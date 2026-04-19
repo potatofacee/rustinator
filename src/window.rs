@@ -527,6 +527,20 @@ impl ApplicationHandler<UserEvent> for WinitApp {
             }
         }
 
+        // Intercept Ctrl+scroll for font zoom before egui turns it into smooth zoom_delta.
+        if let WindowEvent::MouseWheel { delta, .. } = &event {
+            if self.current_modifiers.state().control_key() {
+                let lines = match delta {
+                    winit::event::MouseScrollDelta::LineDelta(_, y) => *y as i32,
+                    winit::event::MouseScrollDelta::PixelDelta(pos) => (pos.y / 20.0) as i32,
+                };
+                if lines != 0 {
+                    app.pending_zoom_steps += lines;
+                    return;
+                }
+            }
+        }
+
         let response = egui_winit.on_window_event(&gl_state.window, &event);
 
         if response.repaint {
