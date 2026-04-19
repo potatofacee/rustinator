@@ -509,68 +509,77 @@ impl App {
         Ok(())
     }
 
-    fn draw_prefs(&mut self, ctx: &egui::Context) {
-        if !self.prefs_open {
-            return;
-        }
+    pub(crate) fn draw_prefs_content(&mut self, ui: &mut egui::Ui) {
+        let bottom_h = 40.0;
+        let (top_rect, bottom_rect) = {
+            let full = ui.available_rect_before_wrap();
+            let split_y = (full.bottom() - bottom_h).max(full.top());
+            (
+                egui::Rect::from_min_max(full.min, egui::pos2(full.right(), split_y)),
+                egui::Rect::from_min_max(egui::pos2(full.left(), split_y), full.max),
+            )
+        };
 
         let mut save_now = false;
         let mut cancel_now = false;
 
-        egui::Window::new("Rustinator — Preferences")
-            .open(&mut self.prefs_open)
-            .resizable(true)
-            .default_size([640.0, 460.0])
-            .min_size([520.0, 360.0])
-            .show(ctx, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.horizontal_top(|ui| {
-                        ui.vertical(|ui| {
-                            ui.set_min_width(120.0);
-                            ui.heading("Prefs");
-                            ui.add_space(6.0);
-                            for (label, section) in [
-                                ("Global", PrefsSection::Global),
-                                ("Profiles", PrefsSection::Profiles),
-                                ("Keybindings", PrefsSection::Keybindings),
-                            ] {
-                                let selected = self.prefs_section == section;
-                                if ui.selectable_label(selected, label).clicked() {
-                                    self.prefs_section = section;
-                                }
-                            }
-                        });
-
-                        ui.separator();
-
-                        ui.vertical(|ui| match self.prefs_section {
-                            PrefsSection::Global => draw_prefs_global(ui, &mut self.prefs_draft),
-                            PrefsSection::Profiles => draw_prefs_profiles(
-                                ui,
-                                &mut self.prefs_draft,
-                                &mut self.prefs_selected_profile,
-                            ),
-                            PrefsSection::Keybindings => draw_prefs_keybindings(ui),
-                        });
-                    });
+        let mut top_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(top_rect)
+                .layout(egui::Layout::top_down(egui::Align::LEFT)),
+        );
+        egui::ScrollArea::vertical().show(&mut top_ui, |ui| {
+            ui.horizontal_top(|ui| {
+                ui.vertical(|ui| {
+                    ui.set_min_width(120.0);
+                    ui.heading("Prefs");
+                    ui.add_space(6.0);
+                    for (label, section) in [
+                        ("Global", PrefsSection::Global),
+                        ("Profiles", PrefsSection::Profiles),
+                        ("Keybindings", PrefsSection::Keybindings),
+                    ] {
+                        let selected = self.prefs_section == section;
+                        if ui.selectable_label(selected, label).clicked() {
+                            self.prefs_section = section;
+                        }
+                    }
                 });
 
                 ui.separator();
-                ui.horizontal(|ui| {
-                    if ui.button("Save").clicked() {
-                        save_now = true;
-                    }
-                    if ui.button("Cancel").clicked() {
-                        cancel_now = true;
-                    }
-                    if let Some(status) = &self.prefs_status {
-                        ui.add_space(12.0);
-                        ui.label(
-                            egui::RichText::new(status).color(egui::Color32::LIGHT_YELLOW),
-                        );
-                    }
+
+                ui.vertical(|ui| match self.prefs_section {
+                    PrefsSection::Global => draw_prefs_global(ui, &mut self.prefs_draft),
+                    PrefsSection::Profiles => draw_prefs_profiles(
+                        ui,
+                        &mut self.prefs_draft,
+                        &mut self.prefs_selected_profile,
+                    ),
+                    PrefsSection::Keybindings => draw_prefs_keybindings(ui),
                 });
             });
+        });
+
+        let mut bottom_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(bottom_rect)
+                .layout(egui::Layout::top_down(egui::Align::LEFT)),
+        );
+        bottom_ui.separator();
+        bottom_ui.horizontal(|ui| {
+            if ui.button("Save").clicked() {
+                save_now = true;
+            }
+            if ui.button("Cancel").clicked() {
+                cancel_now = true;
+            }
+            if let Some(status) = &self.prefs_status {
+                ui.add_space(12.0);
+                ui.label(
+                    egui::RichText::new(status).color(egui::Color32::LIGHT_YELLOW),
+                );
+            }
+        });
 
         if save_now {
             self.apply_prefs();
@@ -899,7 +908,6 @@ impl App {
     pub(crate) fn ui(&mut self, ui: &mut egui::Ui) {
         self.draw_close_dialog(ui.ctx());
         self.update_window_title();
-        self.draw_prefs(ui.ctx());
         self.draw_search(ui);
 
         let mut clicked_tab: Option<usize> = None;
