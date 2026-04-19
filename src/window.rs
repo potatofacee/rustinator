@@ -44,17 +44,7 @@ impl GlState {
 
         log::info!("GL display backend: {}", display_backend_name(&display));
 
-        let config_template = ConfigTemplateBuilder::new()
-            .with_alpha_size(8)
-            .with_transparency(true);
-
-        let gl_config = unsafe {
-            display
-                .find_configs(config_template.build())
-                .expect("failed to find GL config")
-                .next()
-                .expect("no GL configs available")
-        };
+        let gl_config = pick_gl_config(&display);
 
         log::info!(
             "GL config: alpha_size={}, transparency={:?}",
@@ -143,6 +133,75 @@ fn create_context_and_surface(
         .expect("failed to make context current");
 
     (gl_context, gl_surface)
+}
+
+fn pick_gl_config(display: &Display) -> GlConfig {
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    use glutin::platform::x11::X11GlConfigExt as _;
+
+    // First try: configs with transparency and alpha.
+    let transparent_template = ConfigTemplateBuilder::new()
+        .with_alpha_size(8)
+        .with_transparency(true)
+        .build();
+
+    if let Ok(configs) = unsafe { display.find_configs(transparent_template) } {
+        let mut best: Option<GlConfig> = None;
+        for config in configs {
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+            {
+                if config.x11_visual().is_none() {
+                    log::debug!(
+                        "skipping GL config (no X11 visual): alpha_size={}",
+                        config.alpha_size()
+                    );
+                    continue;
+                }
+            }
+            if config.alpha_size() >= best.as_ref().map_or(0, |c| c.alpha_size()) {
+                best = Some(config);
+            }
+        }
+        if let Some(config) = best {
+            return config;
+        }
+    }
+
+    log::warn!("no transparent GL config with X11 visual found; trying without transparency filter");
+
+    // Fallback: any config with alpha, no transparency filter.
+    let alpha_template = ConfigTemplateBuilder::new()
+        .with_alpha_size(8)
+        .build();
+
+    if let Ok(configs) = unsafe { display.find_configs(alpha_template) } {
+        let mut best: Option<GlConfig> = None;
+        for config in configs {
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+            {
+                if config.x11_visual().is_none() {
+                    continue;
+                }
+            }
+            if config.alpha_size() >= best.as_ref().map_or(0, |c| c.alpha_size()) {
+                best = Some(config);
+            }
+        }
+        if let Some(config) = best {
+            return config;
+        }
+    }
+
+    // Last resort: any config at all.
+    log::warn!("no GL config with alpha found; transparency will not work");
+    let any_template = ConfigTemplateBuilder::new().build();
+    unsafe {
+        display
+            .find_configs(any_template)
+            .expect("failed to find any GL config")
+            .next()
+            .expect("no GL configs available at all")
+    }
 }
 
 fn display_backend_name(display: &Display) -> &'static str {
