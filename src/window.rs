@@ -14,6 +14,8 @@ use glutin::surface::{GlSurface as _, Surface, SurfaceAttributesBuilder, WindowS
 use raw_window_handle::{HasDisplayHandle as _, HasWindowHandle as _};
 use winit::application::ApplicationHandler;
 use winit::event::{StartCause, WindowEvent};
+use winit::keyboard::{Key, NamedKey};
+use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::window::{Window, WindowAttributes, WindowId};
 
@@ -395,6 +397,8 @@ struct WinitApp {
     main_window_id: Option<WindowId>,
     prefs: Option<PrefsWindowState>,
     shutting_down: bool,
+    pending_keys: Vec<egui::Event>,
+    current_modifiers: winit::event::Modifiers,
 }
 
 impl WinitApp {
@@ -409,6 +413,8 @@ impl WinitApp {
             main_window_id: None,
             prefs: None,
             shutting_down: false,
+            pending_keys: Vec::new(),
+            current_modifiers: winit::event::Modifiers::default(),
         }
     }
 }
@@ -509,6 +515,18 @@ impl ApplicationHandler<UserEvent> for WinitApp {
         let Some(egui_winit) = &mut self.egui_winit else { return };
         let Some(app) = &mut self.app else { return };
 
+        if let WindowEvent::ModifiersChanged(mods) = &event {
+            self.current_modifiers = *mods;
+        }
+
+        // Intercept keyboard events that egui-winit may fail to translate
+        // (Ctrl+letter produces control characters in logical_key, not letter keys).
+        if let WindowEvent::KeyboardInput { event: key_event, .. } = &event {
+            if let Some(egui_ev) = translate_key_event(key_event, self.current_modifiers) {
+                self.pending_keys.push(egui_ev);
+            }
+        }
+
         let response = egui_winit.on_window_event(&gl_state.window, &event);
 
         if response.repaint {
@@ -581,7 +599,8 @@ impl WinitApp {
 
         gl_state.make_current();
 
-        let raw_input = egui_winit.take_egui_input(&gl_state.window);
+        let mut raw_input = egui_winit.take_egui_input(&gl_state.window);
+        raw_input.events.append(&mut self.pending_keys);
         let clear_color = app.clear_color();
 
         {
@@ -642,6 +661,93 @@ impl WinitApp {
             gl_state.make_current();
         }
     }
+}
+
+fn translate_key_event(event: &winit::event::KeyEvent, modifiers: winit::event::Modifiers) -> Option<egui::Event> {
+    if !event.state.is_pressed() {
+        return None;
+    }
+    let mods = winit_mods_to_egui(modifiers);
+    if !mods.ctrl && !mods.alt {
+        return None;
+    }
+
+    let key = match &event.key_without_modifiers() {
+        Key::Character(c) => char_to_egui_key(c)?,
+        Key::Named(named) => named_to_egui_key(*named)?,
+        _ => return None,
+    };
+
+    Some(egui::Event::Key {
+        key,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: mods,
+    })
+}
+
+fn winit_mods_to_egui(mods: winit::event::Modifiers) -> egui::Modifiers {
+    let state = mods.state();
+    egui::Modifiers {
+        alt: state.alt_key(),
+        ctrl: state.control_key(),
+        shift: state.shift_key(),
+        mac_cmd: state.super_key() && cfg!(target_os = "macos"),
+        command: state.control_key() || (state.super_key() && cfg!(target_os = "macos")),
+    }
+}
+
+fn char_to_egui_key(c: &str) -> Option<egui::Key> {
+    let ch = c.chars().next()?;
+    Some(match ch.to_ascii_lowercase() {
+        'a' => egui::Key::A, 'b' => egui::Key::B, 'c' => egui::Key::C,
+        'd' => egui::Key::D, 'e' => egui::Key::E, 'f' => egui::Key::F,
+        'g' => egui::Key::G, 'h' => egui::Key::H, 'i' => egui::Key::I,
+        'j' => egui::Key::J, 'k' => egui::Key::K, 'l' => egui::Key::L,
+        'm' => egui::Key::M, 'n' => egui::Key::N, 'o' => egui::Key::O,
+        'p' => egui::Key::P, 'q' => egui::Key::Q, 'r' => egui::Key::R,
+        's' => egui::Key::S, 't' => egui::Key::T, 'u' => egui::Key::U,
+        'v' => egui::Key::V, 'w' => egui::Key::W, 'x' => egui::Key::X,
+        'y' => egui::Key::Y, 'z' => egui::Key::Z,
+        '0' => egui::Key::Num0, '1' => egui::Key::Num1, '2' => egui::Key::Num2,
+        '3' => egui::Key::Num3, '4' => egui::Key::Num4, '5' => egui::Key::Num5,
+        '6' => egui::Key::Num6, '7' => egui::Key::Num7, '8' => egui::Key::Num8,
+        '9' => egui::Key::Num9,
+        '[' => egui::Key::OpenBracket, ']' => egui::Key::CloseBracket,
+        '\\' => egui::Key::Backslash, ';' => egui::Key::Semicolon,
+        '\'' => egui::Key::Quote, '`' => egui::Key::Backtick,
+        ',' => egui::Key::Comma, '.' => egui::Key::Period,
+        '/' => egui::Key::Slash, '-' => egui::Key::Minus, '=' => egui::Key::Equals,
+        _ => return None,
+    })
+}
+
+fn named_to_egui_key(named: NamedKey) -> Option<egui::Key> {
+    Some(match named {
+        NamedKey::Enter => egui::Key::Enter,
+        NamedKey::Tab => egui::Key::Tab,
+        NamedKey::Backspace => egui::Key::Backspace,
+        NamedKey::Escape => egui::Key::Escape,
+        NamedKey::Space => egui::Key::Space,
+        NamedKey::Delete => egui::Key::Delete,
+        NamedKey::Insert => egui::Key::Insert,
+        NamedKey::Home => egui::Key::Home,
+        NamedKey::End => egui::Key::End,
+        NamedKey::PageUp => egui::Key::PageUp,
+        NamedKey::PageDown => egui::Key::PageDown,
+        NamedKey::ArrowUp => egui::Key::ArrowUp,
+        NamedKey::ArrowDown => egui::Key::ArrowDown,
+        NamedKey::ArrowLeft => egui::Key::ArrowLeft,
+        NamedKey::ArrowRight => egui::Key::ArrowRight,
+        NamedKey::F1 => egui::Key::F1, NamedKey::F2 => egui::Key::F2,
+        NamedKey::F3 => egui::Key::F3, NamedKey::F4 => egui::Key::F4,
+        NamedKey::F5 => egui::Key::F5, NamedKey::F6 => egui::Key::F6,
+        NamedKey::F7 => egui::Key::F7, NamedKey::F8 => egui::Key::F8,
+        NamedKey::F9 => egui::Key::F9, NamedKey::F10 => egui::Key::F10,
+        NamedKey::F11 => egui::Key::F11, NamedKey::F12 => egui::Key::F12,
+        _ => return None,
+    })
 }
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
