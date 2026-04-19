@@ -31,6 +31,7 @@ const INITIAL_COLS: u16 = 100;
 const INITIAL_LINES: u16 = 32;
 const PANE_GAP: f32 = 2.0;
 const FOCUS_BORDER: f32 = 1.0;
+const PANE_TITLE_HEIGHT: f32 = 20.0;
 
 struct Tab {
     panes: HashMap<PaneId, Pane>,
@@ -38,6 +39,7 @@ struct Tab {
     focused: PaneId,
     zoomed: Option<PaneId>,
     broadcast: bool,
+    custom_title: Option<String>,
 }
 
 impl Tab {
@@ -51,6 +53,7 @@ impl Tab {
             focused: id,
             zoomed: None,
             broadcast: false,
+            custom_title: None,
         }
     }
 }
@@ -81,6 +84,12 @@ pub(crate) struct App {
     search_pane: Option<(usize, PaneId)>,
     search_focus_pending: bool,
     bindings: BindingTable,
+    title_dialog_open: bool,
+    title_dialog_buf: String,
+    last_pane_rect: Option<egui::Rect>,
+    layout_save_dialog: bool,
+    layout_save_buf: String,
+    layout_restore_pending: Option<crate::layout::LayoutTemplate>,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -93,6 +102,7 @@ enum PrefsSection {
 enum PaneAction {
     SplitHorizontal,
     SplitVertical,
+    SplitAuto,
     Close,
     FocusNext,
     FocusPrev,
@@ -105,6 +115,8 @@ enum PaneAction {
     ToggleZoom,
     ToggleBroadcast,
     ToggleSearch,
+    ToggleReadOnly,
+    SetTitle,
 }
 
 impl App {
@@ -131,7 +143,7 @@ impl App {
         let renderer = Renderer::new(gl, &font_ctx);
 
         let mut term_config = TermConfig::default();
-        term_config.scrolling_history = profile.scrollback.history;
+        term_config.scrolling_history = profile.scrollback.effective_history();
         term_config.kitty_keyboard = true;
 
         let pane_defaults = PaneDefaults {
@@ -189,6 +201,12 @@ impl App {
             search_pane: None,
             search_focus_pending: false,
             bindings,
+            title_dialog_open: false,
+            title_dialog_buf: String::new(),
+            last_pane_rect: None,
+            layout_save_dialog: false,
+            layout_save_buf: String::new(),
+            layout_restore_pending: None,
         }
     }
 
@@ -257,6 +275,7 @@ impl App {
         let mut keep_open = true;
         let mut cancel = false;
         let mut confirm = false;
+        let mut dont_ask = false;
         let pane_count = self.total_alive_panes();
         egui::Window::new("Confirm close")
             .open(&mut keep_open)
@@ -275,15 +294,101 @@ impl App {
                     if ui.button("Close").clicked() {
                         confirm = true;
                     }
+                    if ui.button("Close and don't ask again").clicked() {
+                        confirm = true;
+                        dont_ask = true;
+                    }
                 });
             });
         if cancel || !keep_open {
             self.close_dialog_open = false;
         }
         if confirm {
+            if dont_ask {
+                self.user_config.global.confirm_on_close = false;
+                let _ = self.user_config.save();
+            }
             self.confirmed_close = true;
             self.close_dialog_open = false;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
+    fn draw_title_dialog(&mut self, ctx: &egui::Context) {
+        if !self.title_dialog_open {
+            return;
+        }
+        let mut keep_open = true;
+        let mut apply = false;
+        egui::Window::new("Set tab title")
+            .open(&mut keep_open)
+            .resizable(false)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Title:");
+                    let resp = ui.text_edit_singleline(&mut self.title_dialog_buf);
+                    if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        apply = true;
+                    }
+                    resp.request_focus();
+                });
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui.button("OK").clicked() {
+                        apply = true;
+                    }
+                    if ui.button("Clear").clicked() {
+                        self.tabs[self.active_tab].custom_title = None;
+                        self.title_dialog_open = false;
+                    }
+                });
+            });
+        if !keep_open {
+            self.title_dialog_open = false;
+        }
+        if apply {
+            let title = self.title_dialog_buf.trim().to_string();
+            self.tabs[self.active_tab].custom_title = if title.is_empty() {
+                None
+            } else {
+                Some(title)
+            };
+            self.title_dialog_open = false;
+        }
+    }
+
+    fn draw_layout_save_dialog(&mut self, ctx: &egui::Context) {
+        if !self.layout_save_dialog {
+            return;
+        }
+        let mut keep_open = true;
+        let mut save = false;
+        egui::Window::new("Save layout")
+            .open(&mut keep_open)
+            .resizable(false)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Name:");
+                    let resp = ui.text_edit_singleline(&mut self.layout_save_buf);
+                    if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        save = true;
+                    }
+                    resp.request_focus();
+                });
+                ui.add_space(4.0);
+                if ui.button("Save").clicked() {
+                    save = true;
+                }
+            });
+        if !keep_open {
+            self.layout_save_dialog = false;
+        }
+        if save && !self.layout_save_buf.trim().is_empty() {
+            let name = self.layout_save_buf.trim().to_string();
+            self.save_layout(name);
+            self.layout_save_dialog = false;
         }
     }
 
@@ -362,6 +467,8 @@ impl App {
                 PaneAction::ToggleZoom => self.toggle_zoom(),
                 PaneAction::ToggleBroadcast => self.toggle_broadcast(),
                 PaneAction::ToggleSearch => self.toggle_search(),
+                PaneAction::SplitAuto | PaneAction::ToggleReadOnly
+                | PaneAction::SetTitle => {}
             }
         }
     }
@@ -399,6 +506,47 @@ impl App {
         } else {
             tab.zoomed = Some(tab.focused);
         }
+    }
+
+    fn save_layout(&mut self, name: String) {
+        use crate::config::SavedLayout;
+        let template = self.active().layout.to_template();
+        let layouts = &mut self.user_config.layouts;
+        if let Some(existing) = layouts.iter_mut().find(|l| l.name == name) {
+            existing.template = template;
+        } else {
+            layouts.push(SavedLayout { name, template });
+        }
+        let _ = self.user_config.save();
+    }
+
+    fn restore_layout(&mut self, template: &crate::layout::LayoutTemplate) {
+        let needed = template.leaf_count();
+        let tab = self.active();
+        let mut existing_ids: Vec<PaneId> = Vec::new();
+        tab.layout.leaves_in_order(&mut existing_ids);
+
+        while existing_ids.len() < needed {
+            let new_id = self.next_pane_id;
+            self.next_pane_id += 1;
+            let pane = self.spawn_pane(new_id, 80, 24);
+            self.active().panes.insert(new_id, pane);
+            existing_ids.push(new_id);
+        }
+        while existing_ids.len() > needed {
+            if let Some(extra) = existing_ids.pop() {
+                self.active().panes.remove(&extra);
+            }
+        }
+
+        let mut id_iter = existing_ids.into_iter();
+        self.active().layout = template.build(&mut id_iter);
+        let mut leaves = Vec::new();
+        self.active().layout.leaves_in_order(&mut leaves);
+        if !leaves.contains(&self.active().focused) {
+            self.active().focused = leaves.first().copied().unwrap_or(1);
+        }
+        self.active().zoomed = None;
     }
 
     fn copy_selection(&mut self) {
@@ -471,7 +619,7 @@ impl App {
             cursor: profile.cursor_rgb(),
             bg_opacity: profile.transparency.opacity,
         };
-        self.term_config.scrolling_history = profile.scrollback.history;
+        self.term_config.scrolling_history = profile.scrollback.effective_history();
 
         let font_changed = profile.font.family != old_profile.font.family
             || (profile.font.size - old_profile.font.size).abs() > 0.001;
@@ -616,16 +764,24 @@ impl App {
             return;
         }
 
-        // Any leaves remaining in this tab?
+        if matches!(result, crate::layout::RemoveResult::Empty) {
+            // Last pane in the tab — close the tab.
+            self.close_tab(self.active_tab);
+            return;
+        }
+
         let mut leaves = Vec::new();
         self.active().layout.leaves_in_order(&mut leaves);
         if let Some(first) = leaves.first() {
             self.active().focused = *first;
+        }
+    }
+
+    fn close_tab(&mut self, idx: usize) {
+        if idx >= self.tabs.len() {
             return;
         }
-
-        // Tab is empty — remove it.
-        self.tabs.remove(self.active_tab);
+        self.tabs.remove(idx);
         if self.tabs.is_empty() {
             self.egui_ctx
                 .send_viewport_cmd(egui::ViewportCommand::Close);
@@ -633,6 +789,8 @@ impl App {
         }
         if self.active_tab >= self.tabs.len() {
             self.active_tab = self.tabs.len() - 1;
+        } else if idx < self.active_tab {
+            self.active_tab -= 1;
         }
     }
 
@@ -670,9 +828,9 @@ impl App {
         let events = ctx.input(|i| i.events.clone());
         let tab = &self.tabs[self.active_tab];
         let targets: Vec<&Pane> = if tab.broadcast {
-            tab.panes.values().collect()
+            tab.panes.values().filter(|p| !p.read_only).collect()
         } else {
-            tab.panes.get(&tab.focused).into_iter().collect()
+            tab.panes.get(&tab.focused).into_iter().filter(|p| !p.read_only).collect()
         };
         if targets.is_empty() {
             return;
@@ -766,7 +924,7 @@ impl App {
             let mut bg = Vec::with_capacity(frame.cells.len());
             let mut gl_instances = Vec::with_capacity(frame.cells.len());
             for cell in &frame.cells {
-                if cell.bg != frame.default_bg {
+                if cell.bg[..3] != frame.default_bg[..3] {
                     bg.push(BgInstance::full(cell.col, cell.row, cell.bg));
                 }
                 if cell.c != ' ' && cell.c != '\0' {
@@ -778,32 +936,45 @@ impl App {
                 }
             }
 
-            // Beam / underline cursor overlays. Dimensions chosen so 2px is the
-            // visible minimum but the overlay scales with larger cells.
             if let Some(overlay) = frame.cursor {
                 let cw = renderer.cell_w;
                 let ch = renderer.cell_h;
-                let inst = match overlay {
+                match overlay {
                     CursorOverlay::Beam { col, row, color } => {
                         let frac = (2.0 / cw).clamp(0.05, 0.3);
-                        BgInstance {
+                        bg.push(BgInstance {
                             cell: [col, row],
                             color,
                             offset_cells: [0.0, 0.0],
                             size_cells: [frac, 1.0],
-                        }
+                        });
                     }
                     CursorOverlay::Underline { col, row, color } => {
                         let frac = (2.0 / ch).clamp(0.05, 0.3);
-                        BgInstance {
+                        bg.push(BgInstance {
                             cell: [col, row],
                             color,
                             offset_cells: [0.0, 1.0 - frac],
                             size_cells: [1.0, frac],
-                        }
+                        });
                     }
-                };
-                bg.push(inst);
+                    CursorOverlay::HollowBlock { col, row, color } => {
+                        let bw = (1.0 / cw).clamp(0.02, 0.1);
+                        let bh = (1.0 / ch).clamp(0.02, 0.1);
+                        // top
+                        bg.push(BgInstance { cell: [col, row], color,
+                            offset_cells: [0.0, 0.0], size_cells: [1.0, bh] });
+                        // bottom
+                        bg.push(BgInstance { cell: [col, row], color,
+                            offset_cells: [0.0, 1.0 - bh], size_cells: [1.0, bh] });
+                        // left
+                        bg.push(BgInstance { cell: [col, row], color,
+                            offset_cells: [0.0, bh], size_cells: [bw, 1.0 - 2.0 * bh] });
+                        // right
+                        bg.push(BgInstance { cell: [col, row], color,
+                            offset_cells: [1.0 - bw, bh], size_cells: [bw, 1.0 - 2.0 * bh] });
+                    }
+                }
             }
 
             // URL underline on Ctrl-hover.
@@ -871,25 +1042,17 @@ impl App {
         if matches!(result, crate::layout::RemoveResult::NotFound) {
             return;
         }
+        if matches!(result, crate::layout::RemoveResult::Empty) {
+            self.close_tab(tab_idx);
+            return;
+        }
+        let tab = &mut self.tabs[tab_idx];
         let mut leaves = Vec::new();
         tab.layout.leaves_in_order(&mut leaves);
         if let Some(first) = leaves.first() {
             if !leaves.contains(&tab.focused) {
                 tab.focused = *first;
             }
-            return;
-        }
-        // Tab empty — remove it.
-        self.tabs.remove(tab_idx);
-        if self.tabs.is_empty() {
-            self.egui_ctx
-                .send_viewport_cmd(egui::ViewportCommand::Close);
-            return;
-        }
-        if self.active_tab >= self.tabs.len() {
-            self.active_tab = self.tabs.len() - 1;
-        } else if tab_idx < self.active_tab {
-            self.active_tab -= 1;
         }
     }
 }
@@ -907,25 +1070,104 @@ impl App {
 
     pub(crate) fn ui(&mut self, ui: &mut egui::Ui) {
         self.draw_close_dialog(ui.ctx());
+        self.draw_title_dialog(ui.ctx());
+        self.draw_layout_save_dialog(ui.ctx());
         self.update_window_title();
         self.draw_search(ui);
 
         let mut clicked_tab: Option<usize> = None;
+        let mut closed_tab: Option<usize> = None;
         let mut new_tab_requested = false;
-        egui::Panel::top("tab_bar").show_inside(ui, |ui| {
+        egui::Panel::top("tab_bar")
+            .frame(egui::Frame::new().fill(egui::Color32::from_gray(40)).inner_margin(2.0))
+            .show_inside(ui, |ui| {
+            let avail = ui.available_width();
+            let btn_width = 24.0;
+            let tab_count = self.tabs.len().max(1) as f32;
+            let tab_width = ((avail - btn_width) / tab_count).max(40.0);
+
             ui.horizontal(|ui| {
-                for (i, _) in self.tabs.iter().enumerate() {
-                    let label = format!("Tab {}", i + 1);
-                    if ui.selectable_label(i == self.active_tab, label).clicked() {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                for (i, tab) in self.tabs.iter().enumerate() {
+                    let title = tab.custom_title.clone().unwrap_or_else(|| {
+                        tab.panes
+                            .get(&tab.focused)
+                            .and_then(|p| p.title())
+                            .unwrap_or_else(|| format!("Tab {}", i + 1))
+                    });
+
+                    let (rect, response) = ui.allocate_exact_size(
+                        egui::vec2(tab_width, ui.available_height()),
+                        egui::Sense::click(),
+                    );
+                    if response.clicked() {
                         clicked_tab = Some(i);
                     }
+
+                    let selected = i == self.active_tab;
+                    let bg = if selected {
+                        egui::Color32::from_gray(60)
+                    } else if response.hovered() {
+                        egui::Color32::from_gray(50)
+                    } else {
+                        egui::Color32::TRANSPARENT
+                    };
+                    ui.painter().rect_filled(rect, 2.0, bg);
+
+                    let text_color = egui::Color32::from_gray(220);
+                    let close_size = 14.0;
+                    let close_rect = egui::Rect::from_min_size(
+                        egui::pos2(rect.right() - close_size - 4.0,
+                                   rect.center().y - close_size / 2.0),
+                        egui::vec2(close_size, close_size),
+                    );
+                    let close_resp = ui.interact(
+                        close_rect,
+                        egui::Id::new(("tab_close", i)),
+                        egui::Sense::click(),
+                    );
+                    if close_resp.clicked() {
+                        closed_tab = Some(i);
+                    }
+                    let x_color = if close_resp.hovered() {
+                        egui::Color32::from_gray(255)
+                    } else {
+                        egui::Color32::from_gray(140)
+                    };
+                    ui.painter().text(
+                        close_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "×",
+                        egui::FontId::proportional(14.0),
+                        x_color,
+                    );
+
+                    let text_area = egui::Rect::from_min_max(
+                        egui::pos2(rect.left() + 4.0, rect.top()),
+                        egui::pos2(close_rect.left() - 2.0, rect.bottom()),
+                    );
+                    let galley = ui.painter().layout_no_wrap(
+                        title,
+                        egui::FontId::proportional(13.0),
+                        text_color,
+                    );
+                    let text_pos = egui::Align2::CENTER_CENTER
+                        .anchor_size(text_area.center(), galley.size());
+                    let text_pos = text_pos.intersect(text_area);
+                    ui.painter().galley(
+                        text_pos.min,
+                        galley,
+                        text_color,
+                    );
                 }
                 if ui.small_button("+").clicked() {
                     new_tab_requested = true;
                 }
             });
         });
-        if let Some(i) = clicked_tab {
+        if let Some(i) = closed_tab {
+            self.close_tab(i);
+        } else if let Some(i) = clicked_tab {
             self.active_tab = i;
         }
         if new_tab_requested {
@@ -997,10 +1239,63 @@ impl App {
         let shift_held = mods.shift;
         let alt_held = mods.alt;
         let mut deferred: Vec<PaneAction> = Vec::new();
+        let show_title_bars = leaves.len() > 1;
 
         for (id, rect) in leaves {
+            let (title_rect, terminal_rect) = if show_title_bars {
+                let title = egui::Rect::from_min_size(
+                    rect.min,
+                    egui::vec2(rect.width(), PANE_TITLE_HEIGHT),
+                );
+                let terminal = egui::Rect::from_min_max(
+                    egui::pos2(rect.left(), rect.top() + PANE_TITLE_HEIGHT),
+                    rect.max,
+                );
+                (Some(title), terminal)
+            } else {
+                (None, rect)
+            };
+
+            if let Some(tr) = title_rect {
+                let focused = id == self.tabs[self.active_tab].focused;
+                let bg = if focused {
+                    egui::Color32::from_gray(50)
+                } else {
+                    egui::Color32::from_gray(30)
+                };
+                ui.painter().rect_filled(tr, 0.0, bg);
+
+                let title_text = self.tabs[self.active_tab]
+                    .panes
+                    .get(&id)
+                    .map(|pane| {
+                        let name = pane.title().unwrap_or_default();
+                        let dims = format!("{}x{}", pane.cols, pane.lines);
+                        if name.is_empty() {
+                            dims
+                        } else {
+                            format!("{name}  {dims}")
+                        }
+                    })
+                    .unwrap_or_default();
+
+                let text_color = if focused {
+                    egui::Color32::from_gray(220)
+                } else {
+                    egui::Color32::from_gray(140)
+                };
+                let galley = ui.painter().layout_no_wrap(
+                    title_text,
+                    egui::FontId::proportional(12.0),
+                    text_color,
+                );
+                let pos = egui::Align2::CENTER_CENTER
+                    .anchor_size(tr.center(), galley.size());
+                ui.painter().galley(pos.min, galley, text_color);
+            }
+
             let response = ui.interact(
-                rect,
+                terminal_rect,
                 egui::Id::new(("pane", self.active_tab, id)),
                 egui::Sense::click_and_drag(),
             );
@@ -1025,7 +1320,7 @@ impl App {
             let pointer = response
                 .interact_pointer_pos()
                 .or_else(|| response.hover_pos());
-            let pointer_cell = pointer.map(|p| cell_at(p, rect, ppp, cell_w, cell_h));
+            let pointer_cell = pointer.map(|p| cell_at(p, terminal_rect, ppp, cell_w, cell_h));
             let url_at_pointer = pointer_cell.and_then(|(col, row)| {
                 let frame = self
                     .tabs[self.active_tab]
@@ -1142,8 +1437,9 @@ impl App {
             }
 
             let focused = id == self.tabs[self.active_tab].focused;
-            self.paint_pane(ui, id, rect, focused, url_highlight);
+            self.paint_pane(ui, id, terminal_rect, focused, url_highlight);
 
+            self.last_pane_rect = Some(terminal_rect);
             response.context_menu(|ui| {
                 if ui.button("Copy").clicked() {
                     deferred.push(PaneAction::Copy);
@@ -1154,13 +1450,33 @@ impl App {
                     ui.close();
                 }
                 ui.separator();
+                if ui.button("Split Horizontally").clicked() {
+                    deferred.push(PaneAction::SplitHorizontal);
+                    ui.close();
+                }
+                if ui.button("Split Vertically").clicked() {
+                    deferred.push(PaneAction::SplitVertical);
+                    ui.close();
+                }
+                if ui.button("Split Auto").clicked() {
+                    deferred.push(PaneAction::SplitAuto);
+                    ui.close();
+                }
+                ui.separator();
                 let zoom_label = if zoomed.is_some() {
-                    "Unzoom pane"
+                    "Restore all terminals"
                 } else {
-                    "Zoom pane"
+                    "Maximize terminal"
                 };
                 if ui.button(zoom_label).clicked() {
                     deferred.push(PaneAction::ToggleZoom);
+                    ui.close();
+                }
+                let read_only = self.tabs[self.active_tab]
+                    .panes.get(&id).map_or(false, |p| p.read_only);
+                let ro_label = if read_only { "Disable read-only" } else { "Read-only" };
+                if ui.button(ro_label).clicked() {
+                    deferred.push(PaneAction::ToggleReadOnly);
                     ui.close();
                 }
                 let broadcast_label = if self.tabs[self.active_tab].broadcast {
@@ -1173,18 +1489,32 @@ impl App {
                     ui.close();
                 }
                 ui.separator();
-                if ui.button("Split Horizontally").clicked() {
-                    deferred.push(PaneAction::SplitHorizontal);
-                    ui.close();
-                }
-                if ui.button("Split Vertically").clicked() {
-                    deferred.push(PaneAction::SplitVertical);
+                if ui.button("Set title…").clicked() {
+                    deferred.push(PaneAction::SetTitle);
                     ui.close();
                 }
                 if ui.button("Close Pane").clicked() {
                     deferred.push(PaneAction::Close);
                     ui.close();
                 }
+                ui.separator();
+                ui.menu_button("Layouts", |ui| {
+                    if ui.button("Save current layout…").clicked() {
+                        self.layout_save_buf.clear();
+                        self.layout_save_dialog = true;
+                        ui.close();
+                    }
+                    let layouts = self.user_config.layouts.clone();
+                    if !layouts.is_empty() {
+                        ui.separator();
+                        for layout in &layouts {
+                            if ui.button(&layout.name).clicked() {
+                                self.layout_restore_pending = Some(layout.template.clone());
+                                ui.close();
+                            }
+                        }
+                    }
+                });
                 ui.separator();
                 if ui.button("New Tab").clicked() {
                     deferred.push(PaneAction::NewTab);
@@ -1202,13 +1532,37 @@ impl App {
             match action {
                 PaneAction::SplitHorizontal => self.split(Direction::Horizontal),
                 PaneAction::SplitVertical => self.split(Direction::Vertical),
+                PaneAction::SplitAuto => {
+                    let dir = match self.last_pane_rect {
+                        Some(r) if r.width() >= r.height() => Direction::Vertical,
+                        _ => Direction::Horizontal,
+                    };
+                    self.split(dir);
+                }
                 PaneAction::Close => self.close_focused(),
                 PaneAction::NewTab => self.new_tab(),
                 PaneAction::OpenPrefs => self.open_prefs(),
                 PaneAction::Copy => self.copy_selection(),
                 PaneAction::Paste => self.paste_from_clipboard(),
+                PaneAction::ToggleReadOnly => {
+                    let focused = self.active().focused;
+                    if let Some(pane) = self.active().panes.get_mut(&focused) {
+                        pane.read_only = !pane.read_only;
+                    }
+                }
+                PaneAction::SetTitle => {
+                    let current = self.tabs[self.active_tab].custom_title
+                        .clone()
+                        .unwrap_or_default();
+                    self.title_dialog_buf = current;
+                    self.title_dialog_open = true;
+                }
                 _ => {}
             }
+        }
+
+        if let Some(template) = self.layout_restore_pending.take() {
+            self.restore_layout(&template);
         }
     }
 }
@@ -1426,14 +1780,17 @@ fn draw_prefs_profiles(
 
             ui.add_space(8.0);
             ui.label(egui::RichText::new("Scrolling").strong());
-            ui.horizontal(|ui| {
-                ui.label("History (lines)");
-                ui.add(
-                    egui::DragValue::new(&mut profile.scrollback.history)
-                        .range(100..=1_000_000)
-                        .speed(100.0),
-                );
-            });
+            ui.checkbox(&mut profile.scrollback.infinite, "Infinite scrollback");
+            if !profile.scrollback.infinite {
+                ui.horizontal(|ui| {
+                    ui.label("History (lines)");
+                    ui.add(
+                        egui::DragValue::new(&mut profile.scrollback.history)
+                            .range(100..=1_000_000)
+                            .speed(100.0),
+                    );
+                });
+            }
 
             ui.add_space(8.0);
             ui.label(egui::RichText::new("Transparency").strong());

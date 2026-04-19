@@ -2,7 +2,7 @@ use egui;
 
 use crate::pane::PaneId;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Direction {
     /// Divider is horizontal; children are stacked top / bottom.
     Horizontal,
@@ -233,6 +233,52 @@ impl Node {
                 left.leaves_in_order(out);
                 right.leaves_in_order(out);
             }
+        }
+    }
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub enum LayoutTemplate {
+    Terminal,
+    Split {
+        dir: Direction,
+        ratio: f32,
+        left: Box<LayoutTemplate>,
+        right: Box<LayoutTemplate>,
+    },
+}
+
+impl Node {
+    pub fn to_template(&self) -> LayoutTemplate {
+        match self {
+            Node::Leaf(_) => LayoutTemplate::Terminal,
+            Node::Split { dir, ratio, left, right } => LayoutTemplate::Split {
+                dir: *dir,
+                ratio: *ratio,
+                left: Box::new(left.to_template()),
+                right: Box::new(right.to_template()),
+            },
+        }
+    }
+}
+
+impl LayoutTemplate {
+    pub fn leaf_count(&self) -> usize {
+        match self {
+            LayoutTemplate::Terminal => 1,
+            LayoutTemplate::Split { left, right, .. } => left.leaf_count() + right.leaf_count(),
+        }
+    }
+
+    pub fn build(&self, ids: &mut impl Iterator<Item = PaneId>) -> Node {
+        match self {
+            LayoutTemplate::Terminal => Node::Leaf(ids.next().unwrap_or(0)),
+            LayoutTemplate::Split { dir, ratio, left, right } => Node::Split {
+                dir: *dir,
+                ratio: *ratio,
+                left: Box::new(left.build(ids)),
+                right: Box::new(right.build(ids)),
+            },
         }
     }
 }

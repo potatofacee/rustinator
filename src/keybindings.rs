@@ -62,7 +62,7 @@ impl Mods {
             shift: m.shift,
             alt: m.alt,
             ctrl: m.ctrl,
-            mac_cmd: m.mac_cmd || m.command,
+            mac_cmd: m.mac_cmd,
         }
     }
 }

@@ -213,7 +213,7 @@ pub struct UrlMatch {
 pub enum CursorOverlay {
     Beam { col: i32, row: i32, color: [f32; 4] },
     Underline { col: i32, row: i32, color: [f32; 4] },
-    // Block is rendered by inverting fg/bg at the cursor cell; no overlay needed.
+    HollowBlock { col: i32, row: i32, color: [f32; 4] },
 }
 
 pub struct CellSnapshot {
@@ -315,6 +315,7 @@ pub struct Pane {
     pub title: Arc<Mutex<Option<String>>>,
     pub cached: Option<Arc<Frame>>,
     pub defaults: PaneDefaults,
+    pub read_only: bool,
 }
 
 impl Pane {
@@ -345,7 +346,9 @@ impl Pane {
             cell_height: cell_h.round() as u16,
         };
 
-        let pty = tty::new(&tty::Options::default(), window_size, id).expect("failed to open pty");
+        let mut pty_opts = tty::Options::default();
+        pty_opts.env.insert("TERM".into(), "xterm-256color".into());
+        let pty = tty::new(&pty_opts, window_size, id).expect("failed to open pty");
         let event_loop = EventLoop::new(Arc::clone(&terminal), proxy, pty, false, false)
             .expect("failed to create pty event loop");
         let pty_tx = event_loop.channel();
@@ -362,6 +365,7 @@ impl Pane {
             title,
             cached: None,
             defaults,
+            read_only: false,
         }
     }
 
@@ -576,9 +580,7 @@ impl Pane {
             let [r, g, b] = self.defaults.cursor;
             [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0]
         };
-        // Only Block does the fg/bg swap trick; other shapes draw an explicit overlay.
-        let cursor_invert_at_cell =
-            cursor_visible && matches!(cursor_shape, CursorShape::Block | CursorShape::HollowBlock);
+        let cursor_invert_at_cell = false;
         let cursor_overlay = if cursor_visible && cursor_row >= 0 && cursor_row < lines {
             match cursor_shape {
                 CursorShape::Beam => Some(CursorOverlay::Beam {
@@ -591,6 +593,13 @@ impl Pane {
                     row: cursor_row,
                     color: cursor_color,
                 }),
+                CursorShape::Block | CursorShape::HollowBlock => {
+                    Some(CursorOverlay::HollowBlock {
+                        col: cursor_col,
+                        row: cursor_row,
+                        color: cursor_color,
+                    })
+                }
                 _ => None,
             }
         } else {
