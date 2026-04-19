@@ -23,6 +23,18 @@ pub enum Action {
     ToggleZoom,
     ToggleBroadcast,
     ToggleSearch,
+    ZoomIn,
+    ZoomOut,
+    ZoomReset,
+    CloseWindow,
+    ToggleFullscreen,
+    ResizeLeft,
+    ResizeRight,
+    ResizeUp,
+    ResizeDown,
+    ResetTerminal,
+    ResetClear,
+    NewWindow,
 }
 
 impl Action {
@@ -42,6 +54,18 @@ impl Action {
             "toggle_zoom" => Action::ToggleZoom,
             "toggle_broadcast" => Action::ToggleBroadcast,
             "toggle_search" => Action::ToggleSearch,
+            "zoom_in" => Action::ZoomIn,
+            "zoom_out" => Action::ZoomOut,
+            "zoom_reset" => Action::ZoomReset,
+            "close_window" => Action::CloseWindow,
+            "toggle_fullscreen" => Action::ToggleFullscreen,
+            "resize_left" => Action::ResizeLeft,
+            "resize_right" => Action::ResizeRight,
+            "resize_up" => Action::ResizeUp,
+            "resize_down" => Action::ResizeDown,
+            "reset_terminal" => Action::ResetTerminal,
+            "reset_clear" => Action::ResetClear,
+            "new_window" => Action::NewWindow,
             _ => return None,
         })
     }
@@ -123,6 +147,20 @@ fn defaults() -> Vec<(&'static str, Action)> {
         ("Ctrl+Shift+X", Action::ToggleZoom),
         ("Ctrl+Shift+B", Action::ToggleBroadcast),
         ("Ctrl+F", Action::ToggleSearch),
+        ("Ctrl+Shift+F", Action::ToggleSearch),
+        ("Ctrl+Equals", Action::ZoomIn),
+        ("Ctrl+Shift+Equals", Action::ZoomIn),
+        ("Ctrl+Minus", Action::ZoomOut),
+        ("Ctrl+0", Action::ZoomReset),
+        ("Ctrl+Shift+Q", Action::CloseWindow),
+        ("F11", Action::ToggleFullscreen),
+        ("Ctrl+Shift+Left", Action::ResizeLeft),
+        ("Ctrl+Shift+Right", Action::ResizeRight),
+        ("Ctrl+Shift+Up", Action::ResizeUp),
+        ("Ctrl+Shift+Down", Action::ResizeDown),
+        ("Ctrl+Shift+R", Action::ResetTerminal),
+        ("Ctrl+Shift+G", Action::ResetClear),
+        ("Ctrl+Shift+I", Action::NewWindow),
     ]
 }
 

@@ -281,7 +281,7 @@ impl Renderer {
         self.ascent = font.cell_height() + font.metrics.descent;
     }
 
-    fn reset_atlas(&mut self) {
+    pub fn reset_atlas(&mut self) {
         self.glyph_cache.clear();
         self.shelf_y = 0;
         self.shelf_cursor_x = 0;

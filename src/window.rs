@@ -616,6 +616,16 @@ impl WinitApp {
 
         egui_winit.handle_platform_output(&gl_state.window, full_output.platform_output);
 
+        if app.fullscreen_pending {
+            app.fullscreen_pending = false;
+            let is_fullscreen = gl_state.window.fullscreen().is_some();
+            if is_fullscreen {
+                gl_state.window.set_fullscreen(None);
+            } else {
+                gl_state.window.set_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
+            }
+        }
+
         if let Some(vp_out) = full_output
             .viewport_output
             .get(&egui::ViewportId::ROOT)

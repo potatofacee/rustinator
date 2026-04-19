@@ -90,6 +90,9 @@ pub(crate) struct App {
     layout_save_dialog: bool,
     layout_save_buf: String,
     layout_restore_pending: Option<crate::layout::LayoutTemplate>,
+    base_font_size: f32,
+    font_size_override: Option<f32>,
+    fullscreen_pending: bool,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -117,6 +120,18 @@ enum PaneAction {
     ToggleSearch,
     ToggleReadOnly,
     SetTitle,
+    ZoomIn,
+    ZoomOut,
+    ZoomReset,
+    CloseWindow,
+    ToggleFullscreen,
+    ResizeLeft,
+    ResizeRight,
+    ResizeUp,
+    ResizeDown,
+    ResetTerminal,
+    ResetClear,
+    NewWindow,
 }
 
 impl App {
@@ -129,6 +144,7 @@ impl App {
 
         let user_config = Config::load();
         let profile = user_config.active();
+        let base_font_size = profile.font.size;
 
         let font_ctx = FontContext::new(&profile.font.family, profile.font.size)
             .expect("failed to load font");
@@ -207,6 +223,9 @@ impl App {
             layout_save_dialog: false,
             layout_save_buf: String::new(),
             layout_restore_pending: None,
+            base_font_size,
+            font_size_override: None,
+            fullscreen_pending: false,
         }
     }
 
@@ -473,6 +492,25 @@ impl App {
                 PaneAction::ToggleZoom => self.toggle_zoom(),
                 PaneAction::ToggleBroadcast => self.toggle_broadcast(),
                 PaneAction::ToggleSearch => self.toggle_search(),
+                PaneAction::ZoomIn => self.adjust_font_size(1.0),
+                PaneAction::ZoomOut => self.adjust_font_size(-1.0),
+                PaneAction::ZoomReset => self.reset_font_size(),
+                PaneAction::CloseWindow => {
+                    if self.should_confirm_close() {
+                        self.close_dialog_open = true;
+                    } else {
+                        self.confirmed_close = true;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                }
+                PaneAction::ToggleFullscreen => self.fullscreen_pending = !self.fullscreen_pending,
+                PaneAction::ResizeLeft => self.resize_split(-0.05, false),
+                PaneAction::ResizeRight => self.resize_split(0.05, false),
+                PaneAction::ResizeUp => self.resize_split(-0.05, true),
+                PaneAction::ResizeDown => self.resize_split(0.05, true),
+                PaneAction::ResetTerminal => self.reset_focused_terminal(false),
+                PaneAction::ResetClear => self.reset_focused_terminal(true),
+                PaneAction::NewWindow => { let _ = std::process::Command::new(std::env::current_exe().unwrap_or_default()).spawn(); }
                 PaneAction::SplitAuto | PaneAction::ToggleReadOnly
                 | PaneAction::SetTitle => {}
             }
@@ -511,6 +549,91 @@ impl App {
             tab.zoomed = None;
         } else {
             tab.zoomed = Some(tab.focused);
+        }
+    }
+
+    fn adjust_font_size(&mut self, delta: f32) {
+        let current = self.font_size_override.unwrap_or(self.base_font_size);
+        let new_size = (current + delta).clamp(4.0, 72.0);
+        self.apply_font_size(new_size);
+    }
+
+    fn reset_font_size(&mut self) {
+        self.font_size_override = None;
+        self.apply_font_size(self.base_font_size);
+    }
+
+    fn apply_font_size(&mut self, size: f32) {
+        self.font_size_override = Some(size);
+        let profile = self.user_config.active();
+        if let Ok(fc) = FontContext::new(&profile.font.family, size) {
+            self.cell_w = fc.cell_width();
+            self.cell_h = fc.cell_height();
+            let mut renderer = self.renderer.lock().unwrap();
+            renderer.cell_w = self.cell_w;
+            renderer.cell_h = self.cell_h;
+            renderer.reset_atlas();
+            *self.font.lock().unwrap() = fc;
+        }
+    }
+
+    fn resize_split(&mut self, delta: f32, horizontal: bool) {
+        let tab = &self.tabs[self.active_tab];
+        let focused = tab.focused;
+        let root_rect = self.last_pane_rect.unwrap_or(egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(800.0, 600.0),
+        ));
+        let mut dividers = Vec::new();
+        tab.layout.walk_dividers(root_rect, PANE_GAP, &mut dividers);
+
+        let mut rects = Vec::new();
+        tab.layout.walk_rects(root_rect, PANE_GAP, &mut rects);
+        let focused_rect = rects.iter().find(|(id, _)| *id == focused).map(|(_, r)| *r);
+        let Some(fr) = focused_rect else { return };
+
+        let target_dir = if horizontal {
+            layout::Direction::Horizontal
+        } else {
+            layout::Direction::Vertical
+        };
+
+        let best = dividers
+            .iter()
+            .filter(|d| d.dir == target_dir)
+            .min_by_key(|d| {
+                let dist = if horizontal {
+                    ((d.rect.center().y - fr.center().y).abs() * 100.0) as i32
+                } else {
+                    ((d.rect.center().x - fr.center().x).abs() * 100.0) as i32
+                };
+                dist
+            });
+
+        if let Some(div) = best {
+            let path = div.path.clone();
+            let parent = div.parent_rect;
+            let current_ratio = match target_dir {
+                layout::Direction::Horizontal => {
+                    (div.rect.center().y - parent.top()) / parent.height()
+                }
+                layout::Direction::Vertical => {
+                    (div.rect.center().x - parent.left()) / parent.width()
+                }
+            };
+            self.tabs[self.active_tab]
+                .layout
+                .set_ratio(&path, current_ratio + delta);
+        }
+    }
+
+    fn reset_focused_terminal(&mut self, clear: bool) {
+        let tab = &self.tabs[self.active_tab];
+        if let Some(pane) = tab.panes.get(&tab.focused) {
+            if clear {
+                pane.send_bytes(b"\x1b[2J\x1b[H".to_vec());
+            }
+            pane.send_bytes(b"\x1bc".to_vec());
         }
     }
 
@@ -1253,6 +1376,17 @@ impl App {
         let mut deferred: Vec<PaneAction> = Vec::new();
         let show_title_bars = leaves.len() > 1;
 
+        if ctrl_held {
+            let scroll_y = ui.ctx().input(|i| i.smooth_scroll_delta.y);
+            if scroll_y.abs() > 1.0 {
+                if scroll_y > 0.0 {
+                    self.adjust_font_size(1.0);
+                } else {
+                    self.adjust_font_size(-1.0);
+                }
+            }
+        }
+
         for (id, rect) in leaves {
             let (title_rect, terminal_rect) = if show_title_bars {
                 let title = egui::Rect::from_min_size(
@@ -1647,6 +1781,18 @@ fn action_to_pane_action(a: Action) -> PaneAction {
         Action::ToggleZoom => PaneAction::ToggleZoom,
         Action::ToggleBroadcast => PaneAction::ToggleBroadcast,
         Action::ToggleSearch => PaneAction::ToggleSearch,
+        Action::ZoomIn => PaneAction::ZoomIn,
+        Action::ZoomOut => PaneAction::ZoomOut,
+        Action::ZoomReset => PaneAction::ZoomReset,
+        Action::CloseWindow => PaneAction::CloseWindow,
+        Action::ToggleFullscreen => PaneAction::ToggleFullscreen,
+        Action::ResizeLeft => PaneAction::ResizeLeft,
+        Action::ResizeRight => PaneAction::ResizeRight,
+        Action::ResizeUp => PaneAction::ResizeUp,
+        Action::ResizeDown => PaneAction::ResizeDown,
+        Action::ResetTerminal => PaneAction::ResetTerminal,
+        Action::ResetClear => PaneAction::ResetClear,
+        Action::NewWindow => PaneAction::NewWindow,
     }
 }
 
