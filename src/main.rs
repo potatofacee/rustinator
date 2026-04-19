@@ -93,6 +93,7 @@ pub(crate) struct App {
     base_font_size: f32,
     font_size_override: Option<f32>,
     fullscreen_pending: bool,
+    pending_zoom_steps: i32,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -226,6 +227,7 @@ impl App {
             base_font_size,
             font_size_override: None,
             fullscreen_pending: false,
+            pending_zoom_steps: 0,
         }
     }
 
@@ -552,6 +554,10 @@ impl App {
         }
     }
 
+    fn current_font_size(&self) -> f32 {
+        self.font_size_override.unwrap_or(self.base_font_size)
+    }
+
     fn adjust_font_size(&mut self, delta: f32) {
         let current = self.font_size_override.unwrap_or(self.base_font_size);
         let new_size = (current + delta).clamp(4.0, 72.0);
@@ -569,11 +575,19 @@ impl App {
         if let Ok(fc) = FontContext::new(&profile.font.family, size) {
             self.cell_w = fc.cell_width();
             self.cell_h = fc.cell_height();
-            let mut renderer = self.renderer.lock().unwrap();
-            renderer.cell_w = self.cell_w;
-            renderer.cell_h = self.cell_h;
-            renderer.reset_atlas();
+            {
+                let mut renderer = self.renderer.lock().unwrap();
+                renderer.cell_w = self.cell_w;
+                renderer.cell_h = self.cell_h;
+                renderer.reset_atlas();
+            }
             *self.font.lock().unwrap() = fc;
+            for tab in &mut self.tabs {
+                for pane in tab.panes.values() {
+                    pane.dirty.store(true, std::sync::atomic::Ordering::Release);
+                    pane.cached.as_ref(); // cached will be rebuilt on next frame via dirty flag
+                }
+            }
         }
     }
 
@@ -1376,15 +1390,10 @@ impl App {
         let mut deferred: Vec<PaneAction> = Vec::new();
         let show_title_bars = leaves.len() > 1;
 
-        if ctrl_held {
-            let scroll_y = ui.ctx().input(|i| i.smooth_scroll_delta.y);
-            if scroll_y.abs() > 1.0 {
-                if scroll_y > 0.0 {
-                    self.adjust_font_size(1.0);
-                } else {
-                    self.adjust_font_size(-1.0);
-                }
-            }
+        if self.pending_zoom_steps != 0 {
+            let steps = self.pending_zoom_steps;
+            self.pending_zoom_steps = 0;
+            self.adjust_font_size(steps as f32);
         }
 
         for (id, rect) in leaves {
