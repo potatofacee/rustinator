@@ -29,7 +29,7 @@ use crate::renderer::{BgInstance, Renderer};
 
 const INITIAL_COLS: u16 = 100;
 const INITIAL_LINES: u16 = 32;
-const PANE_GAP: f32 = 2.0;
+const PANE_GAP: f32 = 3.0;
 const FOCUS_BORDER: f32 = 1.0;
 const PANE_TITLE_HEIGHT: f32 = 20.0;
 
@@ -434,6 +434,8 @@ impl App {
         let bindings = &self.bindings;
 
         ctx.input_mut(|i| {
+            // Dedup Key events — our winit-level injection may overlap with egui-winit's.
+            let mut seen_keys: Vec<(egui::Key, egui::Modifiers)> = Vec::new();
             i.events.retain(|ev| {
                 if let egui::Event::Key {
                     key,
@@ -442,6 +444,10 @@ impl App {
                     ..
                 } = ev
                 {
+                    if (modifiers.ctrl || modifiers.alt) && seen_keys.contains(&(*key, *modifiers)) {
+                        return false;
+                    }
+                    seen_keys.push((*key, *modifiers));
                     if let Some(action) = bindings.lookup(*key, *modifiers) {
                         actions.push(action_to_pane_action(action));
                         return false;
@@ -1206,6 +1212,12 @@ impl App {
                     egui::Id::new(("divider", self.active_tab, div.path.clone())),
                     egui::Sense::drag(),
                 );
+                let divider_color = if resp.hovered() || resp.dragged() {
+                    egui::Color32::from_gray(80)
+                } else {
+                    egui::Color32::from_gray(40)
+                };
+                ui.painter().rect_filled(div.rect, 0.0, divider_color);
                 let cursor = match div.dir {
                     layout::Direction::Horizontal => egui::CursorIcon::ResizeRow,
                     layout::Direction::Vertical => egui::CursorIcon::ResizeColumn,
