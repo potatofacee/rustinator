@@ -64,10 +64,24 @@ impl GlState {
             }))
         };
 
-        let alpha_bits = unsafe { gl.get_parameter_i32(glow::ALPHA_BITS) };
-        log::info!("GL framebuffer alpha bits: {alpha_bits}");
+        unsafe {
+            gl.get_error();
+        }
+
+        let alpha_bits = gl_config.alpha_size();
+        log::info!("GL config alpha_size: {alpha_bits}");
         if alpha_bits == 0 {
-            log::warn!("framebuffer has no alpha — transparency will not work");
+            log::warn!("GL config has no alpha — transparency will not work");
+        }
+
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            use glutin::platform::x11::X11GlConfigExt as _;
+            if let Some(visual) = gl_config.x11_visual() {
+                log::info!("X11 visual ID: 0x{:x}", visual.visual_id());
+            } else {
+                log::warn!("no X11 visual on GL config — compositor transparency won't work");
+            }
         }
 
         Self {
@@ -380,6 +394,7 @@ struct WinitApp {
     event_loop_proxy: EventLoopProxy<UserEvent>,
     main_window_id: Option<WindowId>,
     prefs: Option<PrefsWindowState>,
+    shutting_down: bool,
 }
 
 impl WinitApp {
@@ -393,6 +408,7 @@ impl WinitApp {
             event_loop_proxy,
             main_window_id: None,
             prefs: None,
+            shutting_down: false,
         }
     }
 }
@@ -450,6 +466,9 @@ impl ApplicationHandler<UserEvent> for WinitApp {
         window_id: WindowId,
         event: WindowEvent,
     ) {
+        if self.shutting_down {
+            return;
+        }
         // Prefs window events.
         if let Some(prefs) = &mut self.prefs {
             if window_id == prefs.window.id() {
@@ -528,11 +547,27 @@ impl ApplicationHandler<UserEvent> for WinitApp {
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        if self.shutting_down {
+            return;
+        }
         if let Some(gl_state) = &self.gl_state {
             gl_state.window.request_redraw();
         }
         if let Some(prefs) = &self.prefs {
             prefs.window.request_redraw();
+        }
+    }
+
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        self.shutting_down = true;
+        if let Some(mut prefs) = self.prefs.take() {
+            prefs.painter.destroy();
+        }
+        if let Some(gl_state) = &self.gl_state {
+            gl_state.make_current();
+        }
+        if let Some(painter) = &mut self.painter {
+            painter.destroy();
         }
     }
 }
@@ -548,6 +583,12 @@ impl WinitApp {
 
         let raw_input = egui_winit.take_egui_input(&gl_state.window);
         let clear_color = app.clear_color();
+
+        {
+            let mut style = (*self.egui_ctx.global_style()).clone();
+            style.visuals.panel_fill = egui::Color32::TRANSPARENT;
+            self.egui_ctx.set_global_style(style);
+        }
 
         let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
             app.logic(ui.ctx());
@@ -595,8 +636,9 @@ impl WinitApp {
             ));
             gl_state.make_current();
         } else if !app.prefs_open && self.prefs.is_some() {
-            // Drop the prefs window — restore main context first.
-            self.prefs = None;
+            if let Some(mut prefs) = self.prefs.take() {
+                prefs.painter.destroy();
+            }
             gl_state.make_current();
         }
     }
