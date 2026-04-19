@@ -126,15 +126,27 @@ pub struct EventProxy {
     pub dirty: Arc<AtomicBool>,
     pub exited: Arc<AtomicBool>,
     pub title: Arc<Mutex<Option<String>>>,
+    pub winit_proxy: Option<winit::event_loop::EventLoopProxy<crate::window::UserEvent>>,
 }
 
 impl EventProxy {
-    pub fn new(ctx: egui::Context) -> Self {
+    pub fn new(
+        ctx: egui::Context,
+        winit_proxy: Option<winit::event_loop::EventLoopProxy<crate::window::UserEvent>>,
+    ) -> Self {
         Self {
             ctx,
             dirty: Arc::new(AtomicBool::new(true)),
             exited: Arc::new(AtomicBool::new(false)),
             title: Arc::new(Mutex::new(None)),
+            winit_proxy,
+        }
+    }
+
+    fn wake(&self) {
+        self.ctx.request_repaint();
+        if let Some(proxy) = &self.winit_proxy {
+            let _ = proxy.send_event(crate::window::UserEvent::Repaint);
         }
     }
 }
@@ -144,21 +156,21 @@ impl EventListener for EventProxy {
         match event {
             Event::Wakeup | Event::Bell | Event::MouseCursorDirty => {
                 self.dirty.store(true, Ordering::Release);
-                self.ctx.request_repaint();
+                self.wake();
             }
             Event::Title(t) => {
                 *self.title.lock().unwrap() = Some(t);
                 self.dirty.store(true, Ordering::Release);
-                self.ctx.request_repaint();
+                self.wake();
             }
             Event::ResetTitle => {
                 *self.title.lock().unwrap() = None;
                 self.dirty.store(true, Ordering::Release);
-                self.ctx.request_repaint();
+                self.wake();
             }
             Event::Exit | Event::ChildExit(_) => {
                 self.exited.store(true, Ordering::Release);
-                self.ctx.request_repaint();
+                self.wake();
             }
             _ => {}
         }
@@ -315,8 +327,9 @@ impl Pane {
         ctx: egui::Context,
         term_config: Config,
         defaults: PaneDefaults,
+        winit_proxy: Option<winit::event_loop::EventLoopProxy<crate::window::UserEvent>>,
     ) -> Self {
-        let proxy = EventProxy::new(ctx);
+        let proxy = EventProxy::new(ctx, winit_proxy);
         let dirty = Arc::clone(&proxy.dirty);
         let exited = Arc::clone(&proxy.exited);
         let title = Arc::clone(&proxy.title);
