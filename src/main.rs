@@ -924,6 +924,14 @@ impl App {
         if idx >= self.tabs.len() {
             return;
         }
+        if let Some((ti, _)) = self.search_pane {
+            if ti == idx {
+                self.search_pane = None;
+                self.search_open = false;
+            } else if ti > idx {
+                self.search_pane = Some((ti - 1, self.search_pane.unwrap().1));
+            }
+        }
         self.tabs.remove(idx);
         if self.tabs.is_empty() {
             self.egui_ctx
@@ -978,6 +986,7 @@ impl App {
         if targets.is_empty() {
             return;
         }
+        let has_text_event = events.iter().any(|e| matches!(e, egui::Event::Text(_)));
         for event in events {
             match event {
                 egui::Event::Text(text) => {
@@ -993,6 +1002,15 @@ impl App {
                     modifiers,
                     ..
                 } => {
+                    // When a Text event is present for this frame, skip Key events
+                    // for keys that key_to_bytes would also encode (Enter, Tab, etc.)
+                    // to avoid double-sending. Text events handle printable input;
+                    // Key events handle non-printable / modifier combos.
+                    if has_text_event && !modifiers.ctrl && !modifiers.alt {
+                        if let Some(_) = key_to_bytes(key, modifiers) {
+                            continue;
+                        }
+                    }
                     for pane in &targets {
                         pane.send_key(key, modifiers, key_to_bytes);
                     }
@@ -1158,20 +1176,20 @@ impl App {
     /// Reap panes whose child process has exited. Runs once per frame.
     fn reap_exited(&mut self) {
         use std::sync::atomic::Ordering;
-        // Collect (tab_idx, pane_id) to close.
-        let mut to_close: Vec<(usize, PaneId)> = Vec::new();
-        for (t, tab) in self.tabs.iter().enumerate() {
-            for (&id, pane) in &tab.panes {
-                if pane.exited.load(Ordering::Acquire) {
-                    to_close.push((t, id));
+        loop {
+            let mut found = None;
+            'outer: for (t, tab) in self.tabs.iter().enumerate() {
+                for (&id, pane) in &tab.panes {
+                    if pane.exited.load(Ordering::Acquire) {
+                        found = Some((t, id));
+                        break 'outer;
+                    }
                 }
             }
-        }
-        if to_close.is_empty() {
-            return;
-        }
-        for (t, id) in to_close {
-            self.close_pane(t, id);
+            match found {
+                Some((t, id)) => self.close_pane(t, id),
+                None => break,
+            }
         }
     }
 
@@ -1243,7 +1261,8 @@ impl App {
                         egui::vec2(tab_width, ui.available_height()),
                         egui::Sense::click(),
                     );
-                    if response.clicked() {
+                    response.surrender_focus();
+                    if response.clicked_by(egui::PointerButton::Primary) {
                         clicked_tab = Some(i);
                     }
 
@@ -1266,10 +1285,11 @@ impl App {
                     );
                     let close_resp = ui.interact(
                         close_rect,
-                        egui::Id::new(("tab_close", i)),
+                        egui::Id::new(("tab_close", tab.focused)),
                         egui::Sense::click(),
                     );
-                    if close_resp.clicked() {
+                    close_resp.surrender_focus();
+                    if close_resp.clicked_by(egui::PointerButton::Primary) {
                         closed_tab = Some(i);
                     }
                     let x_color = if close_resp.hovered() {
@@ -1303,7 +1323,9 @@ impl App {
                         text_color,
                     );
                 }
-                if ui.small_button("+").clicked() {
+                let plus_btn = ui.small_button("+");
+                plus_btn.surrender_focus();
+                if plus_btn.clicked_by(egui::PointerButton::Primary) {
                     new_tab_requested = true;
                 }
             });

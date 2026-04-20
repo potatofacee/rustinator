@@ -168,8 +168,11 @@ impl EventListener for EventProxy {
                 self.dirty.store(true, Ordering::Release);
                 self.wake();
             }
-            Event::Exit | Event::ChildExit(_) => {
+            Event::Exit => {
                 self.exited.store(true, Ordering::Release);
+                self.wake();
+            }
+            Event::ChildExit(_) => {
                 self.wake();
             }
             _ => {}
