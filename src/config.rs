@@ -136,7 +136,12 @@ impl Profile {
 
 impl Default for FontConfig {
     fn default() -> Self {
-        Self { family: "monospace".into(), size: 12.0 }
+        let family = if cfg!(target_os = "macos") {
+            "Menlo"
+        } else {
+            "monospace"
+        };
+        Self { family: family.into(), size: 12.0 }
     }
 }
 

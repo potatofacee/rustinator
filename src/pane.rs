@@ -351,6 +351,7 @@ impl Pane {
 
         let mut pty_opts = tty::Options::default();
         pty_opts.env.insert("TERM".into(), "xterm-256color".into());
+        crate::shell_integration::inject_env(&mut pty_opts.env);
         let pty = tty::new(&pty_opts, window_size, id).expect("failed to open pty");
         let event_loop = EventLoop::new(Arc::clone(&terminal), proxy, pty, false, false)
             .expect("failed to create pty event loop");
