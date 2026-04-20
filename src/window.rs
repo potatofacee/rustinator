@@ -399,6 +399,7 @@ struct WinitApp {
     shutting_down: bool,
     pending_keys: Vec<egui::Event>,
     current_modifiers: winit::event::Modifiers,
+    zoom_pixel_accumulator: f64,
 }
 
 impl WinitApp {
@@ -415,6 +416,7 @@ impl WinitApp {
             shutting_down: false,
             pending_keys: Vec::new(),
             current_modifiers: winit::event::Modifiers::default(),
+            zoom_pixel_accumulator: 0.0,
         }
     }
 }
@@ -447,6 +449,7 @@ impl ApplicationHandler<UserEvent> for WinitApp {
             Arc::clone(&gl_state.gl),
             self.egui_ctx.clone(),
             self.event_loop_proxy.clone(),
+            gl_state.window.scale_factor() as f32,
         );
 
         self.main_window_id = Some(gl_state.window.id());
@@ -527,17 +530,35 @@ impl ApplicationHandler<UserEvent> for WinitApp {
             }
         }
 
-        // Intercept Ctrl+scroll for font zoom before egui turns it into smooth zoom_delta.
+        // Intercept modifier+scroll for font zoom before egui turns it into smooth zoom_delta.
         if let WindowEvent::MouseWheel { delta, .. } = &event {
-            if self.current_modifiers.state().control_key() {
-                let lines = match delta {
-                    winit::event::MouseScrollDelta::LineDelta(_, y) => *y as i32,
-                    winit::event::MouseScrollDelta::PixelDelta(pos) => (pos.y / 20.0) as i32,
-                };
-                if lines != 0 {
-                    app.pending_zoom_steps += lines;
-                    return;
+            let zoom_mod = if cfg!(target_os = "macos") {
+                self.current_modifiers.state().super_key()
+            } else {
+                self.current_modifiers.state().control_key()
+            };
+            if zoom_mod {
+                match delta {
+                    winit::event::MouseScrollDelta::LineDelta(_, y) => {
+                        let direction = y.signum() as i32;
+                        if direction != 0 {
+                            app.pending_zoom_steps += direction;
+                        }
+                    }
+                    winit::event::MouseScrollDelta::PixelDelta(pos) => {
+                        self.zoom_pixel_accumulator += pos.y;
+                        const THRESHOLD: f64 = 30.0;
+                        while self.zoom_pixel_accumulator >= THRESHOLD {
+                            app.pending_zoom_steps += 1;
+                            self.zoom_pixel_accumulator -= THRESHOLD;
+                        }
+                        while self.zoom_pixel_accumulator <= -THRESHOLD {
+                            app.pending_zoom_steps -= 1;
+                            self.zoom_pixel_accumulator += THRESHOLD;
+                        }
+                    }
                 }
+                return;
             }
         }
 

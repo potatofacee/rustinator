@@ -7,6 +7,7 @@ mod mouse;
 mod pane;
 mod presets;
 mod renderer;
+mod shell_integration;
 pub mod window;
 
 use std::collections::HashMap;
@@ -92,6 +93,7 @@ pub(crate) struct App {
     layout_restore_pending: Option<crate::layout::LayoutTemplate>,
     base_font_size: f32,
     font_size_override: Option<f32>,
+    scale_factor: f32,
     fullscreen_pending: bool,
     pending_zoom_steps: i32,
 }
@@ -140,6 +142,7 @@ impl App {
         gl: Arc<glow::Context>,
         egui_ctx: egui::Context,
         event_loop_proxy: EventLoopProxy<window::UserEvent>,
+        scale_factor: f32,
     ) -> Self {
         tty::setup_env();
 
@@ -147,7 +150,7 @@ impl App {
         let profile = user_config.active();
         let base_font_size = profile.font.size;
 
-        let font_ctx = FontContext::new(&profile.font.family, profile.font.size)
+        let font_ctx = FontContext::new(&profile.font.family, profile.font.size * scale_factor)
             .expect("failed to load font");
         let m = font_ctx.metrics;
         eprintln!(
@@ -226,6 +229,7 @@ impl App {
             layout_restore_pending: None,
             base_font_size,
             font_size_override: None,
+            scale_factor,
             fullscreen_pending: false,
             pending_zoom_steps: 0,
         }
@@ -456,7 +460,9 @@ impl App {
 
         ctx.input_mut(|i| {
             // Dedup Key events — our winit-level injection may overlap with egui-winit's.
-            let mut seen_keys: Vec<(egui::Key, egui::Modifiers)> = Vec::new();
+            // Compare only the fields used for binding lookup to avoid mismatches from
+            // platform differences in how `command` is set.
+            let mut seen_keys: Vec<(egui::Key, bool, bool, bool, bool)> = Vec::new();
             i.events.retain(|ev| {
                 if let egui::Event::Key {
                     key,
@@ -465,10 +471,11 @@ impl App {
                     ..
                 } = ev
                 {
-                    if (modifiers.ctrl || modifiers.alt) && seen_keys.contains(&(*key, *modifiers)) {
+                    let dedup_key = (*key, modifiers.ctrl, modifiers.alt, modifiers.shift, modifiers.mac_cmd);
+                    if (modifiers.ctrl || modifiers.alt) && seen_keys.contains(&dedup_key) {
                         return false;
                     }
-                    seen_keys.push((*key, *modifiers));
+                    seen_keys.push(dedup_key);
                     if let Some(action) = bindings.lookup(*key, *modifiers) {
                         actions.push(action_to_pane_action(action));
                         return false;
@@ -554,10 +561,6 @@ impl App {
         }
     }
 
-    fn current_font_size(&self) -> f32 {
-        self.font_size_override.unwrap_or(self.base_font_size)
-    }
-
     fn adjust_font_size(&mut self, delta: f32) {
         let current = self.font_size_override.unwrap_or(self.base_font_size);
         let new_size = (current + delta).clamp(4.0, 72.0);
@@ -572,14 +575,12 @@ impl App {
     fn apply_font_size(&mut self, size: f32) {
         self.font_size_override = Some(size);
         let profile = self.user_config.active();
-        if let Ok(fc) = FontContext::new(&profile.font.family, size) {
+        if let Ok(fc) = FontContext::new(&profile.font.family, size * self.scale_factor) {
             self.cell_w = fc.cell_width();
             self.cell_h = fc.cell_height();
             {
                 let mut renderer = self.renderer.lock().unwrap();
-                renderer.cell_w = self.cell_w;
-                renderer.cell_h = self.cell_h;
-                renderer.reset_atlas();
+                renderer.reload_font(&fc);
             }
             *self.font.lock().unwrap() = fc;
             for tab in &mut self.tabs {
@@ -790,7 +791,7 @@ impl App {
     }
 
     fn reload_font(&mut self, family: &str, size: f32) -> Result<(), crossfont::Error> {
-        let new_font = FontContext::new(family, size)?;
+        let new_font = FontContext::new(family, size * self.scale_factor)?;
         let cell_w = new_font.cell_width();
         let cell_h = new_font.cell_height();
         self.renderer.lock().unwrap().reload_font(&new_font);
