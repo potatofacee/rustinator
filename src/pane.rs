@@ -681,7 +681,7 @@ fn pane_cwd(pid: u32) -> Option<std::path::PathBuf> {
 fn pane_cwd(pid: u32) -> Option<std::path::PathBuf> {
     use std::process::Command;
     let output = Command::new("lsof")
-        .args(["-p", &pid.to_string(), "-Fn", "-d", "cwd"])
+        .args(["-a", "-p", &pid.to_string(), "-Fn", "-d", "cwd"])
         .output()
         .ok()?;
     let text = String::from_utf8_lossy(&output.stdout);
