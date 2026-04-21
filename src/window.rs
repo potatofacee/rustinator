@@ -445,12 +445,18 @@ impl ApplicationHandler<UserEvent> for WinitApp {
             Some(painter.max_texture_side()),
         );
 
-        let app = App::new(
+        let app = match App::new(
             Arc::clone(&gl_state.gl),
             self.egui_ctx.clone(),
             self.event_loop_proxy.clone(),
             gl_state.window.scale_factor() as f32,
-        );
+        ) {
+            Ok(app) => app,
+            Err(e) => {
+                eprintln!("rustinator: fatal error during startup: {e}");
+                std::process::exit(1);
+            }
+        };
 
         self.main_window_id = Some(gl_state.window.id());
         self.gl_state = Some(gl_state);

@@ -225,6 +225,27 @@ impl Node {
         }
     }
 
+    /// Swap two leaf pane IDs in the tree.
+    pub fn swap_leaves(&mut self, a: PaneId, b: PaneId) {
+        Self::swap_leaves_impl(self, a, b);
+    }
+
+    fn swap_leaves_impl(node: &mut Node, a: PaneId, b: PaneId) {
+        match node {
+            Node::Leaf(id) => {
+                if *id == a {
+                    *id = b;
+                } else if *id == b {
+                    *id = a;
+                }
+            }
+            Node::Split { left, right, .. } => {
+                Self::swap_leaves_impl(left, a, b);
+                Self::swap_leaves_impl(right, a, b);
+            }
+        }
+    }
+
     /// Collect all pane ids in left-to-right, top-to-bottom traversal order (useful for cycling).
     pub fn leaves_in_order(&self, out: &mut Vec<PaneId>) {
         match self {
