@@ -343,6 +343,13 @@ impl PrefsWindowState {
         }
     }
 
+    fn destroy(mut self, main_context: &PossiblyCurrentContext) {
+        main_context.make_current(&self.gl_surface).ok();
+        self.painter.destroy();
+        drop(self.gl_surface);
+        drop(self.window);
+    }
+
     fn swap_buffers(&self, main_context: &PossiblyCurrentContext) {
         self.gl_surface.swap_buffers(main_context).ok();
     }
@@ -640,8 +647,11 @@ impl ApplicationHandler<UserEvent> for WinitApp {
         if let Some(gl_state) = &self.gl_state {
             gl_state.make_current();
         }
-        if let Some(mut prefs) = self.prefs.take() {
-            prefs.painter.destroy();
+        if let Some(prefs) = self.prefs.take() {
+            if let Some(gl_state) = &self.gl_state {
+                prefs.destroy(&gl_state.gl_context);
+                gl_state.make_current();
+            }
         }
         if let Some(painter) = &mut self.painter {
             painter.destroy();
@@ -725,8 +735,8 @@ impl WinitApp {
             ));
             gl_state.make_current();
         } else if !app.prefs_open && self.prefs.is_some() {
-            if let Some(mut prefs) = self.prefs.take() {
-                prefs.painter.destroy();
+            if let Some(prefs) = self.prefs.take() {
+                prefs.destroy(&gl_state.gl_context);
             }
             gl_state.make_current();
         }
