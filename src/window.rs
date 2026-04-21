@@ -272,7 +272,6 @@ fn create_display(event_loop: &ActiveEventLoop) -> Display {
 
 struct PrefsWindowState {
     window: Window,
-    gl_context: PossiblyCurrentContext,
     gl_surface: Surface<WindowSurface>,
     painter: egui_glow::Painter,
     egui_ctx: egui::Context,
@@ -285,6 +284,7 @@ impl PrefsWindowState {
         gl_display: &Display,
         gl_config: &GlConfig,
         gl: &Arc<glow::Context>,
+        main_context: &PossiblyCurrentContext,
     ) -> Self {
         let window_attrs = WindowAttributes::default()
             .with_title("Rustinator — Preferences")
@@ -294,8 +294,21 @@ impl PrefsWindowState {
         let window = glutin_winit::finalize_window(event_loop, window_attrs, gl_config)
             .expect("failed to create prefs window");
 
-        let (gl_context, gl_surface) =
-            create_context_and_surface(gl_display, gl_config, &window);
+        let raw_window_handle = window.window_handle().ok().map(|h| h.as_raw());
+        let surface_attrs = SurfaceAttributesBuilder::<WindowSurface>::new().build(
+            raw_window_handle.expect("window handle required for surface"),
+            NonZeroU32::new(window.inner_size().width.max(1)).unwrap(),
+            NonZeroU32::new(window.inner_size().height.max(1)).unwrap(),
+        );
+        let gl_surface = unsafe {
+            gl_display
+                .create_window_surface(gl_config, &surface_attrs)
+                .expect("failed to create prefs surface")
+        };
+
+        main_context
+            .make_current(&gl_surface)
+            .expect("failed to make main context current on prefs surface");
 
         let painter = egui_glow::Painter::new(
             Arc::clone(gl),
@@ -316,9 +329,13 @@ impl PrefsWindowState {
             Some(painter.max_texture_side()),
         );
 
+        let phys = window.inner_size();
+        if let (Some(w), Some(h)) = (NonZeroU32::new(phys.width), NonZeroU32::new(phys.height)) {
+            gl_surface.resize(main_context, w, h);
+        }
+
         Self {
             window,
-            gl_context,
             gl_surface,
             painter,
             egui_ctx,
@@ -326,22 +343,22 @@ impl PrefsWindowState {
         }
     }
 
-    fn make_current(&self) {
-        self.gl_context.make_current(&self.gl_surface).ok();
+    fn swap_buffers(&self, main_context: &PossiblyCurrentContext) {
+        self.gl_surface.swap_buffers(main_context).ok();
     }
 
-    fn swap_buffers(&self) {
-        self.gl_surface.swap_buffers(&self.gl_context).ok();
-    }
-
-    fn resize(&self, width: u32, height: u32) {
+    fn resize(&self, main_context: &PossiblyCurrentContext, width: u32, height: u32) {
         if let (Some(w), Some(h)) = (NonZeroU32::new(width), NonZeroU32::new(height)) {
-            self.gl_surface.resize(&self.gl_context, w, h);
+            self.gl_surface.resize(main_context, w, h);
         }
     }
 
-    fn paint(&mut self, app: &mut App) {
-        self.make_current();
+    fn paint(&mut self, app: &mut App, main_context: &PossiblyCurrentContext) {
+        main_context.make_current(&self.gl_surface).ok();
+        let phys = self.window.inner_size();
+        if let (Some(w), Some(h)) = (NonZeroU32::new(phys.width), NonZeroU32::new(phys.height)) {
+            self.gl_surface.resize(main_context, w, h);
+        }
 
         let raw_input = self.egui_winit.take_egui_input(&self.window);
 
@@ -361,7 +378,7 @@ impl PrefsWindowState {
             .handle_platform_output(&self.window, full_output.platform_output);
 
         let screen_size: [u32; 2] = self.window.inner_size().into();
-        let pixels_per_point = self.egui_ctx.pixels_per_point();
+        let pixels_per_point = egui_winit::pixels_per_point(&self.egui_ctx, &self.window);
 
         let clipped_primitives = self.egui_ctx.tessellate(full_output.shapes, pixels_per_point);
 
@@ -381,7 +398,7 @@ impl PrefsWindowState {
             &full_output.textures_delta,
         );
 
-        self.swap_buffers();
+        self.swap_buffers(main_context);
     }
 }
 
@@ -485,15 +502,16 @@ impl ApplicationHandler<UserEvent> for WinitApp {
             return;
         }
         // Prefs window events.
-        if let Some(prefs) = &mut self.prefs {
-            if window_id == prefs.window.id() {
-                let response = prefs.egui_winit.on_window_event(&prefs.window, &event);
-                if response.repaint {
-                    prefs.window.request_redraw();
-                }
-                if response.consumed {
-                    return;
-                }
+        let is_prefs_window = self.prefs.as_ref().is_some_and(|p| window_id == p.window.id());
+        if is_prefs_window {
+            // Temporarily take prefs out of self so we can borrow other fields.
+            let mut prefs = self.prefs.take().unwrap();
+            let response = prefs.egui_winit.on_window_event(&prefs.window, &event);
+            if response.repaint {
+                prefs.window.request_redraw();
+            }
+            let consumed = response.consumed;
+            if !consumed {
                 match event {
                     WindowEvent::CloseRequested => {
                         if let Some(app) = &mut self.app {
@@ -501,22 +519,22 @@ impl ApplicationHandler<UserEvent> for WinitApp {
                         }
                     }
                     WindowEvent::Resized(size) => {
-                        prefs.resize(size.width, size.height);
+                        if let Some(gl_state) = &self.gl_state {
+                            prefs.resize(&gl_state.gl_context, size.width, size.height);
+                        }
                         prefs.window.request_redraw();
                     }
                     WindowEvent::RedrawRequested => {
-                        if let Some(app) = &mut self.app {
-                            prefs.paint(app);
-                            // Restore main GL context.
-                            if let Some(gl_state) = &self.gl_state {
-                                gl_state.make_current();
-                            }
+                        if let (Some(app), Some(gl_state)) = (&mut self.app, &self.gl_state) {
+                            prefs.paint(app, &gl_state.gl_context);
+                            gl_state.make_current();
                         }
                     }
                     _ => {}
                 }
-                return;
             }
+            self.prefs = Some(prefs);
+            return;
         }
 
         // Main window events.
@@ -619,11 +637,11 @@ impl ApplicationHandler<UserEvent> for WinitApp {
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         self.shutting_down = true;
-        if let Some(mut prefs) = self.prefs.take() {
-            prefs.painter.destroy();
-        }
         if let Some(gl_state) = &self.gl_state {
             gl_state.make_current();
+        }
+        if let Some(mut prefs) = self.prefs.take() {
+            prefs.painter.destroy();
         }
         if let Some(painter) = &mut self.painter {
             painter.destroy();
@@ -703,6 +721,7 @@ impl WinitApp {
                 &gl_state.gl_display,
                 &gl_state.gl_config,
                 &gl_state.gl,
+                &gl_state.gl_context,
             ));
             gl_state.make_current();
         } else if !app.prefs_open && self.prefs.is_some() {

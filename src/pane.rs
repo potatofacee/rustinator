@@ -354,6 +354,8 @@ impl Pane {
 
         let mut pty_opts = tty::Options::default();
         pty_opts.env.insert("TERM".into(), "xterm-256color".into());
+        pty_opts.env.insert("CLICOLOR".into(), "1".into());
+        pty_opts.env.insert("CLICOLOR_FORCE".into(), "1".into());
         crate::shell_integration::inject_env(&mut pty_opts.env);
         if let Some(dir) = working_dir {
             pty_opts.working_directory = Some(dir.to_path_buf());
