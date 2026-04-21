@@ -175,6 +175,7 @@ impl App {
         let mut term_config = TermConfig::default();
         term_config.scrolling_history = profile.scrollback.effective_history();
         term_config.kitty_keyboard = true;
+        term_config.semantic_escape_chars = config::word_chars_to_semantic_escape(&profile.word_chars);
 
         let pane_defaults = PaneDefaults {
             fg: profile.foreground_rgb(),
@@ -725,9 +726,14 @@ impl App {
         let Some(pane) = tab.panes.get(&tab.focused) else {
             return;
         };
-        if let Some(text) = pane.selection_text() {
-            if !text.is_empty() {
+        match pane.selection_text() {
+            Some(text) if !text.is_empty() => {
                 self.egui_ctx.copy_text(text);
+            }
+            _ => {
+                if self.user_config.active().smart_copy {
+                    pane.send_bytes(vec![0x03]);
+                }
             }
         }
     }
@@ -791,6 +797,7 @@ impl App {
             bg_opacity: profile.transparency.opacity,
         };
         self.term_config.scrolling_history = profile.scrollback.effective_history();
+        self.term_config.semantic_escape_chars = config::word_chars_to_semantic_escape(&profile.word_chars);
 
         let font_changed = profile.font.family != old_profile.font.family
             || (profile.font.size - old_profile.font.size).abs() > 0.001;
@@ -1039,6 +1046,14 @@ impl App {
         if targets.is_empty() {
             return;
         }
+        let has_input = events.iter().any(|e| {
+            matches!(e, egui::Event::Text(_) | egui::Event::Key { pressed: true, .. } | egui::Event::Paste(_))
+        });
+        if has_input && self.user_config.active().scroll_on_keystroke {
+            for pane in &targets {
+                pane.scroll_to_bottom();
+            }
+        }
         let has_text_event = events.iter().any(|e| matches!(e, egui::Event::Text(_)));
         for event in events {
             match event {
@@ -1089,6 +1104,7 @@ impl App {
         let cell_w = self.cell_w;
         let cell_h = self.cell_h;
         let blink_elapsed = self.cursor_blink_epoch.elapsed();
+        let cursor_blink_enabled = self.user_config.active().cursor_blink;
         let font = Arc::clone(&self.font);
         let renderer = Arc::clone(&self.renderer);
         let tab = self.active();
@@ -1114,7 +1130,7 @@ impl App {
             Some(CursorOverlay::Block { col, row, color }) if !focused => {
                 Some(Some(CursorOverlay::HollowBlock { col, row, color }))
             }
-            Some(CursorOverlay::Block { col, row, color }) => {
+            Some(CursorOverlay::Block { col, row, color }) if cursor_blink_enabled => {
                 let blink_off = (blink_elapsed.as_millis() / 530) % 2 == 1;
                 if blink_off {
                     Some(Some(CursorOverlay::HollowBlock { col, row, color }))
@@ -1311,6 +1327,15 @@ impl App {
 
     pub(crate) fn logic(&mut self, ctx: &egui::Context) {
         self.reap_exited();
+        if self.user_config.active().scroll_on_output {
+            if let Some(tab) = self.tabs.get(self.active_tab) {
+                for pane in tab.panes.values() {
+                    if pane.dirty.load(std::sync::atomic::Ordering::Relaxed) {
+                        pane.scroll_to_bottom();
+                    }
+                }
+            }
+        }
         self.consume_pane_actions(ctx);
         self.forward_input(ctx);
     }
@@ -1457,7 +1482,7 @@ impl App {
                 let resp = ui.interact(
                     div.rect,
                     egui::Id::new(("divider", self.active_tab, div.path.clone())),
-                    egui::Sense::drag(),
+                    egui::Sense::click_and_drag(),
                 );
                 let divider_color = if resp.hovered() || resp.dragged() {
                     egui::Color32::from_gray(80)
@@ -1472,7 +1497,11 @@ impl App {
                 if resp.hovered() || resp.dragged() {
                     ui.ctx().set_cursor_icon(cursor);
                 }
-                if resp.dragged() {
+                if resp.double_clicked() {
+                    self.tabs[self.active_tab]
+                        .layout
+                        .set_ratio(&div.path, 0.5);
+                } else if resp.dragged() {
                     if let Some(pointer) = resp.interact_pointer_pos() {
                         let new_ratio = match div.dir {
                             layout::Direction::Vertical => {
@@ -1708,6 +1737,9 @@ impl App {
                             if let Some(text) = pane.selection_text() {
                                 if !text.is_empty() {
                                     write_primary(&text);
+                                    if self.user_config.active().copy_on_selection {
+                                        self.egui_ctx.copy_text(text);
+                                    }
                                 }
                             }
                         }
@@ -2195,6 +2227,27 @@ fn draw_prefs_profiles(
                 .small()
                 .weak(),
             );
+
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new("Cursor").strong());
+            ui.checkbox(&mut profile.cursor_blink, "Cursor blink");
+
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new("Clipboard").strong());
+            ui.checkbox(&mut profile.copy_on_selection, "Copy on selection");
+            ui.checkbox(&mut profile.smart_copy, "Smart copy (Ctrl+Shift+C sends Ctrl+C when no selection)");
+
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new("Scroll behavior").strong());
+            ui.checkbox(&mut profile.scroll_on_output, "Scroll on output");
+            ui.checkbox(&mut profile.scroll_on_keystroke, "Scroll on keystroke");
+
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new("Selection").strong());
+            ui.horizontal(|ui| {
+                ui.label("Word characters");
+                ui.text_edit_singleline(&mut profile.word_chars);
+            });
         });
     });
 }

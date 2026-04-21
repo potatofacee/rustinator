@@ -53,6 +53,26 @@ pub struct Profile {
     pub colors: ColorsConfig,
     pub scrollback: ScrollbackConfig,
     pub transparency: TransparencyConfig,
+    #[serde(default)]
+    pub copy_on_selection: bool,
+    #[serde(default)]
+    pub smart_copy: bool,
+    #[serde(default = "default_true")]
+    pub cursor_blink: bool,
+    #[serde(default)]
+    pub scroll_on_output: bool,
+    #[serde(default = "default_true")]
+    pub scroll_on_keystroke: bool,
+    #[serde(default = "default_word_chars")]
+    pub word_chars: String,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_word_chars() -> String {
+    "-A-Za-z0-9,./?%&#:_=+@~".into()
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -118,6 +138,12 @@ impl Profile {
             colors: ColorsConfig::default(),
             scrollback: ScrollbackConfig::default(),
             transparency: TransparencyConfig::default(),
+            copy_on_selection: false,
+            smart_copy: false,
+            cursor_blink: true,
+            scroll_on_output: false,
+            scroll_on_keystroke: true,
+            word_chars: default_word_chars(),
         }
     }
 
@@ -221,6 +247,12 @@ impl Config {
                 colors: self.colors.take().unwrap_or_default(),
                 scrollback: self.scrollback.take().unwrap_or_default(),
                 transparency: TransparencyConfig::default(),
+                copy_on_selection: false,
+                smart_copy: false,
+                cursor_blink: true,
+                scroll_on_output: false,
+                scroll_on_keystroke: true,
+                word_chars: default_word_chars(),
             };
             self.profiles = vec![profile];
             if self.active_profile.is_empty() {
@@ -285,6 +317,27 @@ fn config_path() -> Option<PathBuf> {
     } else {
         Some(PathBuf::from(&home).join(".config/rustinator/config.toml"))
     }
+}
+
+pub fn word_chars_to_semantic_escape(word_chars: &str) -> String {
+    let mut word_set = std::collections::HashSet::new();
+    let chars: Vec<char> = word_chars.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if i + 2 < chars.len() && chars[i + 1] == '-' {
+            let start = chars[i];
+            let end = chars[i + 2];
+            for c in start..=end {
+                word_set.insert(c);
+            }
+            i += 3;
+        } else {
+            word_set.insert(chars[i]);
+            i += 1;
+        }
+    }
+    let candidates = ",|:\"' ()[]{}<>\t`│;!^*\\~$#@&%?/.-_=+";
+    candidates.chars().filter(|c| !word_set.contains(c)).collect()
 }
 
 fn parse_hex(s: &str) -> Option<[u8; 3]> {
