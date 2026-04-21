@@ -138,6 +138,7 @@ enum PaneAction {
     ResetTerminal,
     ResetClear,
     NewWindow,
+    OpenTerminalHere,
 }
 
 impl App {
@@ -202,6 +203,7 @@ impl App {
             term_config.clone(),
             pane_defaults,
             Some(event_loop_proxy.clone()),
+            None,
         ).map_err(|e| format!("first pane: {e}"))?;
 
         Ok(Self {
@@ -429,6 +431,9 @@ impl App {
     }
 
     fn update_window_title(&mut self) {
+        if self.tabs.is_empty() {
+            return;
+        }
         let tab = &self.tabs[self.active_tab];
         let focused_title = tab
             .panes
@@ -447,7 +452,7 @@ impl App {
         }
     }
 
-    fn spawn_pane(&mut self, id: PaneId, cols: usize, lines: usize) -> Option<Pane> {
+    fn spawn_pane(&mut self, id: PaneId, cols: usize, lines: usize, cwd: Option<&std::path::Path>) -> Option<Pane> {
         match Pane::spawn(
             id,
             cols,
@@ -458,6 +463,7 @@ impl App {
             self.term_config.clone(),
             self.pane_defaults,
             Some(self.event_loop_proxy.clone()),
+            cwd,
         ) {
             Ok(pane) => Some(pane),
             Err(e) => {
@@ -472,6 +478,9 @@ impl App {
     }
 
     fn consume_pane_actions(&mut self, ctx: &egui::Context) {
+        if self.tabs.is_empty() || ctx.egui_wants_keyboard_input() {
+            return;
+        }
         let mut actions: Vec<PaneAction> = Vec::new();
         let bindings = &self.bindings;
 
@@ -537,6 +546,7 @@ impl App {
                 PaneAction::ResetTerminal => self.reset_focused_terminal(false),
                 PaneAction::ResetClear => self.reset_focused_terminal(true),
                 PaneAction::NewWindow => { let _ = std::process::Command::new(std::env::current_exe().unwrap_or_default()).spawn(); }
+                PaneAction::OpenTerminalHere => self.split_here(),
                 PaneAction::SplitAuto | PaneAction::ToggleReadOnly
                 | PaneAction::SetTitle => {}
             }
@@ -690,7 +700,7 @@ impl App {
         while existing_ids.len() < needed {
             let new_id = self.next_pane_id;
             self.next_pane_id += 1;
-            let Some(pane) = self.spawn_pane(new_id, 80, 24) else { break };
+            let Some(pane) = self.spawn_pane(new_id, 80, 24, None) else { break };
             self.active().panes.insert(new_id, pane);
             existing_ids.push(new_id);
         }
@@ -903,13 +913,35 @@ impl App {
     }
 
     fn split(&mut self, dir: Direction) {
+        let focused = self.tabs[self.active_tab].focused;
+        let cwd = self.tabs[self.active_tab].panes.get(&focused)
+            .and_then(|p| p.cwd());
         let new_id = self.next_pane_id;
         self.next_pane_id += 1;
-        let Some(pane) = self.spawn_pane(new_id, 80, 24) else { return };
+        let Some(pane) = self.spawn_pane(new_id, 80, 24, cwd.as_deref()) else { return };
         let active = self.active();
         active.panes.insert(new_id, pane);
         if !active.layout.split_leaf(active.focused, new_id, dir) {
             eprintln!("split: focused leaf {} not found in layout", active.focused);
+        }
+        active.focused = new_id;
+    }
+
+    fn split_here(&mut self) {
+        let dir = match self.last_pane_rect {
+            Some(r) if r.width() >= r.height() => Direction::Vertical,
+            _ => Direction::Horizontal,
+        };
+        let focused = self.tabs[self.active_tab].focused;
+        let cwd = self.tabs[self.active_tab].panes.get(&focused)
+            .and_then(|p| p.cwd());
+        let new_id = self.next_pane_id;
+        self.next_pane_id += 1;
+        let Some(pane) = self.spawn_pane(new_id, 80, 24, cwd.as_deref()) else { return };
+        let active = self.active();
+        active.panes.insert(new_id, pane);
+        if !active.layout.split_leaf(active.focused, new_id, dir) {
+            eprintln!("split_here: focused leaf {} not found in layout", active.focused);
         }
         active.focused = new_id;
     }
@@ -979,7 +1011,7 @@ impl App {
     fn new_tab(&mut self) {
         let new_id = self.next_pane_id;
         self.next_pane_id += 1;
-        let Some(pane) = self.spawn_pane(new_id, INITIAL_COLS as usize, INITIAL_LINES as usize) else { return };
+        let Some(pane) = self.spawn_pane(new_id, INITIAL_COLS as usize, INITIAL_LINES as usize, None) else { return };
         self.tabs.push(Tab::new(pane));
         self.active_tab = self.tabs.len() - 1;
     }
@@ -994,6 +1026,9 @@ impl App {
     }
 
     fn forward_input(&self, ctx: &egui::Context) {
+        if self.tabs.is_empty() || ctx.egui_wants_keyboard_input() {
+            return;
+        }
         let events = ctx.input(|i| i.events.clone());
         let tab = &self.tabs[self.active_tab];
         let targets: Vec<&Pane> = if tab.broadcast {
@@ -1336,7 +1371,7 @@ impl App {
                     );
                     let close_resp = ui.interact(
                         close_rect,
-                        egui::Id::new(("tab_close", tab.focused)),
+                        egui::Id::new(("tab_close", i)),
                         egui::Sense::click(),
                     );
                     close_resp.surrender_focus();
@@ -1390,7 +1425,9 @@ impl App {
             self.new_tab();
         }
 
-        self.draw_panes(ui);
+        if !self.tabs.is_empty() {
+            self.draw_panes(ui);
+        }
     }
 }
 
@@ -1760,6 +1797,10 @@ impl App {
                 ui.separator();
                 if ui.button("Set title…").clicked() {
                     deferred.push(PaneAction::SetTitle);
+                    ui.close();
+                }
+                if ui.button("Open Terminal Here").clicked() {
+                    deferred.push(PaneAction::OpenTerminalHere);
                     ui.close();
                 }
                 if ui.button("Close Pane").clicked() {
