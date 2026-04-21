@@ -78,20 +78,20 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    pub fn new(gl: Arc<glow::Context>, font: &FontContext) -> Self {
+    pub fn new(gl: Arc<glow::Context>, font: &FontContext) -> Result<Self, String> {
         unsafe {
-            let bg_program = compile_program(&gl, BG_VERT, BG_FRAG, &[]);
-            let glyph_program = compile_program(&gl, GLYPH_VERT, GLYPH_FRAG, &[]);
+            let bg_program = compile_program(&gl, BG_VERT, BG_FRAG, &[])?;
+            let glyph_program = compile_program(&gl, GLYPH_VERT, GLYPH_FRAG, &[])?;
 
             // VAO layout:
             //   binding 0: quad_vbo         → location 0 (vec2 in_pos)
             //   binding 1: instance_vbo     → locations 1..N, divisor 1
             // We re-bind the instance VBO between the two passes because the
             // two instance layouts differ in stride and attribute count.
-            let vao = gl.create_vertex_array().expect("vao");
+            let vao = gl.create_vertex_array().map_err(|e| format!("create vao: {e}"))?;
             gl.bind_vertex_array(Some(vao));
 
-            let quad_vbo = gl.create_buffer().expect("quad vbo");
+            let quad_vbo = gl.create_buffer().map_err(|e| format!("create quad vbo: {e}"))?;
             gl.bind_buffer(glow::ARRAY_BUFFER, Some(quad_vbo));
             gl.buffer_data_u8_slice(
                 glow::ARRAY_BUFFER,
@@ -101,14 +101,14 @@ impl Renderer {
             gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, 8, 0);
             gl.enable_vertex_attrib_array(0);
 
-            let bg_instance_vbo = gl.create_buffer().expect("bg instance vbo");
-            let glyph_instance_vbo = gl.create_buffer().expect("glyph instance vbo");
+            let bg_instance_vbo = gl.create_buffer().map_err(|e| format!("create bg instance vbo: {e}"))?;
+            let glyph_instance_vbo = gl.create_buffer().map_err(|e| format!("create glyph instance vbo: {e}"))?;
 
             gl.bind_vertex_array(None);
             gl.bind_buffer(glow::ARRAY_BUFFER, None);
 
             // Atlas — RGBA8, starts cleared to 0.
-            let atlas_tex = gl.create_texture().expect("atlas texture");
+            let atlas_tex = gl.create_texture().map_err(|e| format!("create atlas texture: {e}"))?;
             gl.bind_texture(glow::TEXTURE_2D, Some(atlas_tex));
             gl.tex_parameter_i32(
                 glow::TEXTURE_2D,
@@ -144,17 +144,17 @@ impl Renderer {
             );
             gl.bind_texture(glow::TEXTURE_2D, None);
 
-            let bg_u_cell_size = gl.get_uniform_location(bg_program, "u_cell_size").unwrap();
-            let bg_u_viewport = gl.get_uniform_location(bg_program, "u_viewport").unwrap();
-            let glyph_u_cell_size = gl
-                .get_uniform_location(glyph_program, "u_cell_size")
-                .unwrap();
-            let glyph_u_viewport = gl
-                .get_uniform_location(glyph_program, "u_viewport")
-                .unwrap();
-            let glyph_u_atlas = gl.get_uniform_location(glyph_program, "u_atlas").unwrap();
+            let u = |prog, name: &str| {
+                gl.get_uniform_location(prog, name)
+                    .ok_or_else(|| format!("uniform '{name}' not found"))
+            };
+            let bg_u_cell_size = u(bg_program, "u_cell_size")?;
+            let bg_u_viewport = u(bg_program, "u_viewport")?;
+            let glyph_u_cell_size = u(glyph_program, "u_cell_size")?;
+            let glyph_u_viewport = u(glyph_program, "u_viewport")?;
+            let glyph_u_atlas = u(glyph_program, "u_atlas")?;
 
-            Self {
+            Ok(Self {
                 gl,
                 bg_program,
                 glyph_program,
@@ -174,9 +174,8 @@ impl Renderer {
                 glyph_u_atlas,
                 cell_w: font.cell_width(),
                 cell_h: font.cell_height(),
-                // FreeType's descender is negative; baseline-from-top = line_height + descent.
                 ascent: font.cell_height() + font.metrics.descent,
-            }
+            })
         }
     }
 
@@ -463,38 +462,46 @@ unsafe fn compile_program(
     vert_src: &str,
     frag_src: &str,
     frag_data_bindings: &[(&str, u32, u32)],
-) -> glow::Program {
+) -> Result<glow::Program, String> {
     unsafe {
-        let program = gl.create_program().expect("program");
-        let vert = gl.create_shader(glow::VERTEX_SHADER).expect("vert shader");
+        let program = gl.create_program().map_err(|e| format!("create program: {e}"))?;
+        let vert = gl.create_shader(glow::VERTEX_SHADER).map_err(|e| format!("create vert shader: {e}"))?;
         gl.shader_source(vert, vert_src);
         gl.compile_shader(vert);
         if !gl.get_shader_compile_status(vert) {
-            panic!("vert shader compile: {}", gl.get_shader_info_log(vert));
+            let log = gl.get_shader_info_log(vert);
+            gl.delete_shader(vert);
+            return Err(format!("vertex shader compile: {log}"));
         }
         let frag = gl
             .create_shader(glow::FRAGMENT_SHADER)
-            .expect("frag shader");
+            .map_err(|e| format!("create frag shader: {e}"))?;
         gl.shader_source(frag, frag_src);
         gl.compile_shader(frag);
         if !gl.get_shader_compile_status(frag) {
-            panic!("frag shader compile: {}", gl.get_shader_info_log(frag));
+            let log = gl.get_shader_info_log(frag);
+            gl.delete_shader(vert);
+            gl.delete_shader(frag);
+            return Err(format!("fragment shader compile: {log}"));
         }
         gl.attach_shader(program, vert);
         gl.attach_shader(program, frag);
-        // Bind dual-source fragment outputs before linking.
         for (name, color, _) in frag_data_bindings {
             gl.bind_frag_data_location(program, *color, name);
         }
         gl.link_program(program);
         if !gl.get_program_link_status(program) {
-            panic!("program link: {}", gl.get_program_info_log(program));
+            let log = gl.get_program_info_log(program);
+            gl.delete_shader(vert);
+            gl.delete_shader(frag);
+            gl.delete_program(program);
+            return Err(format!("program link: {log}"));
         }
         gl.detach_shader(program, vert);
         gl.detach_shader(program, frag);
         gl.delete_shader(vert);
         gl.delete_shader(frag);
-        program
+        Ok(program)
     }
 }
 

@@ -98,6 +98,7 @@ pub(crate) struct App {
     fullscreen_pending: bool,
     pending_zoom_steps: i32,
     cursor_blink_epoch: Instant,
+    drag_source_pane: Option<PaneId>,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -145,15 +146,20 @@ impl App {
         egui_ctx: egui::Context,
         event_loop_proxy: EventLoopProxy<window::UserEvent>,
         scale_factor: f32,
-    ) -> Self {
+    ) -> Result<Self, String> {
         tty::setup_env();
 
         let user_config = Config::load();
         let profile = user_config.active();
         let base_font_size = profile.font.size;
 
+        let fallback_font = if cfg!(target_os = "macos") { "Menlo" } else { "monospace" };
         let font_ctx = FontContext::new(&profile.font.family, profile.font.size * scale_factor)
-            .expect("failed to load font");
+            .or_else(|e| {
+                eprintln!("font '{}' failed ({e}), falling back to '{fallback_font}'", profile.font.family);
+                FontContext::new(fallback_font, profile.font.size * scale_factor)
+            })
+            .map_err(|e| format!("failed to load any font: {e}"))?;
         let m = font_ctx.metrics;
         eprintln!(
             "font loaded: family={} size={:.1}pt advance={:.2}px line_height={:.2}px",
@@ -162,7 +168,8 @@ impl App {
         let cell_w = font_ctx.cell_width();
         let cell_h = font_ctx.cell_height();
 
-        let renderer = Renderer::new(gl, &font_ctx);
+        let renderer = Renderer::new(gl, &font_ctx)
+            .map_err(|e| format!("GPU renderer init failed: {e}"))?;
 
         let mut term_config = TermConfig::default();
         term_config.scrolling_history = profile.scrollback.effective_history();
@@ -195,9 +202,9 @@ impl App {
             term_config.clone(),
             pane_defaults,
             Some(event_loop_proxy.clone()),
-        );
+        ).map_err(|e| format!("first pane: {e}"))?;
 
-        Self {
+        Ok(Self {
             tabs: vec![Tab::new(pane)],
             active_tab: 0,
             next_pane_id: first_id + 1,
@@ -235,7 +242,8 @@ impl App {
             fullscreen_pending: false,
             pending_zoom_steps: 0,
             cursor_blink_epoch: Instant::now(),
-        }
+            drag_source_pane: None,
+        })
     }
 
     fn total_alive_panes(&self) -> usize {
@@ -439,8 +447,8 @@ impl App {
         }
     }
 
-    fn spawn_pane(&mut self, id: PaneId, cols: usize, lines: usize) -> Pane {
-        Pane::spawn(
+    fn spawn_pane(&mut self, id: PaneId, cols: usize, lines: usize) -> Option<Pane> {
+        match Pane::spawn(
             id,
             cols,
             lines,
@@ -450,7 +458,13 @@ impl App {
             self.term_config.clone(),
             self.pane_defaults,
             Some(self.event_loop_proxy.clone()),
-        )
+        ) {
+            Ok(pane) => Some(pane),
+            Err(e) => {
+                eprintln!("failed to spawn pane: {e}");
+                None
+            }
+        }
     }
 
     fn active(&mut self) -> &mut Tab {
@@ -676,7 +690,7 @@ impl App {
         while existing_ids.len() < needed {
             let new_id = self.next_pane_id;
             self.next_pane_id += 1;
-            let pane = self.spawn_pane(new_id, 80, 24);
+            let Some(pane) = self.spawn_pane(new_id, 80, 24) else { break };
             self.active().panes.insert(new_id, pane);
             existing_ids.push(new_id);
         }
@@ -891,7 +905,7 @@ impl App {
     fn split(&mut self, dir: Direction) {
         let new_id = self.next_pane_id;
         self.next_pane_id += 1;
-        let pane = self.spawn_pane(new_id, 80, 24);
+        let Some(pane) = self.spawn_pane(new_id, 80, 24) else { return };
         let active = self.active();
         active.panes.insert(new_id, pane);
         if !active.layout.split_leaf(active.focused, new_id, dir) {
@@ -965,7 +979,7 @@ impl App {
     fn new_tab(&mut self) {
         let new_id = self.next_pane_id;
         self.next_pane_id += 1;
-        let pane = self.spawn_pane(new_id, INITIAL_COLS as usize, INITIAL_LINES as usize);
+        let Some(pane) = self.spawn_pane(new_id, INITIAL_COLS as usize, INITIAL_LINES as usize) else { return };
         self.tabs.push(Tab::new(pane));
         self.active_tab = self.tabs.len() - 1;
     }
@@ -1448,6 +1462,7 @@ impl App {
         let alt_held = mods.alt;
         let mut deferred: Vec<PaneAction> = Vec::new();
         let show_title_bars = leaves.len() > 1;
+        let mut pane_drop_rects: Vec<(PaneId, egui::Rect)> = Vec::new();
 
         {
             let elapsed_ms = self.cursor_blink_epoch.elapsed().as_millis() as u64;
@@ -1485,6 +1500,22 @@ impl App {
                 };
                 ui.painter().rect_filled(tr, 0.0, bg);
 
+                let title_resp = ui.interact(
+                    tr,
+                    egui::Id::new(("title_bar", self.active_tab, id)),
+                    egui::Sense::click_and_drag(),
+                );
+                if title_resp.drag_started() {
+                    self.drag_source_pane = Some(id);
+                    self.active().focused = id;
+                }
+                if title_resp.clicked() {
+                    self.active().focused = id;
+                }
+                if title_resp.dragged() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                }
+
                 let title_text = self.tabs[self.active_tab]
                     .panes
                     .get(&id)
@@ -1513,6 +1544,8 @@ impl App {
                     .anchor_size(tr.center(), galley.size());
                 ui.painter().galley(pos.min, galley, text_color);
             }
+
+            pane_drop_rects.push((id, rect));
 
             let response = ui.interact(
                 terminal_rect,
@@ -1660,6 +1693,21 @@ impl App {
             let focused = id == self.tabs[self.active_tab].focused;
             self.paint_pane(ui, id, terminal_rect, focused, url_highlight);
 
+            if self.drag_source_pane.is_some()
+                && self.drag_source_pane != Some(id)
+            {
+                if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
+                    if rect.contains(pos) {
+                        let zone = drop_zone_rect(rect, pos);
+                        ui.painter().rect_filled(
+                            zone,
+                            0.0,
+                            egui::Color32::from_rgba_unmultiplied(0x40, 0x60, 0xc0, 0x50),
+                        );
+                    }
+                }
+            }
+
             self.last_pane_rect = Some(terminal_rect);
             response.context_menu(|ui| {
                 if ui.button("Copy").clicked() {
@@ -1749,6 +1797,28 @@ impl App {
             });
         }
 
+        if self.drag_source_pane.is_some() && !ui.input(|i| i.pointer.any_down()) {
+            if let Some(src) = self.drag_source_pane.take() {
+                if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
+                    for (tid, full_rect) in &pane_drop_rects {
+                        if *tid != src && full_rect.contains(pos) {
+                            let (dir, src_first) = drop_zone_direction(*full_rect, pos);
+                            let tab = &mut self.tabs[self.active_tab];
+                            tab.layout.remove_leaf(src);
+                            if src_first {
+                                tab.layout.split_leaf(*tid, src, dir);
+                                tab.layout.swap_leaves(src, *tid);
+                            } else {
+                                tab.layout.split_leaf(*tid, src, dir);
+                            }
+                            tab.focused = src;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
         for action in deferred {
             match action {
                 PaneAction::SplitHorizontal => self.split(Direction::Horizontal),
@@ -1831,6 +1901,47 @@ fn write_primary(text: &str) {
     target_os = "openbsd"
 )))]
 fn write_primary(_: &str) {}
+
+fn drop_zone_direction(rect: egui::Rect, pos: egui::Pos2) -> (Direction, bool) {
+    let rx = (pos.x - rect.left()) / rect.width();
+    let ry = (pos.y - rect.top()) / rect.height();
+    let dist_left = rx;
+    let dist_right = 1.0 - rx;
+    let dist_top = ry;
+    let dist_bottom = 1.0 - ry;
+    let min = dist_left.min(dist_right).min(dist_top).min(dist_bottom);
+    if min == dist_left {
+        (Direction::Vertical, true)
+    } else if min == dist_right {
+        (Direction::Vertical, false)
+    } else if min == dist_top {
+        (Direction::Horizontal, true)
+    } else {
+        (Direction::Horizontal, false)
+    }
+}
+
+fn drop_zone_rect(rect: egui::Rect, pos: egui::Pos2) -> egui::Rect {
+    let (dir, first) = drop_zone_direction(rect, pos);
+    match (dir, first) {
+        (Direction::Vertical, true) => egui::Rect::from_min_max(
+            rect.min,
+            egui::pos2(rect.center().x, rect.bottom()),
+        ),
+        (Direction::Vertical, false) => egui::Rect::from_min_max(
+            egui::pos2(rect.center().x, rect.top()),
+            rect.max,
+        ),
+        (Direction::Horizontal, true) => egui::Rect::from_min_max(
+            rect.min,
+            egui::pos2(rect.right(), rect.center().y),
+        ),
+        (Direction::Horizontal, false) => egui::Rect::from_min_max(
+            egui::pos2(rect.left(), rect.center().y),
+            rect.max,
+        ),
+    }
+}
 
 fn cell_at(p: egui::Pos2, rect: egui::Rect, ppp: f32, cell_w: f32, cell_h: f32) -> (i32, i32) {
     let rel_x = ((p.x - rect.left()).max(0.0)) * ppp;

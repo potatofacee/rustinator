@@ -333,7 +333,7 @@ impl Pane {
         term_config: Config,
         defaults: PaneDefaults,
         winit_proxy: Option<winit::event_loop::EventLoopProxy<crate::window::UserEvent>>,
-    ) -> Self {
+    ) -> Result<Self, String> {
         let proxy = EventProxy::new(ctx, winit_proxy);
         let dirty = Arc::clone(&proxy.dirty);
         let exited = Arc::clone(&proxy.exited);
@@ -353,13 +353,14 @@ impl Pane {
         let mut pty_opts = tty::Options::default();
         pty_opts.env.insert("TERM".into(), "xterm-256color".into());
         crate::shell_integration::inject_env(&mut pty_opts.env);
-        let pty = tty::new(&pty_opts, window_size, id).expect("failed to open pty");
+        let pty = tty::new(&pty_opts, window_size, id)
+            .map_err(|e| format!("failed to open pty: {e}"))?;
         let event_loop = EventLoop::new(Arc::clone(&terminal), proxy, pty, false, false)
-            .expect("failed to create pty event loop");
+            .map_err(|e| format!("failed to create pty event loop: {e}"))?;
         let pty_tx = event_loop.channel();
         let _handle = event_loop.spawn();
 
-        Self {
+        Ok(Self {
             id,
             terminal,
             pty_tx,
@@ -371,7 +372,7 @@ impl Pane {
             cached: None,
             defaults,
             read_only: false,
-        }
+        })
     }
 
     pub fn title(&self) -> Option<String> {
