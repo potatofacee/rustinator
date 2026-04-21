@@ -516,6 +516,14 @@ impl Pane {
         self.dirty.store(true, Ordering::Release);
     }
 
+    pub fn scroll_to_bottom(&self) {
+        let mut term = self.terminal.lock();
+        if term.grid().display_offset() != 0 {
+            term.scroll_display(Scroll::Bottom);
+            self.dirty.store(true, Ordering::Release);
+        }
+    }
+
     /// Search scrollback for `needle` (plain text; regex-escaped internally).
     /// Searches backward from the cursor by default. Sets the selection to the
     /// match and scrolls it into view. Returns true if a match was found.
