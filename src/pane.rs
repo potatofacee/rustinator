@@ -312,6 +312,7 @@ pub struct Pane {
     pub id: PaneId,
     pub terminal: Arc<FairMutex<Term<EventProxy>>>,
     pub pty_tx: EventLoopSender,
+    pub child_pid: u32,
     pub cols: usize,
     pub lines: usize,
     pub dirty: Arc<AtomicBool>,
@@ -333,6 +334,7 @@ impl Pane {
         term_config: Config,
         defaults: PaneDefaults,
         winit_proxy: Option<winit::event_loop::EventLoopProxy<crate::window::UserEvent>>,
+        working_dir: Option<&std::path::Path>,
     ) -> Result<Self, String> {
         let proxy = EventProxy::new(ctx, winit_proxy);
         let dirty = Arc::clone(&proxy.dirty);
@@ -353,8 +355,12 @@ impl Pane {
         let mut pty_opts = tty::Options::default();
         pty_opts.env.insert("TERM".into(), "xterm-256color".into());
         crate::shell_integration::inject_env(&mut pty_opts.env);
+        if let Some(dir) = working_dir {
+            pty_opts.working_directory = Some(dir.to_path_buf());
+        }
         let pty = tty::new(&pty_opts, window_size, id)
             .map_err(|e| format!("failed to open pty: {e}"))?;
+        let child_pid = pty.child().id();
         let event_loop = EventLoop::new(Arc::clone(&terminal), proxy, pty, false, false)
             .map_err(|e| format!("failed to create pty event loop: {e}"))?;
         let pty_tx = event_loop.channel();
@@ -364,6 +370,7 @@ impl Pane {
             id,
             terminal,
             pty_tx,
+            child_pid,
             cols,
             lines,
             dirty,
@@ -377,6 +384,10 @@ impl Pane {
 
     pub fn title(&self) -> Option<String> {
         self.title.lock().unwrap().clone()
+    }
+
+    pub fn cwd(&self) -> Option<std::path::PathBuf> {
+        pane_cwd(self.child_pid)
     }
 
     pub fn resize(&mut self, cols: usize, lines: usize, cell_w: f32, cell_h: f32) {
@@ -659,4 +670,33 @@ impl Pane {
             urls,
         }
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))]
+fn pane_cwd(pid: u32) -> Option<std::path::PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+}
+
+#[cfg(target_os = "macos")]
+fn pane_cwd(pid: u32) -> Option<std::path::PathBuf> {
+    use std::process::Command;
+    let output = Command::new("lsof")
+        .args(["-p", &pid.to_string(), "-Fn", "-d", "cwd"])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    for line in text.lines() {
+        if let Some(path) = line.strip_prefix('n') {
+            return Some(std::path::PathBuf::from(path));
+        }
+    }
+    None
+}
+
+#[cfg(not(any(
+    target_os = "linux", target_os = "freebsd", target_os = "netbsd",
+    target_os = "openbsd", target_os = "macos"
+)))]
+fn pane_cwd(_pid: u32) -> Option<std::path::PathBuf> {
+    None
 }
