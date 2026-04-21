@@ -216,6 +216,7 @@ pub struct UrlMatch {
 pub enum CursorOverlay {
     Beam { col: i32, row: i32, color: [f32; 4] },
     Underline { col: i32, row: i32, color: [f32; 4] },
+    Block { col: i32, row: i32, color: [f32; 4] },
     HollowBlock { col: i32, row: i32, color: [f32; 4] },
 }
 
@@ -597,7 +598,12 @@ impl Pane {
                     row: cursor_row,
                     color: cursor_color,
                 }),
-                CursorShape::Block | CursorShape::HollowBlock => {
+                CursorShape::Block => Some(CursorOverlay::Block {
+                    col: cursor_col,
+                    row: cursor_row,
+                    color: cursor_color,
+                }),
+                CursorShape::HollowBlock => {
                     Some(CursorOverlay::HollowBlock {
                         col: cursor_col,
                         row: cursor_row,

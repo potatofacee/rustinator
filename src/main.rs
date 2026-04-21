@@ -12,6 +12,7 @@ pub mod window;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use alacritty_terminal::selection::SelectionType;
 
@@ -96,6 +97,7 @@ pub(crate) struct App {
     scale_factor: f32,
     fullscreen_pending: bool,
     pending_zoom_steps: i32,
+    cursor_blink_epoch: Instant,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -232,6 +234,7 @@ impl App {
             scale_factor,
             fullscreen_pending: false,
             pending_zoom_steps: 0,
+            cursor_blink_epoch: Instant::now(),
         }
     }
 
@@ -1036,6 +1039,7 @@ impl App {
     ) {
         let cell_w = self.cell_w;
         let cell_h = self.cell_h;
+        let blink_elapsed = self.cursor_blink_epoch.elapsed();
         let font = Arc::clone(&self.font);
         let renderer = Arc::clone(&self.renderer);
         let tab = self.active();
@@ -1056,6 +1060,21 @@ impl App {
         pane.resize(new_cols, new_lines, cell_w, cell_h);
 
         let frame = pane.frame();
+
+        let cursor_override = match frame.cursor {
+            Some(CursorOverlay::Block { col, row, color }) if !focused => {
+                Some(Some(CursorOverlay::HollowBlock { col, row, color }))
+            }
+            Some(CursorOverlay::Block { col, row, color }) => {
+                let blink_off = (blink_elapsed.as_millis() / 530) % 2 == 1;
+                if blink_off {
+                    Some(Some(CursorOverlay::HollowBlock { col, row, color }))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
 
         let url_underline = url_highlight;
         let url_color: [f32; 4] = {
@@ -1098,10 +1117,19 @@ impl App {
                 }
             }
 
-            if let Some(overlay) = frame.cursor {
+            let effective_cursor = cursor_override.unwrap_or(frame.cursor);
+            if let Some(overlay) = effective_cursor {
                 let cw = renderer.cell_w;
                 let ch = renderer.cell_h;
                 match overlay {
+                    CursorOverlay::Block { col, row, color } => {
+                        bg.push(BgInstance {
+                            cell: [col, row],
+                            color,
+                            offset_cells: [0.0, 0.0],
+                            size_cells: [1.0, 1.0],
+                        });
+                    }
                     CursorOverlay::Beam { col, row, color } => {
                         let frac = (2.0 / cw).clamp(0.05, 0.3);
                         bg.push(BgInstance {
@@ -1159,6 +1187,14 @@ impl App {
             rect: inner_rect,
             callback: Arc::new(cb),
         });
+
+        if !focused {
+            ui.painter().rect_filled(
+                inner_rect,
+                0.0,
+                egui::Color32::from_black_alpha(50),
+            );
+        }
 
         if focused && std::env::var("RUSTINATOR_NO_FOCUS_BORDER").is_err() {
             let color = if self.tabs[self.active_tab].broadcast {
@@ -1412,6 +1448,12 @@ impl App {
         let alt_held = mods.alt;
         let mut deferred: Vec<PaneAction> = Vec::new();
         let show_title_bars = leaves.len() > 1;
+
+        {
+            let elapsed_ms = self.cursor_blink_epoch.elapsed().as_millis() as u64;
+            let next_toggle = 530 - (elapsed_ms % 530);
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(next_toggle));
+        }
 
         if self.pending_zoom_steps != 0 {
             let steps = self.pending_zoom_steps;
