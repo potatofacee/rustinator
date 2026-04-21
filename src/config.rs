@@ -280,7 +280,11 @@ fn config_path() -> Option<PathBuf> {
         return Some(PathBuf::from(x).join("rustinator/config.toml"));
     }
     let home = std::env::var("HOME").ok()?;
-    Some(PathBuf::from(home).join(".config/rustinator/config.toml"))
+    if cfg!(target_os = "macos") {
+        Some(PathBuf::from(&home).join("Library/Application Support/rustinator/config.toml"))
+    } else {
+        Some(PathBuf::from(&home).join(".config/rustinator/config.toml"))
+    }
 }
 
 fn parse_hex(s: &str) -> Option<[u8; 3]> {

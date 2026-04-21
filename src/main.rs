@@ -1564,7 +1564,8 @@ impl App {
             // Ctrl+click opens a URL if one is under the pointer. Skip selection handling in that case.
             let handled_by_url = if ctrl_held && response.clicked() {
                 if let Some(url) = url_at_pointer.as_ref() {
-                    let _ = std::process::Command::new("xdg-open").arg(&url.url).spawn();
+                    let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+                    let _ = std::process::Command::new(opener).arg(&url.url).spawn();
                     true
                 } else {
                     false
