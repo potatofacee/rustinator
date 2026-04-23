@@ -1126,17 +1126,19 @@ impl App {
 
         let frame = pane.frame();
 
+        let should_blink = cursor_blink_enabled || frame.cursor_blink_requested;
+        let blink_off = should_blink
+            && focused
+            && (blink_elapsed.as_millis() / 530) % 2 == 1;
         let cursor_override = match frame.cursor {
             Some(CursorOverlay::Block { col, row, color }) if !focused => {
                 Some(Some(CursorOverlay::HollowBlock { col, row, color }))
             }
-            Some(CursorOverlay::Block { col, row, color }) if cursor_blink_enabled => {
-                let blink_off = (blink_elapsed.as_millis() / 530) % 2 == 1;
-                if blink_off {
-                    Some(Some(CursorOverlay::HollowBlock { col, row, color }))
-                } else {
-                    None
-                }
+            Some(CursorOverlay::Block { col, row, color }) if blink_off => {
+                Some(Some(CursorOverlay::HollowBlock { col, row, color }))
+            }
+            Some(CursorOverlay::Beam { .. } | CursorOverlay::Underline { .. }) if blink_off => {
+                Some(None)
             }
             _ => None,
         };
@@ -1259,6 +1261,68 @@ impl App {
                 0.0,
                 egui::Color32::from_black_alpha(50),
             );
+        }
+
+        // Scrollbar overlay.
+        if let Some(pane) = self.tabs[self.active_tab].panes.get(&pane_id) {
+            let (offset, history, screen) = pane.scroll_info();
+            if history > 0 {
+                let total = history + screen;
+                let sb_width = 8.0;
+                let track = egui::Rect::from_min_max(
+                    egui::pos2(inner_rect.right() - sb_width, inner_rect.top()),
+                    inner_rect.right_bottom(),
+                );
+                let track_h = track.height();
+                let thumb_frac = (screen as f32 / total as f32).clamp(0.05, 1.0);
+                let thumb_h = (track_h * thumb_frac).max(16.0);
+                let scrollable = track_h - thumb_h;
+                let thumb_top = if history > 0 {
+                    track.top() + scrollable * (1.0 - offset as f32 / history as f32)
+                } else {
+                    track.top()
+                };
+                let thumb_rect = egui::Rect::from_min_size(
+                    egui::pos2(track.left(), thumb_top),
+                    egui::vec2(sb_width, thumb_h),
+                );
+
+                let sb_id = egui::Id::new(("scrollbar", self.active_tab, pane_id));
+                let resp = ui.interact(track, sb_id, egui::Sense::click_and_drag());
+
+                let hovered = resp.hovered() || resp.dragged();
+                let track_color = if hovered {
+                    egui::Color32::from_white_alpha(20)
+                } else {
+                    egui::Color32::TRANSPARENT
+                };
+                let thumb_color = if resp.dragged() {
+                    egui::Color32::from_white_alpha(140)
+                } else if hovered {
+                    egui::Color32::from_white_alpha(100)
+                } else {
+                    egui::Color32::from_white_alpha(50)
+                };
+
+                ui.painter().rect_filled(track, 0.0, track_color);
+                ui.painter().rect_filled(thumb_rect, sb_width / 2.0, thumb_color);
+
+                if resp.dragged() {
+                    if let Some(pos) = resp.interact_pointer_pos() {
+                        let frac = ((pos.y - track.top() - thumb_h / 2.0) / scrollable)
+                            .clamp(0.0, 1.0);
+                        let new_offset = ((1.0 - frac) * history as f32).round() as usize;
+                        pane.scroll_to_position(new_offset);
+                    }
+                } else if resp.clicked() {
+                    if let Some(pos) = resp.interact_pointer_pos() {
+                        let frac = ((pos.y - track.top() - thumb_h / 2.0) / scrollable)
+                            .clamp(0.0, 1.0);
+                        let new_offset = ((1.0 - frac) * history as f32).round() as usize;
+                        pane.scroll_to_position(new_offset);
+                    }
+                }
+            }
         }
 
         if focused && std::env::var("RUSTINATOR_NO_FOCUS_BORDER").is_err() {

@@ -400,4 +400,46 @@ mod tests {
         assert!((top.height() - 30.0).abs() < 0.01);
         assert!((bot.height() - 30.0).abs() < 0.01);
     }
+
+    // ── Gap inventory guardrails ──────────────────────────────────────
+
+    // Gap #9: clockwise rotation of panes
+    // When implementing: add Node::rotate_cw() that flips direction and swaps children.
+    // Then replace the panic with real assertions:
+    //   root.rotate_cw();
+    //   assert direction flipped to Horizontal, children reversed.
+    #[test]
+    #[ignore = "gap #9: Node::rotate_cw not yet implemented"]
+    fn rotate_cw_swaps_children() {
+        panic!("implement Node::rotate_cw(): flip split direction, reverse child order");
+    }
+
+    // Gap #9: counter-clockwise rotation
+    #[test]
+    #[ignore = "gap #9: Node::rotate_ccw not yet implemented"]
+    fn rotate_ccw_swaps_children() {
+        panic!("implement Node::rotate_ccw(): flip split direction, keep child order");
+    }
+
+    // Gap #45: rebalance dividers (equalize ratios)
+    // When implementing: add Node::rebalance() that sets ratio to 0.5.
+    #[test]
+    #[ignore = "gap #45: Node::rebalance not yet implemented"]
+    fn rebalance_equalizes_ratios() {
+        panic!("implement Node::rebalance(): set this split's ratio to 0.5");
+    }
+
+    // Gap #45: recursive rebalance (equalize all nested ratios)
+    #[test]
+    #[ignore = "gap #45: Node::rebalance_recursive not yet implemented"]
+    fn rebalance_recursive_equalizes_nested() {
+        panic!("implement Node::rebalance_recursive(): set all ratios to 0.5 recursively");
+    }
+
+    // Gap #4 (partial): layout template stores per-terminal metadata
+    #[test]
+    #[ignore = "gap #4 partial: LayoutTemplate doesn't store per-terminal cwd/command/group"]
+    fn layout_template_with_metadata() {
+        panic!("extend LayoutTemplate::Terminal to carry optional cwd, command, group, profile");
+    }
 }

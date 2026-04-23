@@ -62,3 +62,54 @@ pub fn inject_env(env: &mut std::collections::HashMap<String, String>) {
         dir.join("bashrc").to_string_lossy().into_owned(),
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_scripts_creates_zshrc() {
+        let dir = write_scripts();
+        assert!(dir.join(".zshrc").exists());
+    }
+
+    #[test]
+    fn write_scripts_creates_bashrc() {
+        let dir = write_scripts();
+        assert!(dir.join("bashrc").exists());
+    }
+
+    #[test]
+    fn inject_env_sets_zdotdir() {
+        let mut env = std::collections::HashMap::new();
+        inject_env(&mut env);
+        assert!(env.contains_key("ZDOTDIR"));
+        assert!(env.contains_key("BASH_ENV"));
+    }
+
+    // ── Gap inventory guardrails ──────────────────────────────────────
+
+    // Gap #24: login shell support
+    #[test]
+    #[ignore = "gap #24: login shell flag not yet supported in shell spawning"]
+    fn inject_env_login_shell_flag() {
+        let mut env = std::collections::HashMap::new();
+        inject_env(&mut env);
+        // When login_shell is true, the shell should be invoked with -l
+        // or the argv[0] should be prefixed with "-".
+        // This tests that the mechanism exists — actual behavior tested at spawn level.
+        assert!(env.contains_key("RUSTINATOR_LOGIN_SHELL")
+            || true, "login shell mechanism should be testable");
+        panic!("login shell support not yet wired into shell spawning");
+    }
+
+    // Gap #22: custom command support
+    #[test]
+    #[ignore = "gap #22: custom command not yet supported in shell spawning"]
+    fn custom_command_bypasses_default_shell() {
+        // When custom_command is set, Pane::spawn should use that instead
+        // of the user's login shell. This is a placeholder that proves
+        // the path exists.
+        panic!("custom command path not yet implemented in Pane::spawn");
+    }
+}

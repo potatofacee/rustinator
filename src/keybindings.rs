@@ -288,4 +288,114 @@ mod tests {
             Some(Action::SplitHorizontal)
         );
     }
+
+    // ── Gap inventory guardrails ──────────────────────────────────────
+    // Each #[ignore] test validates that a new Action variant exists and
+    // its string parses. Remove #[ignore] once implemented.
+
+    // Gap #9: pane rotation
+    #[test]
+    #[ignore = "gap #9: Action::RotateCW not yet implemented"]
+    fn action_rotate_cw() {
+        assert!(Action::from_str("rotate_cw").is_some());
+    }
+
+    #[test]
+    #[ignore = "gap #9: Action::RotateCCW not yet implemented"]
+    fn action_rotate_ccw() {
+        assert!(Action::from_str("rotate_ccw").is_some());
+    }
+
+    // Gap #29: tab reorder by keyboard
+    #[test]
+    #[ignore = "gap #29: Action::MoveTabLeft not yet implemented"]
+    fn action_move_tab_left() {
+        assert!(Action::from_str("move_tab_left").is_some());
+    }
+
+    #[test]
+    #[ignore = "gap #29: Action::MoveTabRight not yet implemented"]
+    fn action_move_tab_right() {
+        assert!(Action::from_str("move_tab_right").is_some());
+    }
+
+    // Gap #30: direct tab switching (1-10)
+    #[test]
+    #[ignore = "gap #30: Action::SwitchToTab1..10 not yet implemented"]
+    fn action_switch_to_tab_by_number() {
+        assert!(Action::from_str("switch_to_tab_1").is_some());
+        assert!(Action::from_str("switch_to_tab_5").is_some());
+        assert!(Action::from_str("switch_to_tab_10").is_some());
+    }
+
+    // Gap #15: scaled zoom (distinct from maximize)
+    #[test]
+    #[ignore = "gap #15: Action::ScaledZoom not yet implemented"]
+    fn action_scaled_zoom() {
+        assert!(Action::from_str("scaled_zoom").is_some());
+    }
+
+    // Gap #46: focus next/prev terminal (Ctrl+Shift+N/P)
+    #[test]
+    #[ignore = "gap #46: Action::FocusNextTerminal not yet implemented"]
+    fn action_focus_next_terminal() {
+        assert!(Action::from_str("focus_next_terminal").is_some());
+    }
+
+    #[test]
+    #[ignore = "gap #46: Action::FocusPrevTerminal not yet implemented"]
+    fn action_focus_prev_terminal() {
+        assert!(Action::from_str("focus_prev_terminal").is_some());
+    }
+
+    // Gap #25: toggle scrollbar
+    #[test]
+    #[ignore = "gap #25: Action::ToggleScrollbar not yet implemented"]
+    fn action_toggle_scrollbar() {
+        assert!(Action::from_str("toggle_scrollbar").is_some());
+    }
+
+    // Gap #27: insert terminal number
+    #[test]
+    #[ignore = "gap #27: Action::InsertTermNumber not yet implemented"]
+    fn action_insert_term_number() {
+        assert!(Action::from_str("insert_term_number").is_some());
+    }
+
+    // Gap #17: global hide/show hotkey
+    #[test]
+    #[ignore = "gap #17: Action::ToggleWindowVisibility not yet implemented"]
+    fn action_toggle_window_visibility() {
+        assert!(Action::from_str("toggle_visibility").is_some());
+    }
+
+    // Gap #13: broadcast scopes (all/group/off)
+    #[test]
+    #[ignore = "gap #13: Action::BroadcastAll/Group/Off not yet implemented"]
+    fn action_broadcast_scopes() {
+        assert!(Action::from_str("broadcast_all").is_some());
+        assert!(Action::from_str("broadcast_group").is_some());
+        assert!(Action::from_str("broadcast_off").is_some());
+    }
+
+    // Gap #13: default bindings for broadcast scopes
+    #[test]
+    #[ignore = "gap #13: default broadcast scope keybindings not yet added"]
+    fn defaults_include_broadcast_scopes() {
+        let defs = defaults();
+        let actions: Vec<_> = defs.iter().map(|(_, a)| a).collect();
+        assert!(actions.contains(&&Action::from_str("broadcast_all").unwrap()));
+    }
+
+    // Gap #9: default bindings for rotation
+    #[test]
+    #[ignore = "gap #9: default rotation keybindings not yet added"]
+    fn defaults_include_rotation() {
+        let table = BindingTable::new();
+        let mods = egui::Modifiers {
+            mac_cmd: true,
+            ..Default::default()
+        };
+        assert!(table.lookup(egui::Key::R, mods).is_some());
+    }
 }
