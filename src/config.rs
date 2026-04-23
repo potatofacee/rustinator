@@ -308,12 +308,11 @@ pub fn format_hex(rgb: [u8; 3]) -> String {
 }
 
 fn config_path() -> Option<PathBuf> {
-    if let Ok(x) = std::env::var("XDG_CONFIG_HOME") {
-        return Some(PathBuf::from(x).join("rustinator/config.toml"));
-    }
     let home = std::env::var("HOME").ok()?;
     if cfg!(target_os = "macos") {
         Some(PathBuf::from(&home).join("Library/Application Support/rustinator/config.toml"))
+    } else if let Ok(x) = std::env::var("XDG_CONFIG_HOME") {
+        Some(PathBuf::from(x).join("rustinator/config.toml"))
     } else {
         Some(PathBuf::from(&home).join(".config/rustinator/config.toml"))
     }
@@ -415,6 +414,138 @@ mod tests {
         assert_eq!(p.font.family, "Fira Code");
         assert_eq!(p.colors.background, "#002b36");
         assert_eq!(p.scrollback.history, 20000);
+    }
+
+    // ── Gap inventory guardrails ──────────────────────────────────────
+    // Each #[ignore] test maps to a feature from terminator-gap-inventory.md.
+    // Remove #[ignore] once the feature is implemented and the test passes.
+    // Run `cargo test -- --ignored` to see the full checklist.
+
+    // ── Gap inventory guardrails ──────────────────────────────────────
+    // Each #[ignore] test maps to a feature from terminator-gap-inventory.md.
+    // Remove #[ignore] once the feature is implemented and the test passes.
+    // Run `cargo test -- --ignored` to see the full checklist.
+    //
+    // Tests use panic!() instead of accessing nonexistent fields so they
+    // compile now but fail when run with --ignored.
+
+    // Gap #22: custom shell command per profile
+    #[test]
+    #[ignore = "gap #22: custom_command not yet in Profile"]
+    fn config_profile_custom_command() {
+        panic!("add use_custom_command: bool and custom_command: Option<String> to Profile");
+    }
+
+    // Gap #24: login shell option
+    #[test]
+    #[ignore = "gap #24: login_shell not yet in Profile"]
+    fn config_profile_login_shell() {
+        panic!("add login_shell: bool to Profile");
+    }
+
+    // Gap #23: exit action (close/hold/restart)
+    #[test]
+    #[ignore = "gap #23: exit_action not yet in Profile"]
+    fn config_profile_exit_action() {
+        panic!("add exit_action: String to Profile (values: close, hold, restart)");
+    }
+
+    // Gap #16: bell configuration
+    #[test]
+    #[ignore = "gap #16: bell config not yet in Profile/Global"]
+    fn config_bell_settings() {
+        panic!("add visible_bell, urgent_bell, icon_bell bools to GlobalConfig");
+    }
+
+    // Gap #25: scrollbar visibility
+    #[test]
+    #[ignore = "gap #25: scrollbar not yet in Profile"]
+    fn config_profile_scrollbar() {
+        panic!("add scrollbar: String to Profile (values: left, right, hidden)");
+    }
+
+    // Gap #26: mouse autohide
+    #[test]
+    #[ignore = "gap #26: mouse_autohide not yet in Profile"]
+    fn config_profile_mouse_autohide() {
+        panic!("add mouse_autohide: bool to Profile");
+    }
+
+    // Gap #28: tab position config
+    #[test]
+    #[ignore = "gap #28: tab_position not yet in GlobalConfig"]
+    fn config_global_tab_position() {
+        panic!("add tab_position: String to GlobalConfig (values: top, bottom, left, right, hidden)");
+    }
+
+    // Gap #18: always on top
+    #[test]
+    #[ignore = "gap #18: always_on_top not yet in GlobalConfig"]
+    fn config_global_always_on_top() {
+        panic!("add always_on_top: bool to GlobalConfig");
+    }
+
+    // Gap #21: borderless window
+    #[test]
+    #[ignore = "gap #21: borderless not yet in GlobalConfig"]
+    fn config_global_borderless() {
+        panic!("add borderless: bool to GlobalConfig");
+    }
+
+    // Gap #20: hide on lose focus
+    #[test]
+    #[ignore = "gap #20: hide_on_lose_focus not yet in GlobalConfig"]
+    fn config_global_hide_on_lose_focus() {
+        panic!("add hide_on_lose_focus: bool to GlobalConfig");
+    }
+
+    // Gap #43: inactive terminal dimming
+    #[test]
+    #[ignore = "gap #43: inactive_color_offset not yet in Profile"]
+    fn config_profile_inactive_dimming() {
+        panic!("add inactive_color_offset: f32 to Profile (0.0-1.0, dims unfocused panes)");
+    }
+
+    // Gap #33: cell height/width scaling
+    #[test]
+    #[ignore = "gap #33: cell_height/cell_width not yet in Profile"]
+    fn config_profile_cell_spacing() {
+        panic!("add cell_height: f32 and cell_width: f32 to Profile");
+    }
+
+    // Gap #8: background image
+    #[test]
+    #[ignore = "gap #8: background image not yet in Profile"]
+    fn config_profile_background_image() {
+        panic!("add background_image: Option<String> and background_image_mode: Option<String> to Profile");
+    }
+
+    // Gap #14: titlebar per pane
+    #[test]
+    #[ignore = "gap #14: show_titlebar not yet in Profile"]
+    fn config_profile_titlebar() {
+        panic!("add show_titlebar: bool to Profile");
+    }
+
+    // Gap #36: disable mouse paste
+    #[test]
+    #[ignore = "gap #36: disable_mouse_paste not yet in Profile"]
+    fn config_profile_disable_mouse_paste() {
+        panic!("add disable_mouse_paste: bool to Profile");
+    }
+
+    // Gap #37: clear selection on copy
+    #[test]
+    #[ignore = "gap #37: clear_selection_on_copy not yet in Profile"]
+    fn config_profile_clear_selection_on_copy() {
+        panic!("add clear_selection_on_copy: bool to Profile");
+    }
+
+    // Gap #9 (partial): confirm_on_close as enum (always/multiple_terminals/never)
+    #[test]
+    #[ignore = "gap partial #9: confirm_on_close should be enum not bool"]
+    fn config_global_confirm_on_close_modes() {
+        panic!("change confirm_on_close from bool to enum: Always, MultipleTerminals, Never");
     }
 
     #[test]

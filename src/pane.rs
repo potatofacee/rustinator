@@ -201,6 +201,7 @@ pub struct Frame {
     pub cells: Vec<CellSnapshot>,
     pub default_bg: [f32; 4],
     pub cursor: Option<CursorOverlay>,
+    pub cursor_blink_requested: bool,
     pub urls: Vec<UrlMatch>,
 }
 
@@ -507,6 +508,24 @@ impl Pane {
         }
     }
 
+    pub fn scroll_info(&self) -> (usize, usize, usize) {
+        let term = self.terminal.lock();
+        let offset = term.grid().display_offset();
+        let history = term.grid().total_lines().saturating_sub(term.grid().screen_lines());
+        let screen = term.grid().screen_lines();
+        (offset, history, screen)
+    }
+
+    pub fn scroll_to_position(&self, offset: usize) {
+        let mut term = self.terminal.lock();
+        let current = term.grid().display_offset();
+        let delta = offset as i32 - current as i32;
+        if delta != 0 {
+            term.scroll_display(Scroll::Delta(delta));
+            self.dirty.store(true, Ordering::Release);
+        }
+    }
+
     pub fn scroll_by(&self, lines: i32) {
         if lines == 0 {
             return;
@@ -597,11 +616,14 @@ impl Pane {
         default_bg[3] = self.defaults.bg_opacity.clamp(0.0, 1.0);
         let display_offset = content.display_offset as i32;
 
+        let cursor_style = term.cursor_style();
+        let cursor_blink_requested = cursor_style.blinking;
         let cursor_shape = content.cursor.shape;
         let cursor_visible = cursor_shape != CursorShape::Hidden;
         let cursor_col = content.cursor.point.column.0 as i32;
         let cursor_row = content.cursor.point.line.0 + display_offset;
         let selection = content.selection;
+
 
         let cursor_color = {
             let [r, g, b] = self.defaults.cursor;
@@ -647,6 +669,18 @@ impl Pane {
             let col = indexed.point.column.0 as i32;
             let mut fg = resolve_color(indexed.cell.fg, palette, true, &self.defaults);
             let mut bg = resolve_color(indexed.cell.bg, palette, false, &self.defaults);
+            let flags = indexed.cell.flags;
+            if flags.contains(Flags::INVERSE) {
+                std::mem::swap(&mut fg, &mut bg);
+            }
+            if flags.contains(Flags::HIDDEN) {
+                fg = bg;
+            }
+            if flags.contains(Flags::DIM) {
+                fg[0] *= 0.66;
+                fg[1] *= 0.66;
+                fg[2] *= 0.66;
+            }
             let is_cursor = cursor_invert_at_cell && col == cursor_col && row == cursor_row;
             let is_selected = selection
                 .map(|s| s.contains(indexed.point))
@@ -654,7 +688,6 @@ impl Pane {
             if is_cursor || is_selected {
                 std::mem::swap(&mut fg, &mut bg);
             }
-            let flags = indexed.cell.flags;
             let style = match (flags.contains(Flags::BOLD), flags.contains(Flags::ITALIC)) {
                 (true, true) => FontStyle::BoldItalic,
                 (true, false) => FontStyle::Bold,
@@ -677,6 +710,7 @@ impl Pane {
             cells,
             default_bg,
             cursor: cursor_overlay,
+            cursor_blink_requested,
             urls,
         }
     }
@@ -709,4 +743,115 @@ fn pane_cwd(pid: u32) -> Option<std::path::PathBuf> {
 )))]
 fn pane_cwd(_pid: u32) -> Option<std::path::PathBuf> {
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_cells(text: &str, row: i32) -> Vec<CellSnapshot> {
+        text.chars()
+            .enumerate()
+            .map(|(i, c)| CellSnapshot {
+                col: i as i32,
+                row,
+                c,
+                fg: [1.0, 1.0, 1.0, 1.0],
+                bg: [0.0, 0.0, 0.0, 1.0],
+                style: FontStyle::Regular,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn scan_urls_finds_https() {
+        let cells = make_cells("visit https://example.com for info", 0);
+        let urls = scan_urls(&cells);
+        assert_eq!(urls.len(), 1);
+        assert_eq!(urls[0].url, "https://example.com");
+    }
+
+    #[test]
+    fn scan_urls_finds_http() {
+        let cells = make_cells("see http://example.org/path?q=1 now", 0);
+        let urls = scan_urls(&cells);
+        assert_eq!(urls.len(), 1);
+        assert!(urls[0].url.starts_with("http://example.org"));
+    }
+
+    #[test]
+    fn scan_urls_none_in_plain_text() {
+        let cells = make_cells("nothing special here", 0);
+        let urls = scan_urls(&cells);
+        assert!(urls.is_empty());
+    }
+
+    // ── Gap inventory guardrails ──────────────────────────────────────
+
+    // Gap #3 (partial): email address detection
+    #[test]
+    #[ignore = "gap #3 partial: scan_urls doesn't detect email addresses"]
+    fn scan_urls_detects_email() {
+        let cells = make_cells("contact user@example.com for help", 0);
+        let urls = scan_urls(&cells);
+        assert_eq!(urls.len(), 1);
+        assert!(urls[0].url.contains("user@example.com"));
+    }
+
+    // Gap #3 (partial): mailto: URI
+    #[test]
+    #[ignore = "gap #3 partial: scan_urls doesn't detect mailto: URIs"]
+    fn scan_urls_detects_mailto() {
+        let cells = make_cells("send to mailto:user@example.com now", 0);
+        let urls = scan_urls(&cells);
+        assert_eq!(urls.len(), 1);
+        assert!(urls[0].url.starts_with("mailto:"));
+    }
+
+    // Gap #3 (partial): file:// URI
+    #[test]
+    #[ignore = "gap #3 partial: scan_urls doesn't detect file:// URIs"]
+    fn scan_urls_detects_file_uri() {
+        let cells = make_cells("open file:///home/user/doc.txt please", 0);
+        let urls = scan_urls(&cells);
+        assert_eq!(urls.len(), 1);
+        assert!(urls[0].url.starts_with("file:///"));
+    }
+
+    // Gap #3 (partial): ssh:// URI
+    #[test]
+    #[ignore = "gap #3 partial: scan_urls doesn't detect ssh:// URIs"]
+    fn scan_urls_detects_ssh_uri() {
+        let cells = make_cells("connect via ssh://user@host.com:22", 0);
+        let urls = scan_urls(&cells);
+        assert_eq!(urls.len(), 1);
+        assert!(urls[0].url.starts_with("ssh://"));
+    }
+
+    // Gap #3 (partial): ftp:// URI
+    #[test]
+    #[ignore = "gap #3 partial: scan_urls doesn't detect ftp:// URIs"]
+    fn scan_urls_detects_ftp_uri() {
+        let cells = make_cells("download from ftp://files.example.com/pub", 0);
+        let urls = scan_urls(&cells);
+        assert_eq!(urls.len(), 1);
+        assert!(urls[0].url.starts_with("ftp://"));
+    }
+
+    // Gap #3 (partial): bare domain (www.example.com)
+    #[test]
+    #[ignore = "gap #3 partial: scan_urls doesn't detect bare www. domains"]
+    fn scan_urls_detects_bare_www() {
+        let cells = make_cells("visit www.example.com for info", 0);
+        let urls = scan_urls(&cells);
+        assert_eq!(urls.len(), 1);
+        assert!(urls[0].url.contains("www.example.com"));
+    }
+
+    // Gap #42: OSC-8 hyperlinks
+    #[test]
+    #[ignore = "gap #42: OSC-8 hyperlink support not yet implemented"]
+    fn url_match_has_hyperlink_flag() {
+        panic!("add is_hyperlink: bool to UrlMatch for OSC-8 support");
+    }
 }

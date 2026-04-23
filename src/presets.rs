@@ -104,3 +104,61 @@ pub fn match_preset(fg: &str, bg: &str, cursor: &str) -> Option<&'static str> {
 fn normalize(hex: &str) -> String {
     hex.trim().trim_start_matches('#').to_ascii_lowercase()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn match_preset_finds_known() {
+        let result = match_preset("#ebdbb2", "#282828", "#ebdbb2");
+        assert_eq!(result, Some("Gruvbox Dark"));
+    }
+
+    #[test]
+    fn match_preset_returns_none_for_unknown() {
+        assert!(match_preset("#123456", "#abcdef", "#000000").is_none());
+    }
+
+    #[test]
+    fn all_presets_have_valid_hex() {
+        for p in PRESETS {
+            assert!(p.foreground.starts_with('#'), "bad fg in {}", p.name);
+            assert!(p.background.starts_with('#'), "bad bg in {}", p.name);
+            assert!(p.cursor.starts_with('#'), "bad cursor in {}", p.name);
+            assert_eq!(p.foreground.len(), 7, "bad fg len in {}", p.name);
+            assert_eq!(p.background.len(), 7, "bad bg len in {}", p.name);
+            assert_eq!(p.cursor.len(), 7, "bad cursor len in {}", p.name);
+        }
+    }
+
+    // ── Gap inventory guardrails ──────────────────────────────────────
+
+    // Terminator has Ambience and palette presets (Tango, Linux, Xterm, Rxvt)
+    // that we're missing as full 16-color palette overrides.
+
+    #[test]
+    #[ignore = "gap: Ambience color scheme not yet in presets"]
+    fn preset_ambience_exists() {
+        assert!(PRESETS.iter().any(|p| p.name == "Ambience"));
+    }
+
+    #[test]
+    #[ignore = "gap: Black on Yellow color scheme not yet in presets"]
+    fn preset_black_on_yellow_exists() {
+        assert!(PRESETS.iter().any(|p| p.name == "Black on Yellow"));
+    }
+
+    #[test]
+    #[ignore = "gap: Gruvbox Light color scheme not yet in presets"]
+    fn preset_gruvbox_light_exists() {
+        assert!(PRESETS.iter().any(|p| p.name == "Gruvbox Light"));
+    }
+
+    // 16-color ANSI palette presets (Terminator has Tango/Linux/Xterm/Rxvt/etc.)
+    #[test]
+    #[ignore = "gap: no 16-color palette presets yet (Tango, Linux, Xterm, Rxvt)"]
+    fn palette_presets_exist() {
+        panic!("add optional 16-color ANSI palette to Preset struct (Tango, Linux, Xterm, Rxvt)");
+    }
+}
