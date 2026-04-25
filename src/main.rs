@@ -60,6 +60,12 @@ impl Tab {
     }
 }
 
+pub(crate) struct RawTermKey {
+    pub key: egui::Key,
+    pub mods: egui::Modifiers,
+    pub legacy_bytes: Vec<u8>,
+}
+
 pub(crate) struct App {
     tabs: Vec<Tab>,
     active_tab: usize,
@@ -99,6 +105,7 @@ pub(crate) struct App {
     pending_zoom_steps: i32,
     cursor_blink_epoch: Instant,
     drag_source_pane: Option<PaneId>,
+    pub(crate) pending_raw_keys: Vec<RawTermKey>,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -246,6 +253,7 @@ impl App {
             pending_zoom_steps: 0,
             cursor_blink_epoch: Instant::now(),
             drag_source_pane: None,
+            pending_raw_keys: Vec::new(),
         })
     }
 
@@ -1032,11 +1040,13 @@ impl App {
         self.active_tab = (((idx + step) % n + n) % n) as usize;
     }
 
-    fn forward_input(&self, ctx: &egui::Context) {
+    fn forward_input(&mut self, ctx: &egui::Context) {
         if self.tabs.is_empty() || ctx.egui_wants_keyboard_input() {
+            self.pending_raw_keys.clear();
             return;
         }
         let events = ctx.input(|i| i.events.clone());
+        let raw_keys = std::mem::take(&mut self.pending_raw_keys);
         let tab = &self.tabs[self.active_tab];
         let targets: Vec<&Pane> = if tab.broadcast {
             tab.panes.values().filter(|p| !p.read_only).collect()
@@ -1070,17 +1080,51 @@ impl App {
                     modifiers,
                     ..
                 } => {
-                    // When a Text event is present for this frame, skip Key events
-                    // for keys that key_to_bytes would also encode (Enter, Tab, etc.)
-                    // to avoid double-sending. Text events handle printable input;
-                    // Key events handle non-printable / modifier combos.
+                    // When a Text event exists for this frame and no ctrl/alt
+                    // modifiers are held, only forward functional keys that
+                    // never produce a Text event.  Everything else (letters,
+                    // digits, punctuation, Enter, Tab, …) is already handled
+                    // by the Text branch above.
                     if has_text_event && !modifiers.ctrl && !modifiers.alt {
-                        if let Some(_) = key_to_bytes(key, modifiers) {
+                        let is_functional = matches!(
+                            key,
+                            egui::Key::Escape
+                                | egui::Key::ArrowUp
+                                | egui::Key::ArrowDown
+                                | egui::Key::ArrowLeft
+                                | egui::Key::ArrowRight
+                                | egui::Key::Home
+                                | egui::Key::End
+                                | egui::Key::PageUp
+                                | egui::Key::PageDown
+                                | egui::Key::Insert
+                                | egui::Key::Delete
+                                | egui::Key::F1
+                                | egui::Key::F2
+                                | egui::Key::F3
+                                | egui::Key::F4
+                                | egui::Key::F5
+                                | egui::Key::F6
+                                | egui::Key::F7
+                                | egui::Key::F8
+                                | egui::Key::F9
+                                | egui::Key::F10
+                                | egui::Key::F11
+                                | egui::Key::F12
+                        );
+                        if !is_functional {
                             continue;
                         }
                     }
+
+                    // Find pre-encoded legacy bytes from the raw winit capture.
+                    let legacy = raw_keys
+                        .iter()
+                        .find(|rk| rk.key == key && rk.mods == modifiers)
+                        .map(|rk| rk.legacy_bytes.clone());
+
                     for pane in &targets {
-                        pane.send_key(key, modifiers, key_to_bytes);
+                        pane.send_key(key, modifiers, legacy.clone());
                     }
                 }
                 egui::Event::Paste(text) => {
@@ -1161,9 +1205,9 @@ impl App {
                 gl.scissor(vp.left_px, vp.from_bottom_px, vp.width_px, vp.height_px);
                 let a = frame.default_bg[3];
                 gl.clear_color(
-                    frame.default_bg[0] * a,
-                    frame.default_bg[1] * a,
-                    frame.default_bg[2] * a,
+                    frame.default_bg[0],
+                    frame.default_bg[1],
+                    frame.default_bg[2],
                     a,
                 );
                 gl.clear(glow::COLOR_BUFFER_BIT);
@@ -1387,6 +1431,14 @@ impl App {
 impl App {
     pub(crate) fn clear_color(&self) -> [f32; 4] {
         [0.0, 0.0, 0.0, 0.0]
+    }
+
+    pub(crate) fn notify_focus(&self, focused: bool) {
+        if let Some(tab) = self.tabs.get(self.active_tab) {
+            for pane in tab.panes.values() {
+                pane.send_focus_event(focused);
+            }
+        }
     }
 
     pub(crate) fn logic(&mut self, ctx: &egui::Context) {
@@ -1787,7 +1839,16 @@ impl App {
                         } else if response.drag_started() {
                             pane.begin_selection(col, row, SelectionType::Simple);
                         } else if response.dragged() {
-                            pane.update_selection(col, row);
+                            if let Some(p) = pointer {
+                                let visible_cols = (terminal_rect.width() * ppp / cell_w).floor() as i32;
+                                if p.y < terminal_rect.top() {
+                                    pane.selection_auto_scroll(1, visible_cols);
+                                } else if p.y > terminal_rect.bottom() {
+                                    pane.selection_auto_scroll(-1, visible_cols);
+                                } else {
+                                    pane.update_selection(col, row);
+                                }
+                            }
                         } else if response.clicked() {
                             pane.clear_selection();
                         }
@@ -2365,68 +2426,6 @@ fn parse_hex_rgb(s: &str) -> Option<[u8; 3]> {
     let g = u8::from_str_radix(&s[2..4], 16).ok()?;
     let b = u8::from_str_radix(&s[4..6], 16).ok()?;
     Some([r, g, b])
-}
-
-fn key_to_bytes(key: egui::Key, mods: egui::Modifiers) -> Option<Vec<u8>> {
-    use egui::Key;
-
-    if mods.ctrl && !mods.shift && !mods.alt {
-        if let Some(b) = ctrl_byte(key) {
-            return Some(vec![b]);
-        }
-    }
-
-    let seq: &[u8] = match key {
-        Key::Enter => b"\r",
-        Key::Backspace => b"\x7f",
-        Key::Tab => b"\t",
-        Key::Escape => b"\x1b",
-        Key::ArrowUp => b"\x1b[A",
-        Key::ArrowDown => b"\x1b[B",
-        Key::ArrowRight => b"\x1b[C",
-        Key::ArrowLeft => b"\x1b[D",
-        Key::Home => b"\x1b[H",
-        Key::End => b"\x1b[F",
-        Key::PageUp => b"\x1b[5~",
-        Key::PageDown => b"\x1b[6~",
-        Key::Delete => b"\x1b[3~",
-        _ => return None,
-    };
-    Some(seq.to_vec())
-}
-
-fn ctrl_byte(key: egui::Key) -> Option<u8> {
-    use egui::Key;
-    let c = match key {
-        Key::A => b'a',
-        Key::B => b'b',
-        Key::C => b'c',
-        Key::D => b'd',
-        Key::E => b'e',
-        Key::F => b'f',
-        Key::G => b'g',
-        Key::H => b'h',
-        Key::I => b'i',
-        Key::J => b'j',
-        Key::K => b'k',
-        Key::L => b'l',
-        Key::M => b'm',
-        Key::N => b'n',
-        Key::O => b'o',
-        Key::P => b'p',
-        Key::Q => b'q',
-        Key::R => b'r',
-        Key::S => b's',
-        Key::T => b't',
-        Key::U => b'u',
-        Key::V => b'v',
-        Key::W => b'w',
-        Key::X => b'x',
-        Key::Y => b'y',
-        Key::Z => b'z',
-        _ => return None,
-    };
-    Some(c - b'a' + 1)
 }
 
 fn main() {

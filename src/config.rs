@@ -567,4 +567,68 @@ mod tests {
         assert_eq!(parsed.active().scrollback.history, 25_000);
         assert!((parsed.active().transparency.opacity - 0.9).abs() < f32::EPSILON);
     }
+
+    // ---- word_chars_to_semantic_escape ----
+
+    #[test]
+    fn word_chars_single_chars() {
+        let esc = word_chars_to_semantic_escape("_-");
+        assert!(!esc.contains('_'));
+        assert!(!esc.contains('-'));
+        assert!(esc.contains(' '));
+    }
+
+    #[test]
+    fn word_chars_range() {
+        let esc = word_chars_to_semantic_escape("a-z");
+        assert!(esc.contains(' '));
+        assert!(esc.contains(','));
+        assert!(!esc.contains('a'));
+    }
+
+    #[test]
+    fn word_chars_empty() {
+        let esc = word_chars_to_semantic_escape("");
+        let candidates = ",|:\"' ()[]{}<>\t`│;!^*\\~$#@&%?/.-_=+";
+        assert_eq!(esc, candidates);
+    }
+
+    #[test]
+    fn word_chars_all_candidates_excluded() {
+        // `-` at end so it's not parsed as a range operator.
+        let word = "-,|:\"' ()[]{}<>\t`│;!^*\\~$#@&%?/._=+";
+        let esc = word_chars_to_semantic_escape(word);
+        assert!(esc.is_empty(), "remaining: {:?}", esc);
+    }
+
+    // ---- effective_history ----
+
+    #[test]
+    fn effective_history_finite() {
+        let sc = ScrollbackConfig { history: 5000, infinite: false };
+        assert_eq!(sc.effective_history(), 5000);
+    }
+
+    #[test]
+    fn effective_history_infinite() {
+        let sc = ScrollbackConfig { history: 5000, infinite: true };
+        assert_eq!(sc.effective_history(), 100_000_000);
+    }
+
+    // ---- parse_hex edge cases ----
+
+    #[test]
+    fn hex_parse_whitespace_trimmed() {
+        assert_eq!(parse_hex("  #abcdef  "), Some([0xab, 0xcd, 0xef]));
+    }
+
+    #[test]
+    fn hex_parse_uppercase() {
+        assert_eq!(parse_hex("#ABCDEF"), Some([0xab, 0xcd, 0xef]));
+    }
+
+    #[test]
+    fn hex_parse_empty() {
+        assert_eq!(parse_hex(""), None);
+    }
 }

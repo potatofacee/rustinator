@@ -355,6 +355,8 @@ impl Pane {
 
         let mut pty_opts = tty::Options::default();
         pty_opts.env.insert("TERM".into(), "xterm-256color".into());
+        pty_opts.env.insert("COLORTERM".into(), "truecolor".into());
+        pty_opts.env.insert("TERM_PROGRAM".into(), "rustinator".into());
         pty_opts.env.insert("CLICOLOR".into(), "1".into());
         pty_opts.env.insert("CLICOLOR_FORCE".into(), "1".into());
         crate::shell_integration::inject_env(&mut pty_opts.env);
@@ -440,20 +442,39 @@ impl Pane {
     }
 
     /// Encode and send a key event, using Kitty keyboard protocol when the term
-    /// has enabled it, otherwise falling back to legacy terminal encoding.
+    /// has enabled it, otherwise sending the pre-encoded legacy bytes.
+    /// When APP_CURSOR (DECCKM) is active, unmodified arrow keys are rewritten
+    /// from CSI to SS3 format.
     pub fn send_key(
         &self,
         key: egui::Key,
         mods: egui::Modifiers,
-        legacy: impl FnOnce(egui::Key, egui::Modifiers) -> Option<Vec<u8>>,
+        legacy_bytes: Option<Vec<u8>>,
     ) {
         let mode = *self.terminal.lock().mode();
         if let Some(bytes) = keyboard::encode(key, mods, mode) {
             self.send_bytes(bytes);
             return;
         }
-        if let Some(bytes) = legacy(key, mods) {
+        if let Some(bytes) = legacy_bytes {
+            if mode.contains(TermMode::APP_CURSOR) {
+                if let Some(app) = decckm_override(key, mods) {
+                    self.send_bytes(app);
+                    return;
+                }
+            }
             self.send_bytes(bytes);
+        }
+    }
+
+    pub fn mode(&self) -> TermMode {
+        *self.terminal.lock().mode()
+    }
+
+    pub fn send_focus_event(&self, focused: bool) {
+        if self.mode().contains(TermMode::FOCUS_IN_OUT) {
+            let seq = if focused { b"\x1b[I" } else { b"\x1b[O" };
+            self.send_bytes(seq.to_vec());
         }
     }
 
@@ -473,6 +494,19 @@ impl Pane {
             sel.update(point, Side::Right);
             self.dirty.store(true, Ordering::Release);
         }
+    }
+
+    pub fn selection_auto_scroll(&self, delta: i32, cols: i32) {
+        let mut term = self.terminal.lock();
+        term.scroll_display(Scroll::Delta(delta));
+        let display_offset = term.grid().display_offset() as i32;
+        let row = if delta > 0 { 0 } else { term.screen_lines() as i32 - 1 };
+        let col = if delta > 0 { 0 } else { cols.saturating_sub(1) };
+        let point = point_from_grid(col, row, display_offset);
+        if let Some(sel) = term.selection.as_mut() {
+            sel.update(point, Side::Right);
+        }
+        self.dirty.store(true, Ordering::Release);
     }
 
     pub fn clear_selection(&self) {
@@ -585,19 +619,20 @@ impl Pane {
     /// Send pasted text, wrapping in bracketed-paste sequences when the term
     /// has BRACKETED_PASTE enabled.
     pub fn send_paste(&self, text: &str) {
+        let fixed = text.replace("\r\n", "\r").replace('\n', "\r");
         let bracketed = self
             .terminal
             .lock()
             .mode()
             .contains(TermMode::BRACKETED_PASTE);
         let bytes = if bracketed {
-            let mut v = Vec::with_capacity(text.len() + 12);
+            let mut v = Vec::with_capacity(fixed.len() + 12);
             v.extend_from_slice(b"\x1b[200~");
-            v.extend_from_slice(text.as_bytes());
+            v.extend_from_slice(fixed.as_bytes());
             v.extend_from_slice(b"\x1b[201~");
             v
         } else {
-            text.as_bytes().to_vec()
+            fixed.into_bytes()
         };
         self.send_bytes(bytes);
     }
@@ -745,6 +780,25 @@ fn pane_cwd(_pid: u32) -> Option<std::path::PathBuf> {
     None
 }
 
+/// When DECCKM (application cursor mode) is active, unmodified cursor keys
+/// use SS3 format instead of CSI. Only applies without modifiers — modified
+/// keys always use CSI 1;{mod} format which is already correct.
+fn decckm_override(key: egui::Key, mods: egui::Modifiers) -> Option<Vec<u8>> {
+    if mods.shift || mods.alt || mods.ctrl || mods.mac_cmd {
+        return None;
+    }
+    let seq: &[u8] = match key {
+        egui::Key::ArrowUp => b"\x1bOA",
+        egui::Key::ArrowDown => b"\x1bOB",
+        egui::Key::ArrowRight => b"\x1bOC",
+        egui::Key::ArrowLeft => b"\x1bOD",
+        egui::Key::Home => b"\x1bOH",
+        egui::Key::End => b"\x1bOF",
+        _ => return None,
+    };
+    Some(seq.to_vec())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -853,5 +907,261 @@ mod tests {
     #[ignore = "gap #42: OSC-8 hyperlink support not yet implemented"]
     fn url_match_has_hyperlink_flag() {
         panic!("add is_hyperlink: bool to UrlMatch for OSC-8 support");
+    }
+
+    // ---- DECCKM (application cursor mode) ----
+
+    fn no_mods() -> egui::Modifiers {
+        egui::Modifiers::default()
+    }
+
+    #[test]
+    fn decckm_arrow_up() {
+        assert_eq!(decckm_override(egui::Key::ArrowUp, no_mods()).unwrap(), b"\x1bOA");
+    }
+
+    #[test]
+    fn decckm_arrow_down() {
+        assert_eq!(decckm_override(egui::Key::ArrowDown, no_mods()).unwrap(), b"\x1bOB");
+    }
+
+    #[test]
+    fn decckm_arrow_right() {
+        assert_eq!(decckm_override(egui::Key::ArrowRight, no_mods()).unwrap(), b"\x1bOC");
+    }
+
+    #[test]
+    fn decckm_arrow_left() {
+        assert_eq!(decckm_override(egui::Key::ArrowLeft, no_mods()).unwrap(), b"\x1bOD");
+    }
+
+    #[test]
+    fn decckm_home() {
+        assert_eq!(decckm_override(egui::Key::Home, no_mods()).unwrap(), b"\x1bOH");
+    }
+
+    #[test]
+    fn decckm_end() {
+        assert_eq!(decckm_override(egui::Key::End, no_mods()).unwrap(), b"\x1bOF");
+    }
+
+    #[test]
+    fn decckm_ignores_modified_keys() {
+        let ctrl = egui::Modifiers { ctrl: true, ..Default::default() };
+        assert_eq!(decckm_override(egui::Key::ArrowUp, ctrl), None);
+
+        let shift = egui::Modifiers { shift: true, ..Default::default() };
+        assert_eq!(decckm_override(egui::Key::ArrowUp, shift), None);
+
+        let alt = egui::Modifiers { alt: true, ..Default::default() };
+        assert_eq!(decckm_override(egui::Key::ArrowUp, alt), None);
+    }
+
+    #[test]
+    fn decckm_ignores_non_cursor_keys() {
+        assert_eq!(decckm_override(egui::Key::A, no_mods()), None);
+        assert_eq!(decckm_override(egui::Key::Enter, no_mods()), None);
+        assert_eq!(decckm_override(egui::Key::F1, no_mods()), None);
+    }
+
+    // ---- escape_regex ----
+
+    #[test]
+    fn escape_regex_plain_text() {
+        assert_eq!(escape_regex("hello"), "hello");
+    }
+
+    #[test]
+    fn escape_regex_special_chars() {
+        assert_eq!(escape_regex("."), "\\.");
+        assert_eq!(escape_regex("+"), "\\+");
+        assert_eq!(escape_regex("*"), "\\*");
+        assert_eq!(escape_regex("?"), "\\?");
+        assert_eq!(escape_regex("("), "\\(");
+        assert_eq!(escape_regex(")"), "\\)");
+        assert_eq!(escape_regex("|"), "\\|");
+        assert_eq!(escape_regex("["), "\\[");
+        assert_eq!(escape_regex("]"), "\\]");
+        assert_eq!(escape_regex("{"), "\\{");
+        assert_eq!(escape_regex("}"), "\\}");
+        assert_eq!(escape_regex("^"), "\\^");
+        assert_eq!(escape_regex("$"), "\\$");
+        assert_eq!(escape_regex("\\"), "\\\\");
+        assert_eq!(escape_regex("/"), "\\/");
+    }
+
+    #[test]
+    fn escape_regex_mixed() {
+        assert_eq!(escape_regex("a.b*c"), "a\\.b\\*c");
+    }
+
+    #[test]
+    fn escape_regex_empty() {
+        assert_eq!(escape_regex(""), "");
+    }
+
+    // ---- is_url_boundary ----
+
+    #[test]
+    fn url_boundary_whitespace() {
+        assert!(is_url_boundary(' '));
+        assert!(is_url_boundary('\t'));
+        assert!(is_url_boundary('\n'));
+    }
+
+    #[test]
+    fn url_boundary_delimiters() {
+        for c in [')', ']', '"', '\'', '>', '<', '{', '}', ',', ';', '|', '`'] {
+            assert!(is_url_boundary(c), "expected '{}' to be a boundary", c);
+        }
+    }
+
+    #[test]
+    fn url_boundary_non_boundary() {
+        assert!(!is_url_boundary('a'));
+        assert!(!is_url_boundary('/'));
+        assert!(!is_url_boundary(':'));
+        assert!(!is_url_boundary('.'));
+        assert!(!is_url_boundary('-'));
+        assert!(!is_url_boundary('_'));
+    }
+
+    // ---- scan_urls ----
+
+    fn cells_from_str(row: i32, text: &str) -> Vec<CellSnapshot> {
+        text.chars()
+            .enumerate()
+            .map(|(i, c)| CellSnapshot {
+                col: i as i32,
+                row,
+                c,
+                fg: [1.0; 4],
+                bg: [0.0, 0.0, 0.0, 1.0],
+                style: FontStyle::Regular,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn scan_urls_https() {
+        let cells = cells_from_str(0, "visit https://example.com today");
+        let urls = scan_urls(&cells);
+        assert_eq!(urls.len(), 1);
+        assert_eq!(urls[0].url, "https://example.com");
+        assert_eq!(urls[0].row, 0);
+        assert_eq!(urls[0].start_col, 6);
+        assert_eq!(urls[0].end_col, 25);
+    }
+
+    #[test]
+    fn scan_urls_http() {
+        let cells = cells_from_str(0, "http://foo.bar/baz");
+        let urls = scan_urls(&cells);
+        assert_eq!(urls.len(), 1);
+        assert_eq!(urls[0].url, "http://foo.bar/baz");
+    }
+
+    #[test]
+    fn scan_urls_multiple_on_row() {
+        let cells = cells_from_str(0, "https://a.com and https://b.com");
+        let urls = scan_urls(&cells);
+        assert_eq!(urls.len(), 2);
+        assert_eq!(urls[0].url, "https://a.com");
+        assert_eq!(urls[1].url, "https://b.com");
+    }
+
+    #[test]
+    fn scan_urls_no_url() {
+        let cells = cells_from_str(0, "nothing here");
+        assert!(scan_urls(&cells).is_empty());
+    }
+
+    #[test]
+    fn scan_urls_bare_protocol_no_content() {
+        let cells = cells_from_str(0, "http:// ");
+        assert!(scan_urls(&cells).is_empty());
+    }
+
+    #[test]
+    fn scan_urls_stops_at_boundary() {
+        let cells = cells_from_str(0, "(https://x.com)");
+        let urls = scan_urls(&cells);
+        assert_eq!(urls.len(), 1);
+        assert_eq!(urls[0].url, "https://x.com");
+    }
+
+    #[test]
+    fn scan_urls_multiple_rows() {
+        let mut cells = cells_from_str(0, "https://row0.com");
+        cells.extend(cells_from_str(1, "https://row1.com"));
+        let urls = scan_urls(&cells);
+        assert_eq!(urls.len(), 2);
+        assert_eq!(urls[0].row, 0);
+        assert_eq!(urls[1].row, 1);
+    }
+
+    #[test]
+    fn scan_urls_empty_cells() {
+        assert!(scan_urls(&[]).is_empty());
+    }
+
+    // ---- indexed_default (256-color palette) ----
+
+    #[test]
+    fn indexed_default_ansi_range() {
+        assert_eq!(indexed_default(0), [0x00, 0x00, 0x00]);
+        assert_eq!(indexed_default(1), [0xcd, 0x00, 0x00]);
+        assert_eq!(indexed_default(15), ANSI[15]);
+    }
+
+    #[test]
+    fn indexed_default_cube_start() {
+        // Index 16 = rgb(0,0,0) in the 6x6x6 cube.
+        assert_eq!(indexed_default(16), [0, 0, 0]);
+    }
+
+    #[test]
+    fn indexed_default_cube_white() {
+        // Index 231 = rgb(5,5,5) = (0xff, 0xff, 0xff).
+        assert_eq!(indexed_default(231), [0xff, 0xff, 0xff]);
+    }
+
+    #[test]
+    fn indexed_default_cube_mid() {
+        // Index 196 = n=180, r=180/36=5 -> 0xff, g=(180/6)%6=0 -> 0, b=180%6=0 -> 0.
+        assert_eq!(indexed_default(196), [0xff, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn indexed_default_grayscale_start() {
+        // Index 232 = 8 + 0*10 = 8.
+        assert_eq!(indexed_default(232), [8, 8, 8]);
+    }
+
+    #[test]
+    fn indexed_default_grayscale_end() {
+        // Index 255 = 8 + 23*10 = 238.
+        assert_eq!(indexed_default(255), [238, 238, 238]);
+    }
+
+    // ---- point_from_grid ----
+
+    #[test]
+    fn point_from_grid_basic() {
+        let p = point_from_grid(5, 3, 0);
+        assert_eq!(p.line, Line(3));
+        assert_eq!(p.column, Column(5));
+    }
+
+    #[test]
+    fn point_from_grid_with_display_offset() {
+        let p = point_from_grid(0, 3, 10);
+        assert_eq!(p.line, Line(-7));
+    }
+
+    #[test]
+    fn point_from_grid_negative_col_clamps() {
+        let p = point_from_grid(-1, 0, 0);
+        assert_eq!(p.column, Column(0));
     }
 }

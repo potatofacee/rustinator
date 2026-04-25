@@ -215,4 +215,163 @@ mod tests {
         // A key not in our map (e.g. NumLock) should bypass.
         assert_eq!(encode(egui::Key::Copy, mods, disambiguate()), None);
     }
+
+    // ---- encode_mods ----
+
+    #[test]
+    fn encode_mods_none() {
+        assert_eq!(encode_mods(egui::Modifiers::default()), 1);
+    }
+
+    #[test]
+    fn encode_mods_shift() {
+        let m = egui::Modifiers { shift: true, ..Default::default() };
+        assert_eq!(encode_mods(m), 2);
+    }
+
+    #[test]
+    fn encode_mods_alt() {
+        let m = egui::Modifiers { alt: true, ..Default::default() };
+        assert_eq!(encode_mods(m), 3);
+    }
+
+    #[test]
+    fn encode_mods_ctrl() {
+        let m = egui::Modifiers { ctrl: true, ..Default::default() };
+        assert_eq!(encode_mods(m), 5);
+    }
+
+    #[test]
+    fn encode_mods_super_via_command() {
+        let m = egui::Modifiers { command: true, ..Default::default() };
+        assert_eq!(encode_mods(m), 9);
+    }
+
+    #[test]
+    fn encode_mods_shift_alt() {
+        let m = egui::Modifiers { shift: true, alt: true, ..Default::default() };
+        assert_eq!(encode_mods(m), 4);
+    }
+
+    #[test]
+    fn encode_mods_all_four() {
+        let m = egui::Modifiers {
+            shift: true, alt: true, ctrl: true, command: true, ..Default::default()
+        };
+        assert_eq!(encode_mods(m), 16);
+    }
+
+    // ---- kitty_keycode ----
+
+    #[test]
+    fn kitty_keycode_letters_are_lowercase_ascii() {
+        assert_eq!(kitty_keycode(egui::Key::A), Some(97));
+        assert_eq!(kitty_keycode(egui::Key::Z), Some(122));
+    }
+
+    #[test]
+    fn kitty_keycode_digits() {
+        assert_eq!(kitty_keycode(egui::Key::Num0), Some(48));
+        assert_eq!(kitty_keycode(egui::Key::Num9), Some(57));
+    }
+
+    #[test]
+    fn kitty_keycode_functional_keys() {
+        assert_eq!(kitty_keycode(egui::Key::Escape), Some(27));
+        assert_eq!(kitty_keycode(egui::Key::Enter), Some(13));
+        assert_eq!(kitty_keycode(egui::Key::Tab), Some(9));
+        assert_eq!(kitty_keycode(egui::Key::Backspace), Some(127));
+        assert_eq!(kitty_keycode(egui::Key::Space), Some(32));
+    }
+
+    #[test]
+    fn kitty_keycode_navigation() {
+        assert_eq!(kitty_keycode(egui::Key::Insert), Some(57348));
+        assert_eq!(kitty_keycode(egui::Key::Delete), Some(57349));
+        assert_eq!(kitty_keycode(egui::Key::ArrowLeft), Some(57350));
+        assert_eq!(kitty_keycode(egui::Key::ArrowRight), Some(57351));
+        assert_eq!(kitty_keycode(egui::Key::ArrowUp), Some(57352));
+        assert_eq!(kitty_keycode(egui::Key::ArrowDown), Some(57353));
+        assert_eq!(kitty_keycode(egui::Key::PageUp), Some(57354));
+        assert_eq!(kitty_keycode(egui::Key::PageDown), Some(57355));
+        assert_eq!(kitty_keycode(egui::Key::Home), Some(57356));
+        assert_eq!(kitty_keycode(egui::Key::End), Some(57357));
+    }
+
+    #[test]
+    fn kitty_keycode_f_keys() {
+        assert_eq!(kitty_keycode(egui::Key::F1), Some(57364));
+        assert_eq!(kitty_keycode(egui::Key::F12), Some(57375));
+    }
+
+    #[test]
+    fn kitty_keycode_punctuation() {
+        assert_eq!(kitty_keycode(egui::Key::Minus), Some(45));
+        assert_eq!(kitty_keycode(egui::Key::Equals), Some(61));
+        assert_eq!(kitty_keycode(egui::Key::OpenBracket), Some(91));
+        assert_eq!(kitty_keycode(egui::Key::CloseBracket), Some(93));
+        assert_eq!(kitty_keycode(egui::Key::Backslash), Some(92));
+        assert_eq!(kitty_keycode(egui::Key::Semicolon), Some(59));
+        assert_eq!(kitty_keycode(egui::Key::Quote), Some(39));
+        assert_eq!(kitty_keycode(egui::Key::Backtick), Some(96));
+        assert_eq!(kitty_keycode(egui::Key::Comma), Some(44));
+        assert_eq!(kitty_keycode(egui::Key::Period), Some(46));
+        assert_eq!(kitty_keycode(egui::Key::Slash), Some(47));
+    }
+
+    #[test]
+    fn kitty_keycode_unmapped_returns_none() {
+        assert_eq!(kitty_keycode(egui::Key::Copy), None);
+        assert_eq!(kitty_keycode(egui::Key::Cut), None);
+    }
+
+    // ---- encode: mode interactions ----
+
+    #[test]
+    fn report_all_keys_emits_unmodified_printable() {
+        let mods = egui::Modifiers::default();
+        let mode = TermMode::KITTY_KEYBOARD_PROTOCOL | TermMode::REPORT_ALL_KEYS_AS_ESC;
+        let bytes = encode(egui::Key::A, mods, mode).unwrap();
+        assert_eq!(bytes, b"\x1b[97u");
+    }
+
+    #[test]
+    fn report_all_keys_emits_even_without_disambiguate() {
+        let mods = egui::Modifiers { ctrl: true, ..Default::default() };
+        let mode = TermMode::KITTY_KEYBOARD_PROTOCOL | TermMode::REPORT_ALL_KEYS_AS_ESC;
+        let bytes = encode(egui::Key::A, mods, mode).unwrap();
+        assert_eq!(bytes, b"\x1b[97;5u");
+    }
+
+    #[test]
+    fn no_kitty_flag_returns_none_even_with_disambiguate() {
+        let mods = egui::Modifiers { ctrl: true, ..Default::default() };
+        assert_eq!(encode(egui::Key::A, mods, TermMode::empty()), None);
+    }
+
+    #[test]
+    fn disambiguate_unmodified_escape() {
+        let mods = egui::Modifiers::default();
+        let bytes = encode(egui::Key::Escape, mods, disambiguate()).unwrap();
+        assert_eq!(bytes, b"\x1b[27u");
+    }
+
+    #[test]
+    fn disambiguate_modified_f_key() {
+        let mods = egui::Modifiers { shift: true, ..Default::default() };
+        let bytes = encode(egui::Key::F1, mods, disambiguate()).unwrap();
+        assert_eq!(bytes, b"\x1b[57364;2u");
+    }
+
+    #[test]
+    fn disambiguate_unmodified_enter_returns_none() {
+        let mods = egui::Modifiers::default();
+        assert_eq!(encode(egui::Key::Enter, mods, disambiguate()), None);
+    }
+
+    #[test]
+    fn unmodified_arrow_no_csi_u_in_disambiguate() {
+        let mods = egui::Modifiers::default();
+        assert_eq!(encode(egui::Key::ArrowUp, mods, disambiguate()), None);
+    }
 }
