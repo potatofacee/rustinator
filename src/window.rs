@@ -19,7 +19,7 @@ use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::window::{Window, WindowAttributes, WindowId};
 
-use crate::App;
+use crate::{App, RawTermKey};
 
 #[derive(Debug, Clone)]
 pub enum UserEvent {
@@ -553,11 +553,15 @@ impl ApplicationHandler<UserEvent> for WinitApp {
             self.current_modifiers = *mods;
         }
 
-        // Intercept keyboard events that egui-winit may fail to translate
-        // (Ctrl+letter produces control characters in logical_key, not letter keys).
+        // Intercept keyboard events before egui-winit's lossy translation.
+        // We produce both an egui event (for keybinding matching) and
+        // pre-encoded legacy terminal bytes (from winit's text_with_all_modifiers).
         if let WindowEvent::KeyboardInput { event: key_event, .. } = &event {
             if let Some(egui_ev) = translate_key_event(key_event, self.current_modifiers) {
                 self.pending_keys.push(egui_ev);
+            }
+            if let Some(raw) = encode_raw_key(key_event, self.current_modifiers) {
+                app.pending_raw_keys.push(raw);
             }
         }
 
@@ -614,6 +618,9 @@ impl ApplicationHandler<UserEvent> for WinitApp {
             WindowEvent::Resized(size) => {
                 gl_state.resize(size.width, size.height);
                 gl_state.window.request_redraw();
+            }
+            WindowEvent::Focused(focused) => {
+                app.notify_focus(focused);
             }
             WindowEvent::RedrawRequested => {
                 self.paint(event_loop);
@@ -767,6 +774,205 @@ fn translate_key_event(event: &winit::event::KeyEvent, modifiers: winit::event::
     })
 }
 
+/// Encode a winit key event into legacy terminal bytes, using winit's
+/// `text_with_all_modifiers()` for printable characters and a table for
+/// functional keys. This runs at capture time so the lossy egui conversion
+/// doesn't discard modifier information.
+fn encode_raw_key(event: &winit::event::KeyEvent, modifiers: winit::event::Modifiers) -> Option<RawTermKey> {
+    if !event.state.is_pressed() {
+        return None;
+    }
+    let mods = winit_mods_to_egui(modifiers);
+    let state = modifiers.state();
+    let alt = state.alt_key();
+    let ctrl = state.control_key();
+    let shift = state.shift_key();
+
+    // Map to egui::Key for the binding-matching side.
+    let egui_key = match &event.key_without_modifiers() {
+        Key::Character(c) => char_to_egui_key(c),
+        Key::Named(named) => named_to_egui_key(*named),
+        _ => None,
+    };
+
+    // --- Functional keys (no text representation) ---
+    // These always need a lookup table regardless of modifiers.
+    if let Key::Named(named) = &event.logical_key {
+        if let Some(bytes) = encode_named_key(*named, shift, alt, ctrl) {
+            return Some(RawTermKey {
+                key: egui_key.unwrap_or(egui::Key::Escape),
+                mods,
+                legacy_bytes: bytes,
+            });
+        }
+    }
+
+    // --- Printable characters: use text_with_all_modifiers ---
+    // This gives us the OS-level result of the keypress with all modifiers
+    // applied (e.g. Ctrl+A → 0x01, Shift+A → "A").
+    if let Some(text) = event.text_with_all_modifiers() {
+        if !text.is_empty() {
+            let egui_key = egui_key?;
+            let mut bytes = text.as_bytes().to_vec();
+            if alt {
+                bytes.insert(0, 0x1b);
+            }
+            return Some(RawTermKey {
+                key: egui_key,
+                mods,
+                legacy_bytes: bytes,
+            });
+        }
+    }
+
+    // Fallback for Ctrl+punctuation that winit may not produce text for.
+    // These are standard xterm control character mappings.
+    if ctrl {
+        let unmod = event.key_without_modifiers();
+        let ctrl_byte: Option<u8> = match &unmod {
+            Key::Character(c) => match c.as_ref() {
+                "[" => Some(0x1b), // ESC
+                "\\" => Some(0x1c),
+                "]" => Some(0x1d),
+                "^" | "6" => Some(0x1e),
+                "_" | "-" => Some(0x1f),
+                "2" | "@" | " " => Some(0x00), // NUL
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(b) = ctrl_byte {
+            let egui_key = egui_key?;
+            let mut bytes = vec![b];
+            if alt {
+                bytes.insert(0, 0x1b);
+            }
+            return Some(RawTermKey {
+                key: egui_key,
+                mods,
+                legacy_bytes: bytes,
+            });
+        }
+    }
+
+    None
+}
+
+fn legacy_mod_param(shift: bool, alt: bool, ctrl: bool) -> u8 {
+    let mut m: u8 = 0;
+    if shift { m |= 1; }
+    if alt { m |= 2; }
+    if ctrl { m |= 4; }
+    1 + m
+}
+
+fn encode_named_key(named: NamedKey, shift: bool, alt: bool, ctrl: bool) -> Option<Vec<u8>> {
+    let has_mods = shift || alt || ctrl;
+
+    // Shift+Tab is the standard backtab sequence.
+    if named == NamedKey::Tab && shift && !alt && !ctrl {
+        return Some(b"\x1b[Z".to_vec());
+    }
+
+    // Simple named keys (no modifier encoding in legacy).
+    if !has_mods {
+        let seq: &[u8] = match named {
+            NamedKey::Enter => b"\r",
+            NamedKey::Backspace => b"\x7f",
+            NamedKey::Tab => b"\t",
+            NamedKey::Escape => b"\x1b",
+            NamedKey::Space => b" ",
+            _ => &[],
+        };
+        if !seq.is_empty() {
+            return Some(seq.to_vec());
+        }
+    }
+
+    // Alt+Enter, Alt+Backspace, etc. — ESC prefix.
+    if alt && !ctrl {
+        let base: Option<u8> = match named {
+            NamedKey::Enter => Some(b'\r'),
+            NamedKey::Backspace => Some(0x7f),
+            NamedKey::Space => Some(b' '),
+            _ => None,
+        };
+        if let Some(b) = base {
+            return Some(vec![0x1b, b]);
+        }
+    }
+
+    // CSI <final> keys — modified form is CSI 1;{mod} <final>.
+    let final_byte: Option<u8> = match named {
+        NamedKey::ArrowUp => Some(b'A'),
+        NamedKey::ArrowDown => Some(b'B'),
+        NamedKey::ArrowRight => Some(b'C'),
+        NamedKey::ArrowLeft => Some(b'D'),
+        NamedKey::Home => Some(b'H'),
+        NamedKey::End => Some(b'F'),
+        _ => None,
+    };
+    if let Some(fb) = final_byte {
+        return if has_mods {
+            Some(format!("\x1b[1;{}{}", legacy_mod_param(shift, alt, ctrl), fb as char).into_bytes())
+        } else {
+            Some(vec![0x1b, b'[', fb])
+        };
+    }
+
+    // CSI <num> ~ keys — modified form is CSI <num>;{mod} ~.
+    let tilde_num: Option<u8> = match named {
+        NamedKey::Insert => Some(2),
+        NamedKey::Delete => Some(3),
+        NamedKey::PageUp => Some(5),
+        NamedKey::PageDown => Some(6),
+        _ => None,
+    };
+    if let Some(num) = tilde_num {
+        return if has_mods {
+            Some(format!("\x1b[{};{}~", num, legacy_mod_param(shift, alt, ctrl)).into_bytes())
+        } else {
+            Some(format!("\x1b[{}~", num).into_bytes())
+        };
+    }
+
+    // F-keys: F1-F4 use SS3, F5-F12 use CSI <num> ~.
+    let fkey: Option<(&[u8], u8)> = match named {
+        NamedKey::F1 => Some((b"\x1bOP", b'P')),
+        NamedKey::F2 => Some((b"\x1bOQ", b'Q')),
+        NamedKey::F3 => Some((b"\x1bOR", b'R')),
+        NamedKey::F4 => Some((b"\x1bOS", b'S')),
+        _ => None,
+    };
+    if let Some((unmod, fb)) = fkey {
+        return if has_mods {
+            Some(format!("\x1b[1;{}{}", legacy_mod_param(shift, alt, ctrl), fb as char).into_bytes())
+        } else {
+            Some(unmod.to_vec())
+        };
+    }
+    let fkey_tilde: Option<u8> = match named {
+        NamedKey::F5 => Some(15),
+        NamedKey::F6 => Some(17),
+        NamedKey::F7 => Some(18),
+        NamedKey::F8 => Some(19),
+        NamedKey::F9 => Some(20),
+        NamedKey::F10 => Some(21),
+        NamedKey::F11 => Some(23),
+        NamedKey::F12 => Some(24),
+        _ => None,
+    };
+    if let Some(num) = fkey_tilde {
+        return if has_mods {
+            Some(format!("\x1b[{};{}~", num, legacy_mod_param(shift, alt, ctrl)).into_bytes())
+        } else {
+            Some(format!("\x1b[{}~", num).into_bytes())
+        };
+    }
+
+    None
+}
+
 fn winit_mods_to_egui(mods: winit::event::Modifiers) -> egui::Modifiers {
     let state = mods.state();
     egui::Modifiers {
@@ -828,6 +1034,539 @@ fn named_to_egui_key(named: NamedKey) -> Option<egui::Key> {
         NamedKey::F11 => egui::Key::F11, NamedKey::F12 => egui::Key::F12,
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- legacy_mod_param ----
+
+    #[test]
+    fn mod_param_no_mods() {
+        assert_eq!(legacy_mod_param(false, false, false), 1);
+    }
+
+    #[test]
+    fn mod_param_shift() {
+        assert_eq!(legacy_mod_param(true, false, false), 2);
+    }
+
+    #[test]
+    fn mod_param_alt() {
+        assert_eq!(legacy_mod_param(false, true, false), 3);
+    }
+
+    #[test]
+    fn mod_param_ctrl() {
+        assert_eq!(legacy_mod_param(false, false, true), 5);
+    }
+
+    #[test]
+    fn mod_param_shift_alt_ctrl() {
+        assert_eq!(legacy_mod_param(true, true, true), 8);
+    }
+
+    // ---- encode_named_key: simple unmodified ----
+
+    #[test]
+    fn enter_unmodified() {
+        assert_eq!(encode_named_key(NamedKey::Enter, false, false, false).unwrap(), b"\r");
+    }
+
+    #[test]
+    fn backspace_unmodified() {
+        assert_eq!(encode_named_key(NamedKey::Backspace, false, false, false).unwrap(), b"\x7f");
+    }
+
+    #[test]
+    fn tab_unmodified() {
+        assert_eq!(encode_named_key(NamedKey::Tab, false, false, false).unwrap(), b"\t");
+    }
+
+    #[test]
+    fn escape_unmodified() {
+        assert_eq!(encode_named_key(NamedKey::Escape, false, false, false).unwrap(), b"\x1b");
+    }
+
+    #[test]
+    fn space_unmodified() {
+        assert_eq!(encode_named_key(NamedKey::Space, false, false, false).unwrap(), b" ");
+    }
+
+    // ---- Shift+Tab (backtab) ----
+
+    #[test]
+    fn shift_tab_is_backtab() {
+        assert_eq!(encode_named_key(NamedKey::Tab, true, false, false).unwrap(), b"\x1b[Z");
+    }
+
+    // ---- Alt+key (ESC prefix) ----
+
+    #[test]
+    fn alt_enter() {
+        assert_eq!(encode_named_key(NamedKey::Enter, false, true, false).unwrap(), b"\x1b\r");
+    }
+
+    #[test]
+    fn alt_backspace() {
+        assert_eq!(encode_named_key(NamedKey::Backspace, false, true, false).unwrap(), b"\x1b\x7f");
+    }
+
+    #[test]
+    fn alt_space() {
+        assert_eq!(encode_named_key(NamedKey::Space, false, true, false).unwrap(), b"\x1b ");
+    }
+
+    // ---- Arrows unmodified ----
+
+    #[test]
+    fn arrow_up() {
+        assert_eq!(encode_named_key(NamedKey::ArrowUp, false, false, false).unwrap(), b"\x1b[A");
+    }
+
+    #[test]
+    fn arrow_down() {
+        assert_eq!(encode_named_key(NamedKey::ArrowDown, false, false, false).unwrap(), b"\x1b[B");
+    }
+
+    #[test]
+    fn arrow_right() {
+        assert_eq!(encode_named_key(NamedKey::ArrowRight, false, false, false).unwrap(), b"\x1b[C");
+    }
+
+    #[test]
+    fn arrow_left() {
+        assert_eq!(encode_named_key(NamedKey::ArrowLeft, false, false, false).unwrap(), b"\x1b[D");
+    }
+
+    #[test]
+    fn home_unmodified() {
+        assert_eq!(encode_named_key(NamedKey::Home, false, false, false).unwrap(), b"\x1b[H");
+    }
+
+    #[test]
+    fn end_unmodified() {
+        assert_eq!(encode_named_key(NamedKey::End, false, false, false).unwrap(), b"\x1b[F");
+    }
+
+    // ---- Arrows with modifiers ----
+
+    #[test]
+    fn ctrl_arrow_up() {
+        assert_eq!(
+            encode_named_key(NamedKey::ArrowUp, false, false, true).unwrap(),
+            b"\x1b[1;5A"
+        );
+    }
+
+    #[test]
+    fn shift_arrow_left() {
+        assert_eq!(
+            encode_named_key(NamedKey::ArrowLeft, true, false, false).unwrap(),
+            b"\x1b[1;2D"
+        );
+    }
+
+    #[test]
+    fn alt_shift_arrow_right() {
+        assert_eq!(
+            encode_named_key(NamedKey::ArrowRight, true, true, false).unwrap(),
+            b"\x1b[1;4C"
+        );
+    }
+
+    // ---- Tilde keys ----
+
+    #[test]
+    fn insert_unmodified() {
+        assert_eq!(encode_named_key(NamedKey::Insert, false, false, false).unwrap(), b"\x1b[2~");
+    }
+
+    #[test]
+    fn delete_unmodified() {
+        assert_eq!(encode_named_key(NamedKey::Delete, false, false, false).unwrap(), b"\x1b[3~");
+    }
+
+    #[test]
+    fn page_up_unmodified() {
+        assert_eq!(encode_named_key(NamedKey::PageUp, false, false, false).unwrap(), b"\x1b[5~");
+    }
+
+    #[test]
+    fn page_down_unmodified() {
+        assert_eq!(encode_named_key(NamedKey::PageDown, false, false, false).unwrap(), b"\x1b[6~");
+    }
+
+    #[test]
+    fn ctrl_delete() {
+        assert_eq!(
+            encode_named_key(NamedKey::Delete, false, false, true).unwrap(),
+            b"\x1b[3;5~"
+        );
+    }
+
+    #[test]
+    fn shift_page_up() {
+        assert_eq!(
+            encode_named_key(NamedKey::PageUp, true, false, false).unwrap(),
+            b"\x1b[5;2~"
+        );
+    }
+
+    // ---- F-keys: F1-F4 (SS3 unmodified, CSI modified) ----
+
+    #[test]
+    fn f1_unmodified() {
+        assert_eq!(encode_named_key(NamedKey::F1, false, false, false).unwrap(), b"\x1bOP");
+    }
+
+    #[test]
+    fn f2_unmodified() {
+        assert_eq!(encode_named_key(NamedKey::F2, false, false, false).unwrap(), b"\x1bOQ");
+    }
+
+    #[test]
+    fn f3_unmodified() {
+        assert_eq!(encode_named_key(NamedKey::F3, false, false, false).unwrap(), b"\x1bOR");
+    }
+
+    #[test]
+    fn f4_unmodified() {
+        assert_eq!(encode_named_key(NamedKey::F4, false, false, false).unwrap(), b"\x1bOS");
+    }
+
+    #[test]
+    fn shift_f1() {
+        assert_eq!(
+            encode_named_key(NamedKey::F1, true, false, false).unwrap(),
+            b"\x1b[1;2P"
+        );
+    }
+
+    #[test]
+    fn ctrl_f3() {
+        assert_eq!(
+            encode_named_key(NamedKey::F3, false, false, true).unwrap(),
+            b"\x1b[1;5R"
+        );
+    }
+
+    // ---- F-keys: F5-F12 (CSI tilde) ----
+
+    #[test]
+    fn f5_unmodified() {
+        assert_eq!(encode_named_key(NamedKey::F5, false, false, false).unwrap(), b"\x1b[15~");
+    }
+
+    #[test]
+    fn f6_unmodified() {
+        assert_eq!(encode_named_key(NamedKey::F6, false, false, false).unwrap(), b"\x1b[17~");
+    }
+
+    #[test]
+    fn f7_unmodified() {
+        assert_eq!(encode_named_key(NamedKey::F7, false, false, false).unwrap(), b"\x1b[18~");
+    }
+
+    #[test]
+    fn f8_unmodified() {
+        assert_eq!(encode_named_key(NamedKey::F8, false, false, false).unwrap(), b"\x1b[19~");
+    }
+
+    #[test]
+    fn f9_unmodified() {
+        assert_eq!(encode_named_key(NamedKey::F9, false, false, false).unwrap(), b"\x1b[20~");
+    }
+
+    #[test]
+    fn f10_unmodified() {
+        assert_eq!(encode_named_key(NamedKey::F10, false, false, false).unwrap(), b"\x1b[21~");
+    }
+
+    #[test]
+    fn f11_unmodified() {
+        assert_eq!(encode_named_key(NamedKey::F11, false, false, false).unwrap(), b"\x1b[23~");
+    }
+
+    #[test]
+    fn f12_unmodified() {
+        assert_eq!(encode_named_key(NamedKey::F12, false, false, false).unwrap(), b"\x1b[24~");
+    }
+
+    #[test]
+    fn alt_f12() {
+        assert_eq!(
+            encode_named_key(NamedKey::F12, false, true, false).unwrap(),
+            b"\x1b[24;3~"
+        );
+    }
+
+    // ---- Unknown named key returns None ----
+
+    #[test]
+    fn unknown_named_key() {
+        assert_eq!(encode_named_key(NamedKey::CapsLock, false, false, false), None);
+    }
+
+    // ---- char_to_egui_key ----
+
+    #[test]
+    fn char_to_key_letter() {
+        assert_eq!(char_to_egui_key("a"), Some(egui::Key::A));
+        assert_eq!(char_to_egui_key("A"), Some(egui::Key::A));
+    }
+
+    #[test]
+    fn char_to_key_digit() {
+        assert_eq!(char_to_egui_key("5"), Some(egui::Key::Num5));
+    }
+
+    #[test]
+    fn char_to_key_punctuation() {
+        assert_eq!(char_to_egui_key("["), Some(egui::Key::OpenBracket));
+        assert_eq!(char_to_egui_key("]"), Some(egui::Key::CloseBracket));
+        assert_eq!(char_to_egui_key("/"), Some(egui::Key::Slash));
+        assert_eq!(char_to_egui_key("-"), Some(egui::Key::Minus));
+    }
+
+    #[test]
+    fn char_to_key_unknown() {
+        assert_eq!(char_to_egui_key("€"), None);
+    }
+
+    // ---- named_to_egui_key ----
+
+    #[test]
+    fn named_to_egui_arrows() {
+        assert_eq!(named_to_egui_key(NamedKey::ArrowUp), Some(egui::Key::ArrowUp));
+        assert_eq!(named_to_egui_key(NamedKey::ArrowDown), Some(egui::Key::ArrowDown));
+    }
+
+    #[test]
+    fn named_to_egui_fkeys() {
+        assert_eq!(named_to_egui_key(NamedKey::F1), Some(egui::Key::F1));
+        assert_eq!(named_to_egui_key(NamedKey::F12), Some(egui::Key::F12));
+    }
+
+    #[test]
+    fn named_to_egui_unknown() {
+        assert_eq!(named_to_egui_key(NamedKey::CapsLock), None);
+    }
+
+    // ---- legacy_mod_param: remaining combos ----
+
+    #[test]
+    fn mod_param_shift_alt() {
+        assert_eq!(legacy_mod_param(true, true, false), 4);
+    }
+
+    #[test]
+    fn mod_param_shift_ctrl() {
+        assert_eq!(legacy_mod_param(true, false, true), 6);
+    }
+
+    #[test]
+    fn mod_param_alt_ctrl() {
+        assert_eq!(legacy_mod_param(false, true, true), 7);
+    }
+
+    // ---- encode_named_key: more modifier combos on arrows ----
+
+    #[test]
+    fn alt_arrow_up() {
+        assert_eq!(
+            encode_named_key(NamedKey::ArrowUp, false, true, false).unwrap(),
+            b"\x1b[1;3A"
+        );
+    }
+
+    #[test]
+    fn ctrl_alt_arrow_down() {
+        assert_eq!(
+            encode_named_key(NamedKey::ArrowDown, false, true, true).unwrap(),
+            b"\x1b[1;7B"
+        );
+    }
+
+    #[test]
+    fn shift_ctrl_arrow_right() {
+        assert_eq!(
+            encode_named_key(NamedKey::ArrowRight, true, false, true).unwrap(),
+            b"\x1b[1;6C"
+        );
+    }
+
+    #[test]
+    fn shift_alt_ctrl_arrow_left() {
+        assert_eq!(
+            encode_named_key(NamedKey::ArrowLeft, true, true, true).unwrap(),
+            b"\x1b[1;8D"
+        );
+    }
+
+    #[test]
+    fn ctrl_home() {
+        assert_eq!(
+            encode_named_key(NamedKey::Home, false, false, true).unwrap(),
+            b"\x1b[1;5H"
+        );
+    }
+
+    #[test]
+    fn shift_end() {
+        assert_eq!(
+            encode_named_key(NamedKey::End, true, false, false).unwrap(),
+            b"\x1b[1;2F"
+        );
+    }
+
+    // ---- encode_named_key: tilde keys with more modifiers ----
+
+    #[test]
+    fn alt_insert() {
+        assert_eq!(
+            encode_named_key(NamedKey::Insert, false, true, false).unwrap(),
+            b"\x1b[2;3~"
+        );
+    }
+
+    #[test]
+    fn shift_ctrl_delete() {
+        assert_eq!(
+            encode_named_key(NamedKey::Delete, true, false, true).unwrap(),
+            b"\x1b[3;6~"
+        );
+    }
+
+    #[test]
+    fn alt_page_down() {
+        assert_eq!(
+            encode_named_key(NamedKey::PageDown, false, true, false).unwrap(),
+            b"\x1b[6;3~"
+        );
+    }
+
+    // ---- encode_named_key: F-key modifier combos ----
+
+    #[test]
+    fn alt_f1() {
+        assert_eq!(
+            encode_named_key(NamedKey::F1, false, true, false).unwrap(),
+            b"\x1b[1;3P"
+        );
+    }
+
+    #[test]
+    fn ctrl_alt_f4() {
+        assert_eq!(
+            encode_named_key(NamedKey::F4, false, true, true).unwrap(),
+            b"\x1b[1;7S"
+        );
+    }
+
+    #[test]
+    fn shift_f5() {
+        assert_eq!(
+            encode_named_key(NamedKey::F5, true, false, false).unwrap(),
+            b"\x1b[15;2~"
+        );
+    }
+
+    #[test]
+    fn ctrl_f9() {
+        assert_eq!(
+            encode_named_key(NamedKey::F9, false, false, true).unwrap(),
+            b"\x1b[20;5~"
+        );
+    }
+
+    #[test]
+    fn shift_alt_ctrl_f12() {
+        assert_eq!(
+            encode_named_key(NamedKey::F12, true, true, true).unwrap(),
+            b"\x1b[24;8~"
+        );
+    }
+
+    // ---- encode_named_key: Tab/Enter/Backspace with modifiers that don't match special paths ----
+
+    #[test]
+    fn ctrl_tab_returns_none() {
+        assert_eq!(encode_named_key(NamedKey::Tab, false, false, true), None);
+    }
+
+    #[test]
+    fn alt_tab_returns_none() {
+        assert_eq!(encode_named_key(NamedKey::Tab, false, true, false), None);
+    }
+
+    #[test]
+    fn ctrl_enter_returns_none() {
+        assert_eq!(encode_named_key(NamedKey::Enter, false, false, true), None);
+    }
+
+    #[test]
+    fn shift_enter_returns_none() {
+        assert_eq!(encode_named_key(NamedKey::Enter, true, false, false), None);
+    }
+
+    #[test]
+    fn ctrl_backspace_returns_none() {
+        assert_eq!(encode_named_key(NamedKey::Backspace, false, false, true), None);
+    }
+
+    #[test]
+    fn shift_escape_returns_none() {
+        assert_eq!(encode_named_key(NamedKey::Escape, true, false, false), None);
+    }
+
+    #[test]
+    fn ctrl_space_returns_none() {
+        assert_eq!(encode_named_key(NamedKey::Space, false, false, true), None);
+    }
+
+    // ---- char_to_egui_key: all punctuation ----
+
+    #[test]
+    fn char_to_key_all_punct() {
+        assert_eq!(char_to_egui_key("\\"), Some(egui::Key::Backslash));
+        assert_eq!(char_to_egui_key(";"), Some(egui::Key::Semicolon));
+        assert_eq!(char_to_egui_key("'"), Some(egui::Key::Quote));
+        assert_eq!(char_to_egui_key("`"), Some(egui::Key::Backtick));
+        assert_eq!(char_to_egui_key(","), Some(egui::Key::Comma));
+        assert_eq!(char_to_egui_key("."), Some(egui::Key::Period));
+        assert_eq!(char_to_egui_key("="), Some(egui::Key::Equals));
+    }
+
+    #[test]
+    fn char_to_key_empty_string() {
+        assert_eq!(char_to_egui_key(""), None);
+    }
+
+    #[test]
+    fn char_to_key_multi_char_uses_first() {
+        assert_eq!(char_to_egui_key("abc"), Some(egui::Key::A));
+    }
+
+    // ---- named_to_egui_key: spot checks ----
+
+    #[test]
+    fn named_to_egui_enter_tab_space() {
+        assert_eq!(named_to_egui_key(NamedKey::Enter), Some(egui::Key::Enter));
+        assert_eq!(named_to_egui_key(NamedKey::Tab), Some(egui::Key::Tab));
+        assert_eq!(named_to_egui_key(NamedKey::Space), Some(egui::Key::Space));
+    }
+
+    #[test]
+    fn named_to_egui_navigation() {
+        assert_eq!(named_to_egui_key(NamedKey::Home), Some(egui::Key::Home));
+        assert_eq!(named_to_egui_key(NamedKey::End), Some(egui::Key::End));
+        assert_eq!(named_to_egui_key(NamedKey::PageUp), Some(egui::Key::PageUp));
+        assert_eq!(named_to_egui_key(NamedKey::PageDown), Some(egui::Key::PageDown));
+        assert_eq!(named_to_egui_key(NamedKey::Insert), Some(egui::Key::Insert));
+        assert_eq!(named_to_egui_key(NamedKey::Delete), Some(egui::Key::Delete));
+    }
 }
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
