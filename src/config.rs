@@ -17,6 +17,9 @@ pub struct Config {
     #[serde(default)]
     pub layouts: Vec<SavedLayout>,
 
+    #[serde(default)]
+    pub hotkey_window: HotkeyWindowConfig,
+
     // ---- Legacy flat fields, for migration from pre-profile configs.
     // These are read but never written back.
     #[serde(default, skip_serializing)]
@@ -111,6 +114,7 @@ impl Default for Config {
             profiles: vec![Profile::new_named("Default")],
             keybindings: Vec::new(),
             layouts: Vec::new(),
+            hotkey_window: HotkeyWindowConfig::default(),
             font: None,
             colors: None,
             scrollback: None,
@@ -196,6 +200,28 @@ impl ScrollbackConfig {
 impl Default for TransparencyConfig {
     fn default() -> Self {
         Self { opacity: 1.0 }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct HotkeyWindowConfig {
+    pub enabled: bool,
+    pub hotkey: String,
+    pub height_percent: u32,
+    pub hide_on_focus_loss: bool,
+    pub always_on_top: bool,
+}
+
+impl Default for HotkeyWindowConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            hotkey: "Ctrl+`".into(),
+            height_percent: 50,
+            hide_on_focus_loss: true,
+            always_on_top: true,
+        }
     }
 }
 

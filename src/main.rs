@@ -1,5 +1,6 @@
 mod config;
 mod font;
+mod hotkey;
 mod keybindings;
 mod keyboard;
 mod layout;
@@ -78,7 +79,7 @@ pub(crate) struct App {
     cell_h: f32,
     term_config: TermConfig,
     pane_defaults: PaneDefaults,
-    user_config: Config,
+    pub(crate) user_config: Config,
     prefs_open: bool,
     prefs_draft: Config,
     prefs_status: Option<String>,
@@ -102,6 +103,7 @@ pub(crate) struct App {
     font_size_override: Option<f32>,
     scale_factor: f32,
     fullscreen_pending: bool,
+    pub(crate) hotkey_changed: bool,
     pending_zoom_steps: i32,
     cursor_blink_epoch: Instant,
     drag_source_pane: Option<PaneId>,
@@ -146,6 +148,7 @@ enum PaneAction {
     ResetClear,
     NewWindow,
     OpenTerminalHere,
+    QuitHotkeyWindow,
 }
 
 impl App {
@@ -250,6 +253,7 @@ impl App {
             font_size_override: None,
             scale_factor,
             fullscreen_pending: false,
+            hotkey_changed: false,
             pending_zoom_steps: 0,
             cursor_blink_epoch: Instant::now(),
             drag_source_pane: None,
@@ -556,6 +560,10 @@ impl App {
                 PaneAction::ResetClear => self.reset_focused_terminal(true),
                 PaneAction::NewWindow => { let _ = std::process::Command::new(std::env::current_exe().unwrap_or_default()).spawn(); }
                 PaneAction::OpenTerminalHere => self.split_here(),
+                PaneAction::QuitHotkeyWindow => {
+                    self.confirmed_close = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
                 PaneAction::SplitAuto | PaneAction::ToggleReadOnly
                 | PaneAction::SetTitle => {}
             }
@@ -784,8 +792,18 @@ impl App {
 
     fn apply_prefs(&mut self) {
         let old_profile = self.user_config.active().clone();
+        let old_hk = self.user_config.hotkey_window.clone();
         self.user_config = self.prefs_draft.clone();
         let profile = self.user_config.active().clone();
+        let new_hk = &self.user_config.hotkey_window;
+        if old_hk.enabled != new_hk.enabled
+            || old_hk.hotkey != new_hk.hotkey
+            || old_hk.height_percent != new_hk.height_percent
+            || old_hk.hide_on_focus_loss != new_hk.hide_on_focus_loss
+            || old_hk.always_on_top != new_hk.always_on_top
+        {
+            self.hotkey_changed = true;
+        }
 
         // Rebuild keybinding table from the new config.
         self.bindings = BindingTable::new();
@@ -2177,6 +2195,7 @@ fn action_to_pane_action(a: Action) -> PaneAction {
         Action::ResetTerminal => PaneAction::ResetTerminal,
         Action::ResetClear => PaneAction::ResetClear,
         Action::NewWindow => PaneAction::NewWindow,
+        Action::QuitHotkeyWindow => PaneAction::QuitHotkeyWindow,
     }
 }
 
@@ -2204,6 +2223,30 @@ fn draw_prefs_global(ui: &mut egui::Ui, cfg: &mut Config) {
         &mut cfg.global.confirm_on_close,
         "Confirm before closing a window with multiple panes",
     );
+
+    ui.add_space(16.0);
+    ui.heading("Hotkey Window");
+    ui.add_space(6.0);
+    ui.checkbox(&mut cfg.hotkey_window.enabled, "Enable hotkey window");
+    if cfg.hotkey_window.enabled {
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label("Hotkey");
+            ui.text_edit_singleline(&mut cfg.hotkey_window.hotkey);
+        });
+        ui.horizontal(|ui| {
+            ui.label("Height (% of screen)");
+            ui.add(egui::Slider::new(&mut cfg.hotkey_window.height_percent, 10..=100).suffix("%"));
+        });
+        ui.checkbox(&mut cfg.hotkey_window.hide_on_focus_loss, "Hide when focus is lost");
+        ui.checkbox(&mut cfg.hotkey_window.always_on_top, "Always on top");
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new("macOS: grant Accessibility permission if prompted.")
+                .small()
+                .weak(),
+        );
+    }
 }
 
 fn draw_prefs_profiles(

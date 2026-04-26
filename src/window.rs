@@ -17,13 +17,14 @@ use winit::event::{StartCause, WindowEvent};
 use winit::keyboard::{Key, NamedKey};
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
-use winit::window::{Window, WindowAttributes, WindowId};
+use winit::window::{Window, WindowAttributes, WindowId, WindowLevel};
 
 use crate::{App, RawTermKey};
 
 #[derive(Debug, Clone)]
 pub enum UserEvent {
     Repaint,
+    HotkeyTogglePressed,
 }
 
 pub struct GlState {
@@ -411,6 +412,183 @@ impl PrefsWindowState {
 
 // --- Main application handler ---
 
+// --- Hotkey dropdown window (secondary OS window with its own terminal) ---
+
+struct HotkeyWindowState {
+    window: Window,
+    gl_surface: Surface<WindowSurface>,
+    painter: egui_glow::Painter,
+    egui_ctx: egui::Context,
+    egui_winit: egui_winit::State,
+    app: App,
+    pending_keys: Vec<egui::Event>,
+    current_modifiers: winit::event::Modifiers,
+    zoom_pixel_accumulator: f64,
+}
+
+impl HotkeyWindowState {
+    fn new(
+        event_loop: &ActiveEventLoop,
+        gl_display: &Display,
+        gl_config: &GlConfig,
+        gl: &Arc<glow::Context>,
+        main_context: &PossiblyCurrentContext,
+        proxy: EventLoopProxy<UserEvent>,
+        height_pct: u32,
+        always_on_top: bool,
+    ) -> Option<Self> {
+        let window_attrs = WindowAttributes::default()
+            .with_title("rustinator")
+            .with_decorations(false)
+            .with_visible(false)
+            .with_transparent(true);
+
+        let window = glutin_winit::finalize_window(event_loop, window_attrs, gl_config)
+            .expect("failed to create hotkey window");
+
+        if always_on_top {
+            window.set_window_level(WindowLevel::AlwaysOnTop);
+        }
+        apply_hotkey_geometry(&window, height_pct);
+
+        let raw_window_handle = window.window_handle().ok().map(|h| h.as_raw());
+        let surface_attrs = SurfaceAttributesBuilder::<WindowSurface>::new().build(
+            raw_window_handle.expect("window handle required for surface"),
+            NonZeroU32::new(window.inner_size().width.max(1)).unwrap(),
+            NonZeroU32::new(window.inner_size().height.max(1)).unwrap(),
+        );
+        let gl_surface = unsafe {
+            gl_display
+                .create_window_surface(gl_config, &surface_attrs)
+                .expect("failed to create hotkey surface")
+        };
+
+        main_context
+            .make_current(&gl_surface)
+            .expect("failed to make context current on hotkey surface");
+
+        let painter = egui_glow::Painter::new(
+            Arc::clone(gl),
+            "",
+            Some(ShaderVersion::get(gl)),
+            true,
+        )
+        .expect("failed to create hotkey painter");
+
+        let egui_ctx = egui::Context::default();
+
+        let egui_winit = egui_winit::State::new(
+            egui_ctx.clone(),
+            egui::ViewportId::from_hash_of("hotkey"),
+            event_loop,
+            Some(window.scale_factor() as f32),
+            None,
+            Some(painter.max_texture_side()),
+        );
+
+        let phys = window.inner_size();
+        if let (Some(w), Some(h)) = (NonZeroU32::new(phys.width), NonZeroU32::new(phys.height)) {
+            gl_surface.resize(main_context, w, h);
+        }
+
+        let app = match App::new(
+            Arc::clone(gl),
+            egui_ctx.clone(),
+            proxy,
+            window.scale_factor() as f32,
+        ) {
+            Ok(app) => app,
+            Err(e) => {
+                log::warn!("hotkey window: failed to create app: {e}");
+                return None;
+            }
+        };
+
+        Some(Self {
+            window,
+            gl_surface,
+            painter,
+            egui_ctx,
+            egui_winit,
+            app,
+            pending_keys: Vec::new(),
+            current_modifiers: winit::event::Modifiers::default(),
+            zoom_pixel_accumulator: 0.0,
+        })
+    }
+
+    fn destroy(mut self, main_context: &PossiblyCurrentContext) {
+        main_context.make_current(&self.gl_surface).ok();
+        self.painter.destroy();
+        drop(self.gl_surface);
+        drop(self.window);
+    }
+
+    fn resize(&self, main_context: &PossiblyCurrentContext, width: u32, height: u32) {
+        if let (Some(w), Some(h)) = (NonZeroU32::new(width), NonZeroU32::new(height)) {
+            self.gl_surface.resize(main_context, w, h);
+        }
+    }
+
+    fn paint(&mut self, main_context: &PossiblyCurrentContext) {
+        main_context.make_current(&self.gl_surface).ok();
+        let phys = self.window.inner_size();
+        if let (Some(w), Some(h)) = (NonZeroU32::new(phys.width), NonZeroU32::new(phys.height)) {
+            self.gl_surface.resize(main_context, w, h);
+        }
+
+        let mut raw_input = self.egui_winit.take_egui_input(&self.window);
+        raw_input.events.append(&mut self.pending_keys);
+
+        let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
+            self.app.logic(ui.ctx());
+            self.app.ui(ui);
+        });
+
+        self.egui_winit
+            .handle_platform_output(&self.window, full_output.platform_output);
+
+        if self.app.fullscreen_pending {
+            self.app.fullscreen_pending = false;
+        }
+
+        if let Some(vp_out) = full_output.viewport_output.get(&egui::ViewportId::ROOT) {
+            for cmd in &vp_out.commands {
+                if let egui::ViewportCommand::Title(t) = cmd {
+                    self.window.set_title(t);
+                }
+            }
+        }
+
+        let screen_size: [u32; 2] = self.window.inner_size().into();
+        let pixels_per_point = egui_winit::pixels_per_point(&self.egui_ctx, &self.window);
+
+        let clipped_primitives = self.egui_ctx.tessellate(full_output.shapes, pixels_per_point);
+
+        let profile = self.app.user_config.active();
+        let [r, g, b] = profile.background_rgb();
+        let opacity = profile.transparency.opacity;
+        let clear_color = [
+            r as f32 / 255.0,
+            g as f32 / 255.0,
+            b as f32 / 255.0,
+            opacity,
+        ];
+
+        self.painter.clear(screen_size, clear_color);
+        self.painter.paint_and_update_textures(
+            screen_size,
+            pixels_per_point,
+            &clipped_primitives,
+            &full_output.textures_delta,
+        );
+
+        self.gl_surface.swap_buffers(main_context).ok();
+    }
+}
+
+// --- Main application handler ---
+
 struct WinitApp {
     gl_state: Option<GlState>,
     egui_ctx: egui::Context,
@@ -424,6 +602,11 @@ struct WinitApp {
     pending_keys: Vec<egui::Event>,
     current_modifiers: winit::event::Modifiers,
     zoom_pixel_accumulator: f64,
+    hotkey_handle: Option<crate::hotkey::HotkeyHandle>,
+    hotkey_window: Option<HotkeyWindowState>,
+    hotkey_height_pct: u32,
+    hotkey_hide_on_focus_loss: bool,
+    hotkey_previous_app_pid: Option<i32>,
 }
 
 impl WinitApp {
@@ -441,6 +624,11 @@ impl WinitApp {
             pending_keys: Vec::new(),
             current_modifiers: winit::event::Modifiers::default(),
             zoom_pixel_accumulator: 0.0,
+            hotkey_handle: None,
+            hotkey_window: None,
+            hotkey_height_pct: 50,
+            hotkey_hide_on_focus_loss: true,
+            hotkey_previous_app_pid: None,
         }
     }
 }
@@ -482,6 +670,29 @@ impl ApplicationHandler<UserEvent> for WinitApp {
             }
         };
 
+        let hk_cfg = &app.user_config.hotkey_window;
+        if hk_cfg.enabled {
+            self.hotkey_height_pct = hk_cfg.height_percent.clamp(1, 100);
+            self.hotkey_hide_on_focus_loss = hk_cfg.hide_on_focus_loss;
+
+            if let Some(handle) =
+                crate::hotkey::spawn(&hk_cfg.hotkey, self.event_loop_proxy.clone())
+            {
+                self.hotkey_handle = Some(handle);
+                self.hotkey_window = HotkeyWindowState::new(
+                    event_loop,
+                    &gl_state.gl_display,
+                    &gl_state.gl_config,
+                    &gl_state.gl,
+                    &gl_state.gl_context,
+                    self.event_loop_proxy.clone(),
+                    self.hotkey_height_pct,
+                    hk_cfg.always_on_top,
+                );
+                gl_state.make_current();
+            }
+        }
+
         self.main_window_id = Some(gl_state.window.id());
         self.gl_state = Some(gl_state);
         self.painter = Some(painter);
@@ -494,6 +705,37 @@ impl ApplicationHandler<UserEvent> for WinitApp {
             UserEvent::Repaint => {
                 if let Some(gl_state) = &self.gl_state {
                     gl_state.window.request_redraw();
+                }
+            }
+            UserEvent::HotkeyTogglePressed => {
+                if let Some(hk) = &self.hotkey_window {
+                    if hk.window.is_visible().unwrap_or(true) {
+                        hk.window.set_visible(false);
+                        #[cfg(target_os = "macos")]
+                        if let Some(pid) = self.hotkey_previous_app_pid.take() {
+                            macos_activate_pid(pid);
+                        }
+                    } else {
+                        #[cfg(target_os = "macos")]
+                        {
+                            let prev = macos_frontmost_pid();
+                            let ours = std::process::id() as i32;
+                            if prev != Some(ours) {
+                                self.hotkey_previous_app_pid = prev;
+                            } else {
+                                self.hotkey_previous_app_pid = None;
+                            }
+                        }
+                        apply_hotkey_geometry(&hk.window, self.hotkey_height_pct);
+                        hk.window.set_visible(true);
+                        hk.window.focus_window();
+                        #[cfg(target_os = "macos")]
+                        if self.hotkey_previous_app_pid.is_some() {
+                            if let Some(gl_state) = &self.gl_state {
+                                macos_order_window_back(&gl_state.window);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -544,6 +786,110 @@ impl ApplicationHandler<UserEvent> for WinitApp {
             return;
         }
 
+        // Hotkey window events.
+        let is_hotkey_window = self
+            .hotkey_window
+            .as_ref()
+            .is_some_and(|h| window_id == h.window.id());
+        if is_hotkey_window {
+            let mut hk = self.hotkey_window.take().unwrap();
+
+            if let WindowEvent::ModifiersChanged(mods) = &event {
+                hk.current_modifiers = *mods;
+            }
+
+            if let WindowEvent::KeyboardInput { event: key_event, .. } = &event {
+                if key_event.state.is_pressed()
+                    && key_event.logical_key == Key::Named(NamedKey::Escape)
+                    && hk.current_modifiers.state().is_empty()
+                {
+                    hk.window.set_visible(false);
+                    #[cfg(target_os = "macos")]
+                    if let Some(pid) = self.hotkey_previous_app_pid.take() {
+                        macos_activate_pid(pid);
+                    }
+                    self.hotkey_window = Some(hk);
+                    return;
+                }
+                if let Some(egui_ev) = translate_key_event(key_event, hk.current_modifiers) {
+                    hk.pending_keys.push(egui_ev);
+                }
+                if let Some(raw) = encode_raw_key(key_event, hk.current_modifiers) {
+                    hk.app.pending_raw_keys.push(raw);
+                }
+            }
+
+            if let WindowEvent::MouseWheel { delta, .. } = &event {
+                let zoom_mod = if cfg!(target_os = "macos") {
+                    hk.current_modifiers.state().super_key()
+                } else {
+                    hk.current_modifiers.state().control_key()
+                };
+                if zoom_mod {
+                    match delta {
+                        winit::event::MouseScrollDelta::LineDelta(_, y) => {
+                            let direction = y.signum() as i32;
+                            if direction != 0 {
+                                hk.app.pending_zoom_steps += direction;
+                            }
+                        }
+                        winit::event::MouseScrollDelta::PixelDelta(pos) => {
+                            hk.zoom_pixel_accumulator += pos.y;
+                            const THRESHOLD: f64 = 30.0;
+                            while hk.zoom_pixel_accumulator >= THRESHOLD {
+                                hk.app.pending_zoom_steps += 1;
+                                hk.zoom_pixel_accumulator -= THRESHOLD;
+                            }
+                            while hk.zoom_pixel_accumulator <= -THRESHOLD {
+                                hk.app.pending_zoom_steps -= 1;
+                                hk.zoom_pixel_accumulator += THRESHOLD;
+                            }
+                        }
+                    }
+                    self.hotkey_window = Some(hk);
+                    return;
+                }
+            }
+
+            let response = hk.egui_winit.on_window_event(&hk.window, &event);
+            if response.repaint {
+                hk.window.request_redraw();
+            }
+            let consumed = response.consumed;
+            if !consumed {
+                match event {
+                    WindowEvent::CloseRequested => {
+                        hk.window.set_visible(false);
+                    }
+                    WindowEvent::Resized(size) => {
+                        if let Some(gl_state) = &self.gl_state {
+                            hk.resize(&gl_state.gl_context, size.width, size.height);
+                        }
+                        hk.window.request_redraw();
+                    }
+                    WindowEvent::Focused(focused) => {
+                        hk.app.notify_focus(focused);
+                        if !focused && self.hotkey_hide_on_focus_loss {
+                            hk.window.set_visible(false);
+                            #[cfg(target_os = "macos")]
+                            if let Some(pid) = self.hotkey_previous_app_pid.take() {
+                                macos_activate_pid(pid);
+                            }
+                        }
+                    }
+                    WindowEvent::RedrawRequested => {
+                        if let Some(gl_state) = &self.gl_state {
+                            hk.paint(&gl_state.gl_context);
+                            gl_state.make_current();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            self.hotkey_window = Some(hk);
+            return;
+        }
+
         // Main window events.
         let Some(gl_state) = &self.gl_state else { return };
         let Some(egui_winit) = &mut self.egui_winit else { return };
@@ -553,9 +899,6 @@ impl ApplicationHandler<UserEvent> for WinitApp {
             self.current_modifiers = *mods;
         }
 
-        // Intercept keyboard events before egui-winit's lossy translation.
-        // We produce both an egui event (for keybinding matching) and
-        // pre-encoded legacy terminal bytes (from winit's text_with_all_modifiers).
         if let WindowEvent::KeyboardInput { event: key_event, .. } = &event {
             if let Some(egui_ev) = translate_key_event(key_event, self.current_modifiers) {
                 self.pending_keys.push(egui_ev);
@@ -565,7 +908,6 @@ impl ApplicationHandler<UserEvent> for WinitApp {
             }
         }
 
-        // Intercept modifier+scroll for font zoom before egui turns it into smooth zoom_delta.
         if let WindowEvent::MouseWheel { delta, .. } = &event {
             let zoom_mod = if cfg!(target_os = "macos") {
                 self.current_modifiers.state().super_key()
@@ -647,12 +989,23 @@ impl ApplicationHandler<UserEvent> for WinitApp {
         if let Some(prefs) = &self.prefs {
             prefs.window.request_redraw();
         }
+        if let Some(hk) = &self.hotkey_window {
+            if hk.window.is_visible().unwrap_or(false) {
+                hk.window.request_redraw();
+            }
+        }
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         self.shutting_down = true;
         if let Some(gl_state) = &self.gl_state {
             gl_state.make_current();
+        }
+        if let Some(hk) = self.hotkey_window.take() {
+            if let Some(gl_state) = &self.gl_state {
+                hk.destroy(&gl_state.gl_context);
+                gl_state.make_current();
+            }
         }
         if let Some(prefs) = self.prefs.take() {
             if let Some(gl_state) = &self.gl_state {
@@ -699,6 +1052,43 @@ impl WinitApp {
                 gl_state.window.set_fullscreen(None);
             } else {
                 gl_state.window.set_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
+            }
+        }
+
+        if app.hotkey_changed {
+            app.hotkey_changed = false;
+            let hk_cfg = &app.user_config.hotkey_window;
+            if hk_cfg.enabled {
+                self.hotkey_height_pct = hk_cfg.height_percent.clamp(1, 100);
+                self.hotkey_hide_on_focus_loss = hk_cfg.hide_on_focus_loss;
+                // Tear down old hotkey state.
+                self.hotkey_handle = None;
+                if let Some(old_hk) = self.hotkey_window.take() {
+                    old_hk.destroy(&gl_state.gl_context);
+                    gl_state.make_current();
+                }
+                if let Some(handle) =
+                    crate::hotkey::spawn(&hk_cfg.hotkey, self.event_loop_proxy.clone())
+                {
+                    self.hotkey_handle = Some(handle);
+                    self.hotkey_window = HotkeyWindowState::new(
+                        event_loop,
+                        &gl_state.gl_display,
+                        &gl_state.gl_config,
+                        &gl_state.gl,
+                        &gl_state.gl_context,
+                        self.event_loop_proxy.clone(),
+                        self.hotkey_height_pct,
+                        hk_cfg.always_on_top,
+                    );
+                    gl_state.make_current();
+                }
+            } else {
+                self.hotkey_handle = None;
+                if let Some(old_hk) = self.hotkey_window.take() {
+                    old_hk.destroy(&gl_state.gl_context);
+                    gl_state.make_current();
+                }
             }
         }
 
@@ -1566,6 +1956,190 @@ mod tests {
         assert_eq!(named_to_egui_key(NamedKey::PageDown), Some(egui::Key::PageDown));
         assert_eq!(named_to_egui_key(NamedKey::Insert), Some(egui::Key::Insert));
         assert_eq!(named_to_egui_key(NamedKey::Delete), Some(egui::Key::Delete));
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_screen_insets(window: &Window) -> Option<(f64, f64, f64, f64)> {
+    use objc2::MainThreadMarker;
+    use objc2::runtime::AnyObject;
+    use objc2_app_kit::NSScreen;
+
+    let (full, visible) = unsafe {
+        let mut result = None;
+        if let Ok(handle) = window.window_handle() {
+            if let raw_window_handle::RawWindowHandle::AppKit(app_handle) = handle.as_raw() {
+                let ns_view = &*(app_handle.ns_view.as_ptr() as *const AnyObject);
+                let ns_window: *const AnyObject = objc2::msg_send![ns_view, window];
+                if !ns_window.is_null() {
+                    let ns_screen: *const AnyObject = objc2::msg_send![&*ns_window, screen];
+                    if !ns_screen.is_null() {
+                        let screen = &*(ns_screen as *const NSScreen);
+                        result = Some((screen.frame(), screen.visibleFrame()));
+                    }
+                }
+            }
+        }
+        result
+    }
+    .or_else(|| {
+        let mtm = MainThreadMarker::new().expect("must be called from main thread");
+        let screen = NSScreen::mainScreen(mtm)?;
+        Some((screen.frame(), screen.visibleFrame()))
+    })?;
+
+    let top = (full.origin.y + full.size.height) - (visible.origin.y + visible.size.height);
+    let left = visible.origin.x - full.origin.x;
+    let bottom = visible.origin.y - full.origin.y;
+    let right = (full.origin.x + full.size.width) - (visible.origin.x + visible.size.width);
+
+    Some((top, left, bottom, right))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_frontmost_pid() -> Option<i32> {
+    use objc2::runtime::{AnyClass, AnyObject};
+
+    unsafe {
+        let cls = AnyClass::get(c"NSWorkspace")?;
+        let workspace: *mut AnyObject = objc2::msg_send![cls, sharedWorkspace];
+        if workspace.is_null() { return None; }
+        let app: *mut AnyObject = objc2::msg_send![&*workspace, frontmostApplication];
+        if app.is_null() { return None; }
+        let pid: i32 = objc2::msg_send![&*app, processIdentifier];
+        Some(pid)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_activate_pid(pid: i32) {
+    use objc2::runtime::{AnyClass, AnyObject};
+
+    unsafe {
+        let Some(cls) = AnyClass::get(c"NSRunningApplication") else { return };
+        let app: *mut AnyObject =
+            objc2::msg_send![cls, runningApplicationWithProcessIdentifier: pid];
+        if !app.is_null() {
+            let _: bool = objc2::msg_send![&*app, activateWithOptions: 2usize];
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_order_window_back(window: &Window) {
+    use objc2::runtime::AnyObject;
+
+    let Ok(handle) = window.window_handle() else { return };
+    let raw_window_handle::RawWindowHandle::AppKit(app_handle) = handle.as_raw() else { return };
+
+    unsafe {
+        let ns_view = &*(app_handle.ns_view.as_ptr() as *const AnyObject);
+        let ns_window: *const AnyObject = objc2::msg_send![ns_view, window];
+        if !ns_window.is_null() {
+            let _: () = objc2::msg_send![&*ns_window, orderBack: std::ptr::null_mut::<AnyObject>()];
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn x11_workarea() -> Option<(i32, i32, u32, u32)> {
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::{AtomEnum, ConnectionExt};
+
+    let (conn, screen_num) = x11rb::connect(None).ok()?;
+    let root = conn.setup().roots[screen_num].root;
+
+    let desktop_atom = conn
+        .intern_atom(false, b"_NET_CURRENT_DESKTOP")
+        .ok()?
+        .reply()
+        .ok()?
+        .atom;
+    let desktop_reply = conn
+        .get_property(false, root, desktop_atom, AtomEnum::CARDINAL, 0, 1)
+        .ok()?
+        .reply()
+        .ok()?;
+    let desktop_idx = desktop_reply.value32()?.next()? as usize;
+
+    let workarea_atom = conn
+        .intern_atom(false, b"_NET_WORKAREA")
+        .ok()?
+        .reply()
+        .ok()?
+        .atom;
+    let workarea_reply = conn
+        .get_property(false, root, workarea_atom, AtomEnum::CARDINAL, 0, 1024)
+        .ok()?
+        .reply()
+        .ok()?;
+    let values: Vec<u32> = workarea_reply.value32()?.collect();
+
+    let base = desktop_idx * 4;
+    if base + 3 >= values.len() {
+        return None;
+    }
+
+    Some((
+        values[base] as i32,
+        values[base + 1] as i32,
+        values[base + 2],
+        values[base + 3],
+    ))
+}
+
+fn apply_hotkey_geometry(window: &Window, height_pct: u32) {
+    let monitor = window
+        .current_monitor()
+        .or_else(|| window.primary_monitor());
+    if let Some(mon) = monitor {
+        let size = mon.size();
+        let pos = mon.position();
+        let scale = window.scale_factor();
+
+        #[cfg(target_os = "macos")]
+        let (top_inset, left_inset, bottom_inset, right_inset) = macos_screen_insets(window)
+            .map(|(t, l, b, r)| (
+                (t * scale) as i32,
+                (l * scale) as i32,
+                (b * scale) as i32,
+                (r * scale) as i32,
+            ))
+            .unwrap_or((0, 0, 0, 0));
+
+        #[cfg(not(target_os = "macos"))]
+        let (top_inset, left_inset, bottom_inset, right_inset) = {
+            #[cfg(not(target_os = "windows"))]
+            if let Some((wa_x, wa_y, wa_w, wa_h)) = x11_workarea() {
+                let mon_right = pos.x + size.width as i32;
+                let mon_bottom = pos.y + size.height as i32;
+                (
+                    wa_y.max(pos.y) - pos.y,
+                    wa_x.max(pos.x) - pos.x,
+                    mon_bottom - (wa_y + wa_h as i32).min(mon_bottom),
+                    mon_right - (wa_x + wa_w as i32).min(mon_right),
+                )
+            } else {
+                let margin = (40.0 * scale) as i32;
+                (margin, margin, 0i32, margin)
+            }
+
+            #[cfg(target_os = "windows")]
+            {
+                let margin = (40.0 * scale) as i32;
+                (margin, margin, 0i32, margin)
+            }
+        };
+
+        let usable_w = (size.width as i32 - left_inset - right_inset).max(100) as u32;
+        let usable_h = (size.height as i32 - top_inset - bottom_inset).max(100) as u32;
+        let h = (usable_h as f32 * height_pct as f32 / 100.0) as u32;
+
+        window.set_outer_position(winit::dpi::PhysicalPosition::new(
+            pos.x + left_inset,
+            pos.y + top_inset,
+        ));
+        let _ = window.request_inner_size(winit::dpi::PhysicalSize::new(usable_w, h));
     }
 }
 
