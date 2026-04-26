@@ -35,6 +35,7 @@ pub enum Action {
     ResetTerminal,
     ResetClear,
     NewWindow,
+    QuitHotkeyWindow,
 }
 
 impl Action {
@@ -66,6 +67,7 @@ impl Action {
             "reset_terminal" => Action::ResetTerminal,
             "reset_clear" => Action::ResetClear,
             "new_window" => Action::NewWindow,
+            "quit_hotkey_window" => Action::QuitHotkeyWindow,
             _ => return None,
         })
     }

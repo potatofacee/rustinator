@@ -7,6 +7,7 @@ edition = "2024"
 alacritty_terminal = "0.26.0"
 arboard = "3.6.1"
 crossfont = "0.9.0"
+global-hotkey = "0.7"
 egui = "0.34.1"
 egui-winit = "0.34.1"
 egui_glow = "0.34.1"
@@ -20,9 +21,15 @@ serde = { version = "1.0.228", features = ["derive"] }
 toml = "1.1.2"
 winit = "0.30.13"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", features = ["NSScreen", "NSWindow", "NSResponder"] }
+objc2-foundation = "0.3"
+
 [target.'cfg(not(any(target_os = "macos", target_os = "windows")))'.dependencies]
 egui-winit = { version = "0.34.1", features = ["x11", "wayland"] }
 egui_glow = { version = "0.34.1", features = ["x11", "wayland"] }
 glutin = { version = "0.32.3", default-features = false, features = ["egl", "glx", "x11", "wayland"] }
 glutin-winit = { version = "0.5.0", default-features = false, features = ["egl", "glx", "x11", "wayland"] }
 winit = { version = "0.30.13", features = ["x11", "wayland"] }
+x11rb = { version = "0.13", default-features = false }
