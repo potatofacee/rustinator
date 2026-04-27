@@ -68,6 +68,17 @@ pub struct Profile {
     pub scroll_on_keystroke: bool,
     #[serde(default = "default_word_chars")]
     pub word_chars: String,
+    #[serde(default)]
+    pub exit_action: ExitAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ExitAction {
+    #[default]
+    Close,
+    Hold,
+    Restart,
 }
 
 fn default_true() -> bool {
@@ -148,6 +159,7 @@ impl Profile {
             scroll_on_output: false,
             scroll_on_keystroke: true,
             word_chars: default_word_chars(),
+            exit_action: ExitAction::Close,
         }
     }
 
@@ -279,6 +291,7 @@ impl Config {
                 scroll_on_output: false,
                 scroll_on_keystroke: true,
                 word_chars: default_word_chars(),
+                exit_action: ExitAction::Close,
             };
             self.profiles = vec![profile];
             if self.active_profile.is_empty() {
@@ -469,11 +482,18 @@ mod tests {
         panic!("add login_shell: bool to Profile");
     }
 
-    // Gap #23: exit action (close/hold/restart)
     #[test]
-    #[ignore = "gap #23: exit_action not yet in Profile"]
     fn config_profile_exit_action() {
-        panic!("add exit_action: String to Profile (values: close, hold, restart)");
+        let p = Profile::default();
+        assert_eq!(p.exit_action, ExitAction::Close);
+
+        let toml_text = r#"
+            [[profiles]]
+            name = "Test"
+            exit_action = "hold"
+        "#;
+        let cfg: Config = toml::from_str(toml_text).unwrap();
+        assert_eq!(cfg.profiles[0].exit_action, ExitAction::Hold);
     }
 
     // Gap #16: bell configuration
