@@ -36,6 +36,7 @@ pub enum Action {
     ResetClear,
     NewWindow,
     QuitHotkeyWindow,
+    SwitchToTab(u8),
 }
 
 impl Action {
@@ -68,6 +69,16 @@ impl Action {
             "reset_clear" => Action::ResetClear,
             "new_window" => Action::NewWindow,
             "quit_hotkey_window" => Action::QuitHotkeyWindow,
+            "switch_to_tab_1" => Action::SwitchToTab(1),
+            "switch_to_tab_2" => Action::SwitchToTab(2),
+            "switch_to_tab_3" => Action::SwitchToTab(3),
+            "switch_to_tab_4" => Action::SwitchToTab(4),
+            "switch_to_tab_5" => Action::SwitchToTab(5),
+            "switch_to_tab_6" => Action::SwitchToTab(6),
+            "switch_to_tab_7" => Action::SwitchToTab(7),
+            "switch_to_tab_8" => Action::SwitchToTab(8),
+            "switch_to_tab_9" => Action::SwitchToTab(9),
+            "switch_to_tab_10" => Action::SwitchToTab(10),
             _ => return None,
         })
     }
@@ -163,6 +174,16 @@ fn defaults() -> Vec<(&'static str, Action)> {
         ("Ctrl+Shift+R", Action::ResetTerminal),
         ("Ctrl+Shift+G", Action::ResetClear),
         ("Ctrl+Shift+I", Action::NewWindow),
+        ("Alt+1", Action::SwitchToTab(1)),
+        ("Alt+2", Action::SwitchToTab(2)),
+        ("Alt+3", Action::SwitchToTab(3)),
+        ("Alt+4", Action::SwitchToTab(4)),
+        ("Alt+5", Action::SwitchToTab(5)),
+        ("Alt+6", Action::SwitchToTab(6)),
+        ("Alt+7", Action::SwitchToTab(7)),
+        ("Alt+8", Action::SwitchToTab(8)),
+        ("Alt+9", Action::SwitchToTab(9)),
+        ("Alt+0", Action::SwitchToTab(10)),
     ]
 }
 
@@ -323,7 +344,6 @@ mod tests {
 
     // Gap #30: direct tab switching (1-10)
     #[test]
-    #[ignore = "gap #30: Action::SwitchToTab1..10 not yet implemented"]
     fn action_switch_to_tab_by_number() {
         assert!(Action::from_str("switch_to_tab_1").is_some());
         assert!(Action::from_str("switch_to_tab_5").is_some());

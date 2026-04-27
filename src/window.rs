@@ -1,6 +1,7 @@
 use std::ffi::CString;
 use std::num::NonZeroU32;
 use std::sync::Arc;
+use std::time::Instant;
 
 use egui_glow::ShaderVersion;
 use glow::HasContext as _;
@@ -424,6 +425,7 @@ struct HotkeyWindowState {
     pending_keys: Vec<egui::Event>,
     current_modifiers: winit::event::Modifiers,
     zoom_pixel_accumulator: f64,
+    shown_at: Option<Instant>,
 }
 
 impl HotkeyWindowState {
@@ -514,6 +516,7 @@ impl HotkeyWindowState {
             pending_keys: Vec::new(),
             current_modifiers: winit::event::Modifiers::default(),
             zoom_pixel_accumulator: 0.0,
+            shown_at: None,
         })
     }
 
@@ -708,8 +711,9 @@ impl ApplicationHandler<UserEvent> for WinitApp {
                 }
             }
             UserEvent::HotkeyTogglePressed => {
-                if let Some(hk) = &self.hotkey_window {
+                if let Some(hk) = &mut self.hotkey_window {
                     if hk.window.is_visible().unwrap_or(true) {
+                        hk.shown_at = None;
                         hk.window.set_visible(false);
                         #[cfg(target_os = "macos")]
                         if let Some(pid) = self.hotkey_previous_app_pid.take() {
@@ -727,6 +731,7 @@ impl ApplicationHandler<UserEvent> for WinitApp {
                             }
                         }
                         apply_hotkey_geometry(&hk.window, self.hotkey_height_pct);
+                        hk.shown_at = Some(Instant::now());
                         hk.window.set_visible(true);
                         hk.window.focus_window();
                         #[cfg(target_os = "macos")]
@@ -870,10 +875,15 @@ impl ApplicationHandler<UserEvent> for WinitApp {
                     WindowEvent::Focused(focused) => {
                         hk.app.notify_focus(focused);
                         if !focused && self.hotkey_hide_on_focus_loss {
-                            hk.window.set_visible(false);
-                            #[cfg(target_os = "macos")]
-                            if let Some(pid) = self.hotkey_previous_app_pid.take() {
-                                macos_activate_pid(pid);
+                            let dominated_by_grace = hk.shown_at
+                                .is_some_and(|t| t.elapsed().as_millis() < 500);
+                            if !dominated_by_grace {
+                                hk.shown_at = None;
+                                hk.window.set_visible(false);
+                                #[cfg(target_os = "macos")]
+                                if let Some(pid) = self.hotkey_previous_app_pid.take() {
+                                    macos_activate_pid(pid);
+                                }
                             }
                         }
                     }
@@ -2134,6 +2144,13 @@ fn apply_hotkey_geometry(window: &Window, height_pct: u32) {
         let usable_w = (size.width as i32 - left_inset - right_inset).max(100) as u32;
         let usable_h = (size.height as i32 - top_inset - bottom_inset).max(100) as u32;
         let h = (usable_h as f32 * height_pct as f32 / 100.0) as u32;
+
+        log::info!(
+            "hotkey geometry: monitor={}x{} pos={},{} insets t={} l={} b={} r={} -> {}x{} at {},{}",
+            size.width, size.height, pos.x, pos.y,
+            top_inset, left_inset, bottom_inset, right_inset,
+            usable_w, h, pos.x + left_inset, pos.y + top_inset,
+        );
 
         window.set_outer_position(winit::dpi::PhysicalPosition::new(
             pos.x + left_inset,

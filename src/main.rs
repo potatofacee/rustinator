@@ -149,6 +149,7 @@ enum PaneAction {
     NewWindow,
     OpenTerminalHere,
     QuitHotkeyWindow,
+    SwitchToTab(u8),
 }
 
 impl App {
@@ -564,6 +565,7 @@ impl App {
                     self.confirmed_close = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
+                PaneAction::SwitchToTab(n) => self.switch_tab_direct(n),
                 PaneAction::SplitAuto | PaneAction::ToggleReadOnly
                 | PaneAction::SetTitle => {}
             }
@@ -1058,6 +1060,13 @@ impl App {
         self.active_tab = (((idx + step) % n + n) % n) as usize;
     }
 
+    fn switch_tab_direct(&mut self, tab_number: u8) {
+        let idx = (tab_number as usize).saturating_sub(1);
+        if idx < self.tabs.len() {
+            self.active_tab = idx;
+        }
+    }
+
     fn forward_input(&mut self, ctx: &egui::Context) {
         if self.tabs.is_empty() || ctx.egui_wants_keyboard_input() {
             self.pending_raw_keys.clear();
@@ -1403,6 +1412,7 @@ impl App {
 impl App {
     /// Reap panes whose child process has exited. Runs once per frame.
     fn reap_exited(&mut self) {
+        use crate::config::ExitAction;
         use std::sync::atomic::Ordering;
         loop {
             let mut found = None;
@@ -1415,7 +1425,40 @@ impl App {
                 }
             }
             match found {
-                Some((t, id)) => self.close_pane(t, id),
+                Some((t, id)) => {
+                    match self.user_config.active().exit_action {
+                        ExitAction::Close => self.close_pane(t, id),
+                        ExitAction::Hold => {
+                            if let Some(tab) = self.tabs.get_mut(t) {
+                                if let Some(pane) = tab.panes.get(&id) {
+                                    pane.exited.store(false, Ordering::Release);
+                                }
+                            }
+                            break;
+                        }
+                        ExitAction::Restart => {
+                            let (cols, lines) = match self.tabs.get(t)
+                                .and_then(|tab| tab.panes.get(&id))
+                            {
+                                Some(pane) => (pane.cols, pane.lines),
+                                None => break,
+                            };
+                            let new_id = self.next_pane_id;
+                            self.next_pane_id += 1;
+                            if let Some(new_pane) = self.spawn_pane(new_id, cols, lines, None) {
+                                let tab = &mut self.tabs[t];
+                                tab.layout.swap_leaves(id, new_id);
+                                tab.panes.remove(&id);
+                                tab.panes.insert(new_id, new_pane);
+                                if tab.focused == id {
+                                    tab.focused = new_id;
+                                }
+                            } else {
+                                self.close_pane(t, id);
+                            }
+                        }
+                    }
+                }
                 None => break,
             }
         }
@@ -2196,6 +2239,7 @@ fn action_to_pane_action(a: Action) -> PaneAction {
         Action::ResetClear => PaneAction::ResetClear,
         Action::NewWindow => PaneAction::NewWindow,
         Action::QuitHotkeyWindow => PaneAction::QuitHotkeyWindow,
+        Action::SwitchToTab(n) => PaneAction::SwitchToTab(n),
     }
 }
 
@@ -2409,6 +2453,23 @@ fn draw_prefs_profiles(
             ui.label(egui::RichText::new("Scroll behavior").strong());
             ui.checkbox(&mut profile.scroll_on_output, "Scroll on output");
             ui.checkbox(&mut profile.scroll_on_keystroke, "Scroll on keystroke");
+
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new("Shell").strong());
+            ui.horizontal(|ui| {
+                ui.label("When shell exits");
+                egui::ComboBox::from_id_salt("exit_action")
+                    .selected_text(match profile.exit_action {
+                        config::ExitAction::Close => "Close pane",
+                        config::ExitAction::Hold => "Hold open",
+                        config::ExitAction::Restart => "Restart shell",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut profile.exit_action, config::ExitAction::Close, "Close pane");
+                        ui.selectable_value(&mut profile.exit_action, config::ExitAction::Hold, "Hold open");
+                        ui.selectable_value(&mut profile.exit_action, config::ExitAction::Restart, "Restart shell");
+                    });
+            });
 
             ui.add_space(8.0);
             ui.label(egui::RichText::new("Selection").strong());
