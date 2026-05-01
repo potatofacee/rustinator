@@ -256,6 +256,37 @@ impl Node {
             }
         }
     }
+
+    /// Rotate the layout clockwise: flip all split directions and swap children.
+    pub fn rotate_cw(&mut self) {
+        match self {
+            Node::Leaf(_) => {}
+            Node::Split { dir, left, right, .. } => {
+                *dir = match dir {
+                    Direction::Horizontal => Direction::Vertical,
+                    Direction::Vertical => Direction::Horizontal,
+                };
+                std::mem::swap(left, right);
+                left.rotate_cw();
+                right.rotate_cw();
+            }
+        }
+    }
+
+    /// Rotate the layout counter-clockwise: flip all split directions (don't swap children).
+    pub fn rotate_ccw(&mut self) {
+        match self {
+            Node::Leaf(_) => {}
+            Node::Split { dir, left, right, .. } => {
+                *dir = match dir {
+                    Direction::Horizontal => Direction::Vertical,
+                    Direction::Vertical => Direction::Horizontal,
+                };
+                left.rotate_ccw();
+                right.rotate_ccw();
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -403,22 +434,32 @@ mod tests {
 
     // ── Gap inventory guardrails ──────────────────────────────────────
 
-    // Gap #9: clockwise rotation of panes
-    // When implementing: add Node::rotate_cw() that flips direction and swaps children.
-    // Then replace the panic with real assertions:
-    //   root.rotate_cw();
-    //   assert direction flipped to Horizontal, children reversed.
     #[test]
-    #[ignore = "gap #9: Node::rotate_cw not yet implemented"]
     fn rotate_cw_swaps_children() {
-        panic!("implement Node::rotate_cw(): flip split direction, reverse child order");
+        let mut root = Node::Leaf(1);
+        root.split_leaf(1, 2, Direction::Vertical);
+        root.rotate_cw();
+        // After CW rotation: Vertical -> Horizontal, children swapped (2, 1)
+        let out = leaves(&root);
+        assert_eq!(out, vec![2, 1]);
+        match &root {
+            Node::Split { dir, .. } => assert_eq!(*dir, Direction::Horizontal),
+            _ => panic!("expected split"),
+        }
     }
 
-    // Gap #9: counter-clockwise rotation
     #[test]
-    #[ignore = "gap #9: Node::rotate_ccw not yet implemented"]
     fn rotate_ccw_swaps_children() {
-        panic!("implement Node::rotate_ccw(): flip split direction, keep child order");
+        let mut root = Node::Leaf(1);
+        root.split_leaf(1, 2, Direction::Vertical);
+        root.rotate_ccw();
+        // After CCW rotation: Vertical -> Horizontal, children NOT swapped (1, 2)
+        let out = leaves(&root);
+        assert_eq!(out, vec![1, 2]);
+        match &root {
+            Node::Split { dir, .. } => assert_eq!(*dir, Direction::Horizontal),
+            _ => panic!("expected split"),
+        }
     }
 
     // Gap #45: rebalance dividers (equalize ratios)

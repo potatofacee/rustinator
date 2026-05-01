@@ -322,6 +322,7 @@ pub struct Pane {
     pub cached: Option<Arc<Frame>>,
     pub defaults: PaneDefaults,
     pub read_only: bool,
+    pub scrollbar_visible: bool,
 }
 
 impl Pane {
@@ -354,6 +355,11 @@ impl Pane {
         };
 
         let mut pty_opts = tty::Options::default();
+        #[cfg(not(target_os = "macos"))]
+        {
+            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+            pty_opts.shell = Some(tty::Shell::new(shell, vec!["--login".into()]));
+        }
         pty_opts.env.insert("TERM".into(), "xterm-256color".into());
         pty_opts.env.insert("COLORTERM".into(), "truecolor".into());
         pty_opts.env.insert("TERM_PROGRAM".into(), "rustinator".into());
@@ -384,6 +390,7 @@ impl Pane {
             cached: None,
             defaults,
             read_only: false,
+            scrollbar_visible: true,
         })
     }
 

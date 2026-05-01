@@ -46,6 +46,8 @@ pub struct SavedLayout {
 #[serde(default)]
 pub struct GlobalConfig {
     pub confirm_on_close: bool,
+    #[serde(default)]
+    pub use_linux_keybindings: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -135,7 +137,10 @@ impl Default for Config {
 
 impl Default for GlobalConfig {
     fn default() -> Self {
-        Self { confirm_on_close: true }
+        Self {
+            confirm_on_close: true,
+            use_linux_keybindings: false,
+        }
     }
 }
 

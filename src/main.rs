@@ -149,7 +149,26 @@ enum PaneAction {
     NewWindow,
     OpenTerminalHere,
     QuitHotkeyWindow,
+    MoveTabLeft,
+    MoveTabRight,
     SwitchToTab(u8),
+    GoUp,
+    GoDown,
+    GoLeft,
+    GoRight,
+    GoNext,
+    GoPrev,
+    RotateCW,
+    RotateCCW,
+    ToggleScrollbar,
+    HideWindow,
+}
+
+enum FocusDir {
+    Up,
+    Down,
+    Left,
+    Right,
 }
 
 impl App {
@@ -195,7 +214,7 @@ impl App {
             bg_opacity: profile.transparency.opacity,
         };
 
-        let mut bindings = BindingTable::new();
+        let mut bindings = BindingTable::new(user_config.global.use_linux_keybindings);
         bindings.apply_user(
             &user_config
                 .keybindings
@@ -566,8 +585,33 @@ impl App {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
                 PaneAction::SwitchToTab(n) => self.switch_tab_direct(n),
-                PaneAction::SplitAuto | PaneAction::ToggleReadOnly
-                | PaneAction::SetTitle => {}
+                PaneAction::MoveTabLeft => self.move_tab(-1),
+                PaneAction::MoveTabRight => self.move_tab(1),
+                PaneAction::GoUp => self.focus_direction(FocusDir::Up),
+                PaneAction::GoDown => self.focus_direction(FocusDir::Down),
+                PaneAction::GoLeft => self.focus_direction(FocusDir::Left),
+                PaneAction::GoRight => self.focus_direction(FocusDir::Right),
+                PaneAction::GoNext => self.cycle_focus(1),
+                PaneAction::GoPrev => self.cycle_focus(-1),
+                PaneAction::RotateCW => self.tabs[self.active_tab].layout.rotate_cw(),
+                PaneAction::RotateCCW => self.tabs[self.active_tab].layout.rotate_ccw(),
+                PaneAction::SplitAuto => {
+                    let dir = match self.last_pane_rect {
+                        Some(r) if r.width() >= r.height() => Direction::Vertical,
+                        _ => Direction::Horizontal,
+                    };
+                    self.split(dir);
+                }
+                PaneAction::ToggleScrollbar => {
+                    let focused = self.active().focused;
+                    if let Some(pane) = self.active().panes.get_mut(&focused) {
+                        pane.scrollbar_visible = !pane.scrollbar_visible;
+                    }
+                }
+                PaneAction::HideWindow => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                }
+                PaneAction::ToggleReadOnly | PaneAction::SetTitle => {}
             }
         }
     }
@@ -808,7 +852,7 @@ impl App {
         }
 
         // Rebuild keybinding table from the new config.
-        self.bindings = BindingTable::new();
+        self.bindings = BindingTable::new(self.user_config.global.use_linux_keybindings);
         self.bindings.apply_user(
             &self
                 .user_config
@@ -1043,6 +1087,37 @@ impl App {
         tab.focused = leaves[new_idx as usize];
     }
 
+    fn focus_direction(&mut self, dir: FocusDir) {
+        let tab = &self.tabs[self.active_tab];
+        let root_rect = self.last_pane_rect.unwrap_or(egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(800.0, 600.0),
+        ));
+        let mut rects = Vec::new();
+        tab.layout.walk_rects(root_rect, PANE_GAP, &mut rects);
+
+        let focused_rect = rects.iter().find(|(id, _)| *id == tab.focused).map(|(_, r)| *r);
+        let Some(fr) = focused_rect else { return };
+
+        let best = rects.iter()
+            .filter(|(id, _)| *id != tab.focused)
+            .filter(|(_, r)| match dir {
+                FocusDir::Up => r.center().y < fr.center().y,
+                FocusDir::Down => r.center().y > fr.center().y,
+                FocusDir::Left => r.center().x < fr.center().x,
+                FocusDir::Right => r.center().x > fr.center().x,
+            })
+            .min_by_key(|(_, r)| {
+                let dx = r.center().x - fr.center().x;
+                let dy = r.center().y - fr.center().y;
+                ((dx * dx + dy * dy) * 1000.0) as i64
+            });
+
+        if let Some((id, _)) = best {
+            self.tabs[self.active_tab].focused = *id;
+        }
+    }
+
     fn new_tab(&mut self) {
         let new_id = self.next_pane_id;
         self.next_pane_id += 1;
@@ -1065,6 +1140,15 @@ impl App {
         if idx < self.tabs.len() {
             self.active_tab = idx;
         }
+    }
+
+    fn move_tab(&mut self, delta: i32) {
+        let n = self.tabs.len() as i32;
+        if n < 2 { return; }
+        let from = self.active_tab as i32;
+        let to = ((from + delta) % n + n) % n;
+        self.tabs.swap(from as usize, to as usize);
+        self.active_tab = to as usize;
     }
 
     fn forward_input(&mut self, ctx: &egui::Context) {
@@ -1337,7 +1421,7 @@ impl App {
         // Scrollbar overlay.
         if let Some(pane) = self.tabs[self.active_tab].panes.get(&pane_id) {
             let (offset, history, screen) = pane.scroll_info();
-            if history > 0 {
+            if history > 0 && pane.scrollbar_visible {
                 let total = history + screen;
                 let sb_width = 8.0;
                 let track = egui::Rect::from_min_max(
@@ -2135,7 +2219,7 @@ fn read_primary() -> Option<String> {
     target_os = "openbsd"
 )))]
 fn read_primary() -> Option<String> {
-    None
+    PRIMARY_BUFFER.lock().ok()?.clone()
 }
 
 #[cfg(any(
@@ -2159,7 +2243,19 @@ fn write_primary(text: &str) {
     target_os = "netbsd",
     target_os = "openbsd"
 )))]
-fn write_primary(_: &str) {}
+fn write_primary(text: &str) {
+    if let Ok(mut buf) = PRIMARY_BUFFER.lock() {
+        *buf = Some(text.to_string());
+    }
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+)))]
+static PRIMARY_BUFFER: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 fn drop_zone_direction(rect: egui::Rect, pos: egui::Pos2) -> (Direction, bool) {
     let rx = (pos.x - rect.left()) / rect.width();
@@ -2239,7 +2335,20 @@ fn action_to_pane_action(a: Action) -> PaneAction {
         Action::ResetClear => PaneAction::ResetClear,
         Action::NewWindow => PaneAction::NewWindow,
         Action::QuitHotkeyWindow => PaneAction::QuitHotkeyWindow,
+        Action::MoveTabLeft => PaneAction::MoveTabLeft,
+        Action::MoveTabRight => PaneAction::MoveTabRight,
         Action::SwitchToTab(n) => PaneAction::SwitchToTab(n),
+        Action::GoUp => PaneAction::GoUp,
+        Action::GoDown => PaneAction::GoDown,
+        Action::GoLeft => PaneAction::GoLeft,
+        Action::GoRight => PaneAction::GoRight,
+        Action::GoNext => PaneAction::GoNext,
+        Action::GoPrev => PaneAction::GoPrev,
+        Action::RotateCW => PaneAction::RotateCW,
+        Action::RotateCCW => PaneAction::RotateCCW,
+        Action::SplitAuto => PaneAction::SplitAuto,
+        Action::ToggleScrollbar => PaneAction::ToggleScrollbar,
+        Action::HideWindow => PaneAction::HideWindow,
     }
 }
 
