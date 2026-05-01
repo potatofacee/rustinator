@@ -36,7 +36,20 @@ pub enum Action {
     ResetClear,
     NewWindow,
     QuitHotkeyWindow,
+    MoveTabLeft,
+    MoveTabRight,
     SwitchToTab(u8),
+    GoUp,
+    GoDown,
+    GoLeft,
+    GoRight,
+    GoNext,
+    GoPrev,
+    RotateCW,
+    RotateCCW,
+    SplitAuto,
+    ToggleScrollbar,
+    HideWindow,
 }
 
 impl Action {
@@ -69,6 +82,8 @@ impl Action {
             "reset_clear" => Action::ResetClear,
             "new_window" => Action::NewWindow,
             "quit_hotkey_window" => Action::QuitHotkeyWindow,
+            "move_tab_left" => Action::MoveTabLeft,
+            "move_tab_right" => Action::MoveTabRight,
             "switch_to_tab_1" => Action::SwitchToTab(1),
             "switch_to_tab_2" => Action::SwitchToTab(2),
             "switch_to_tab_3" => Action::SwitchToTab(3),
@@ -79,6 +94,17 @@ impl Action {
             "switch_to_tab_8" => Action::SwitchToTab(8),
             "switch_to_tab_9" => Action::SwitchToTab(9),
             "switch_to_tab_10" => Action::SwitchToTab(10),
+            "go_up" => Action::GoUp,
+            "go_down" => Action::GoDown,
+            "go_left" => Action::GoLeft,
+            "go_right" => Action::GoRight,
+            "go_next" => Action::GoNext,
+            "go_prev" => Action::GoPrev,
+            "rotate_cw" => Action::RotateCW,
+            "rotate_ccw" => Action::RotateCCW,
+            "split_auto" => Action::SplitAuto,
+            "toggle_scrollbar" => Action::ToggleScrollbar,
+            "hide_window" => Action::HideWindow,
             _ => return None,
         })
     }
@@ -109,9 +135,9 @@ pub struct BindingTable {
 }
 
 impl BindingTable {
-    pub fn new() -> Self {
+    pub fn new(force_linux: bool) -> Self {
         let mut t = Self { map: HashMap::new() };
-        for (combo, action) in defaults() {
+        for (combo, action) in defaults_for_platform(force_linux) {
             if let Some(parsed) = parse_combo(combo) {
                 t.map.insert(parsed, action);
             }
@@ -140,50 +166,176 @@ impl BindingTable {
     }
 }
 
-fn defaults() -> Vec<(&'static str, Action)> {
+pub fn defaults_for_platform(force_linux: bool) -> Vec<(&'static str, Action)> {
+    if cfg!(target_os = "macos") && !force_linux {
+        macos_defaults()
+    } else {
+        linux_defaults()
+    }
+}
+
+fn macos_defaults() -> Vec<(&'static str, Action)> {
     vec![
-        ("Ctrl+Shift+O", Action::SplitHorizontal),
-        ("Ctrl+Shift+E", Action::SplitVertical),
-        ("Ctrl+Shift+W", Action::ClosePane),
-        ("Ctrl+Shift+T", Action::NewTab),
-        ("Ctrl+PageDown", Action::NextTab),
-        ("Ctrl+PageUp", Action::PrevTab),
+        // ── Creation & destruction ───────────────────────────────────
+        ("Cmd+D", Action::SplitHorizontal),
+        ("Cmd+Shift+D", Action::SplitVertical),
+        ("Cmd+W", Action::ClosePane),
+        ("Cmd+Q", Action::CloseWindow),
+        ("Cmd+T", Action::NewTab),
+        ("Cmd+N", Action::NewWindow),
+
+        // ── Navigation (focus) ───────────────────────────────────────
         ("Ctrl+Tab", Action::FocusNext),
-        ("Alt+Right", Action::FocusNext),
-        ("Alt+Down", Action::FocusNext),
         ("Ctrl+Shift+Tab", Action::FocusPrev),
-        ("Alt+Left", Action::FocusPrev),
-        ("Alt+Up", Action::FocusPrev),
-        ("Ctrl+Shift+C", Action::Copy),
-        ("Ctrl+Shift+V", Action::Paste),
-        ("Ctrl+Comma", Action::OpenPrefs),
-        ("Ctrl+Shift+X", Action::ToggleZoom),
-        ("Ctrl+Shift+B", Action::ToggleBroadcast),
-        ("Ctrl+F", Action::ToggleSearch),
-        ("Ctrl+Shift+F", Action::ToggleSearch),
-        ("Ctrl+Equals", Action::ZoomIn),
-        ("Ctrl+Shift+Equals", Action::ZoomIn),
-        ("Ctrl+Minus", Action::ZoomOut),
-        ("Ctrl+0", Action::ZoomReset),
-        ("Ctrl+Shift+Q", Action::CloseWindow),
-        ("F11", Action::ToggleFullscreen),
-        ("Ctrl+Shift+Left", Action::ResizeLeft),
-        ("Ctrl+Shift+Right", Action::ResizeRight),
-        ("Ctrl+Shift+Up", Action::ResizeUp),
-        ("Ctrl+Shift+Down", Action::ResizeDown),
-        ("Ctrl+Shift+R", Action::ResetTerminal),
-        ("Ctrl+Shift+G", Action::ResetClear),
-        ("Ctrl+Shift+I", Action::NewWindow),
-        ("Alt+1", Action::SwitchToTab(1)),
-        ("Alt+2", Action::SwitchToTab(2)),
-        ("Alt+3", Action::SwitchToTab(3)),
-        ("Alt+4", Action::SwitchToTab(4)),
-        ("Alt+5", Action::SwitchToTab(5)),
-        ("Alt+6", Action::SwitchToTab(6)),
-        ("Alt+7", Action::SwitchToTab(7)),
-        ("Alt+8", Action::SwitchToTab(8)),
-        ("Alt+9", Action::SwitchToTab(9)),
-        ("Alt+0", Action::SwitchToTab(10)),
+        ("Alt+Up", Action::GoUp),
+        ("Alt+Down", Action::GoDown),
+        ("Alt+Left", Action::GoLeft),
+        ("Alt+Right", Action::GoRight),
+
+        // ── Tab management ───────────────────────────────────────────
+        ("Cmd+Shift+Right", Action::NextTab),
+        ("Cmd+Shift+Left", Action::PrevTab),
+        ("Cmd+Shift+PageDown", Action::MoveTabRight),
+        ("Cmd+Shift+PageUp", Action::MoveTabLeft),
+        ("Cmd+1", Action::SwitchToTab(1)),
+        ("Cmd+2", Action::SwitchToTab(2)),
+        ("Cmd+3", Action::SwitchToTab(3)),
+        ("Cmd+4", Action::SwitchToTab(4)),
+        ("Cmd+5", Action::SwitchToTab(5)),
+        ("Cmd+6", Action::SwitchToTab(6)),
+        ("Cmd+7", Action::SwitchToTab(7)),
+        ("Cmd+8", Action::SwitchToTab(8)),
+        ("Cmd+9", Action::SwitchToTab(9)),
+
+        // ── Resize ───────────────────────────────────────────────────
+        ("Ctrl+Cmd+Up", Action::ResizeUp),
+        ("Ctrl+Cmd+Down", Action::ResizeDown),
+        ("Ctrl+Cmd+Left", Action::ResizeLeft),
+        ("Ctrl+Cmd+Right", Action::ResizeRight),
+
+        // ── Rotation ─────────────────────────────────────────────────
+        ("Ctrl+Cmd+R", Action::RotateCW),
+        ("Ctrl+Cmd+Shift+R", Action::RotateCCW),
+
+        // ── Zoom & fullscreen ────────────────────────────────────────
+        ("Cmd+Ctrl+F", Action::ToggleFullscreen),
+        ("Cmd+Shift+X", Action::ToggleZoom),
+        ("Cmd+Equals", Action::ZoomIn),
+        ("Cmd+Shift+Equals", Action::ZoomIn),
+        ("Cmd+Minus", Action::ZoomOut),
+        ("Cmd+0", Action::ZoomReset),
+
+        // ── Clipboard ────────────────────────────────────────────────
+        ("Cmd+C", Action::Copy),
+        ("Cmd+V", Action::Paste),
+
+        // ── Search ───────────────────────────────────────────────────
+        ("Cmd+F", Action::ToggleSearch),
+
+        // ── Terminal reset ───────────────────────────────────────────
+        ("Cmd+Shift+R", Action::ResetTerminal),
+        ("Cmd+Shift+G", Action::ResetClear),
+
+        // ── Grouping & broadcasting ──────────────────────────────────
+        ("Cmd+Shift+B", Action::ToggleBroadcast),
+
+        // ── Preferences ──────────────────────────────────────────────
+        ("Cmd+Comma", Action::OpenPrefs),
+    ]
+}
+
+fn linux_defaults() -> Vec<(&'static str, Action)> {
+    vec![
+        // ── Creation & destruction ───────────────────────────────────
+        ("Ctrl+Shift+O", Action::SplitHorizontal),   // split_horiz
+        ("Ctrl+Shift+E", Action::SplitVertical),      // split_vert
+        ("Ctrl+Shift+A", Action::SplitAuto),
+        ("Ctrl+Shift+W", Action::ClosePane),          // close_term
+        ("Ctrl+Shift+Q", Action::CloseWindow),        // close_window
+        ("Ctrl+Shift+T", Action::NewTab),             // new_tab
+        ("Ctrl+Shift+I", Action::NewWindow),          // new_window
+        // ("Super+I", Action::NewTerminator),         // new_terminator — not implemented
+        // ("Alt+L", Action::LayoutLauncher),          // layout_launcher — not implemented
+
+        // ── Navigation (focus) ───────────────────────────────────────
+        ("Ctrl+Tab", Action::FocusNext),              // cycle_next
+        ("Ctrl+Shift+Tab", Action::FocusPrev),        // cycle_prev
+        ("Ctrl+Shift+N", Action::GoNext),             // go_next
+        ("Ctrl+Shift+P", Action::GoPrev),             // go_prev
+        ("Alt+Up", Action::GoUp),                     // go_up
+        ("Alt+Down", Action::GoDown),                 // go_down
+        ("Alt+Left", Action::GoLeft),                 // go_left
+        ("Alt+Right", Action::GoRight),               // go_right
+
+        // ── Tab management ───────────────────────────────────────────
+        ("Ctrl+PageDown", Action::NextTab),           // next_tab
+        ("Ctrl+PageUp", Action::PrevTab),             // prev_tab
+        ("Ctrl+Shift+PageDown", Action::MoveTabRight),
+        ("Ctrl+Shift+PageUp", Action::MoveTabLeft),
+        // switch_to_tab_1..10 — unbound by default in Terminator
+
+        // ── Resize ───────────────────────────────────────────────────
+        ("Ctrl+Shift+Up", Action::ResizeUp),          // resize_up
+        ("Ctrl+Shift+Down", Action::ResizeDown),      // resize_down
+        ("Ctrl+Shift+Left", Action::ResizeLeft),      // resize_left
+        ("Ctrl+Shift+Right", Action::ResizeRight),    // resize_right
+        ("Super+R", Action::RotateCW),
+        ("Super+Shift+R", Action::RotateCCW),
+
+        // ── Zoom & fullscreen ────────────────────────────────────────
+        ("F11", Action::ToggleFullscreen),             // full_screen
+        ("Ctrl+Shift+X", Action::ToggleZoom),          // toggle_zoom
+        // ("Ctrl+Shift+Z", Action::ScaledZoom),       // scaled_zoom — not implemented
+        ("Ctrl+Shift+Alt+A", Action::HideWindow),
+        ("Ctrl+Equals", Action::ZoomIn),               // zoom_in (Ctrl+Plus)
+        ("Ctrl+Shift+Equals", Action::ZoomIn),         // zoom_in (shifted = literal +)
+        ("Ctrl+Minus", Action::ZoomOut),                // zoom_out
+        ("Ctrl+0", Action::ZoomReset),                  // zoom_normal
+        // ("", Action::ZoomInAll),                     // zoom_in_all — not implemented
+        // ("", Action::ZoomOutAll),                    // zoom_out_all — not implemented
+        // ("", Action::ZoomResetAll),                  // zoom_normal_all — not implemented
+
+        // ── Clipboard ────────────────────────────────────────────────
+        ("Ctrl+Shift+C", Action::Copy),                // copy
+        ("Ctrl+Shift+V", Action::Paste),               // paste
+        // ("", Action::PasteSelection),               // paste_selection — not implemented
+
+        // ── Search ───────────────────────────────────────────────────
+        ("Ctrl+Shift+F", Action::ToggleSearch),        // search
+
+        // ── Terminal reset ───────────────────────────────────────────
+        ("Ctrl+Shift+R", Action::ResetTerminal),       // reset
+        ("Ctrl+Shift+G", Action::ResetClear),          // reset_clear
+
+        // ── Scrollbar & profiles ─────────────────────────────────────
+        ("Ctrl+Shift+S", Action::ToggleScrollbar),
+        // ("", Action::NextProfile),                   // next_profile — not implemented
+        // ("", Action::PreviousProfile),               // previous_profile — not implemented
+
+        // ── Grouping & broadcasting ──────────────────────────────────
+        ("Ctrl+Shift+B", Action::ToggleBroadcast),     // (rustinator toggle — Terminator uses separate scopes)
+        // ("Super+G", Action::GroupAll),               // group_all — not implemented
+        // ("Super+Shift+G", Action::UngroupAll),       // ungroup_all — not implemented
+        // ("Super+T", Action::GroupTab),               // group_tab — not implemented
+        // ("Super+Shift+T", Action::UngroupTab),       // ungroup_tab — not implemented
+        // ("Super+Shift+W", Action::UngroupWin),       // ungroup_win — not implemented
+        // ("", Action::BroadcastOff),                  // broadcast_off — not implemented
+        // ("", Action::BroadcastGroup),                // broadcast_group — not implemented
+        // ("", Action::BroadcastAll),                  // broadcast_all — not implemented
+
+        // ── Title editing ────────────────────────────────────────────
+        // ("Ctrl+Alt+W", Action::EditWindowTitle),     // edit_window_title — not implemented
+        // ("Ctrl+Alt+A", Action::EditTabTitle),        // edit_tab_title — not implemented
+        // ("Ctrl+Alt+X", Action::EditTerminalTitle),   // edit_terminal_title — not implemented
+
+        // ── Terminal index insert ────────────────────────────────────
+        // ("Super+1", Action::InsertNumber),           // insert_number — not implemented
+        // ("Super+0", Action::InsertPadded),           // insert_padded — not implemented
+
+        // ── Preferences & help ───────────────────────────────────────
+        // ("", Action::OpenPrefs),                     // preferences — unbound in Terminator
+        // ("Ctrl+Shift+K", Action::PrefsKeybindings),  // preferences_keybindings — not implemented
+        // ("F1", Action::Help),                        // help — not implemented
     ]
 }
 
@@ -277,29 +429,22 @@ mod tests {
     }
 
     #[test]
-    fn defaults_all_parse() {
-        for (combo, _) in defaults() {
+    fn linux_defaults_all_parse() {
+        for (combo, _) in linux_defaults() {
             assert!(parse_combo(combo).is_some(), "failed: {combo}");
         }
     }
 
     #[test]
-    fn lookup_matches_default() {
-        let table = BindingTable::new();
-        let mods = egui::Modifiers {
-            ctrl: true,
-            shift: true,
-            ..Default::default()
-        };
-        assert_eq!(
-            table.lookup(egui::Key::O, mods),
-            Some(Action::SplitHorizontal)
-        );
+    fn macos_defaults_all_parse() {
+        for (combo, _) in macos_defaults() {
+            assert!(parse_combo(combo).is_some(), "failed: {combo}");
+        }
     }
 
     #[test]
     fn user_override_replaces_default() {
-        let mut table = BindingTable::new();
+        let mut table = BindingTable::new(true);
         table.apply_user(&[("split_horizontal".into(), "Ctrl+Alt+H".into())]);
         let mods = egui::Modifiers {
             ctrl: true,
@@ -312,32 +457,291 @@ mod tests {
         );
     }
 
+    #[test]
+    fn force_linux_on_any_platform() {
+        let table = BindingTable::new(true);
+        let mods = egui::Modifiers { ctrl: true, shift: true, ..Default::default() };
+        assert_eq!(table.lookup(egui::Key::O, mods), Some(Action::SplitHorizontal));
+    }
+
+    // ── Linux per-binding coverage ───────────────────────────────────
+    // All use force_linux=true so they pass on any platform.
+
+    fn linux_ctrl_shift(key: egui::Key) -> Option<Action> {
+        let table = BindingTable::new(true);
+        let mods = egui::Modifiers { ctrl: true, shift: true, ..Default::default() };
+        table.lookup(key, mods)
+    }
+
+    fn linux_ctrl_only(key: egui::Key) -> Option<Action> {
+        let table = BindingTable::new(true);
+        let mods = egui::Modifiers { ctrl: true, ..Default::default() };
+        table.lookup(key, mods)
+    }
+
+    fn linux_no_mods(key: egui::Key) -> Option<Action> {
+        let table = BindingTable::new(true);
+        table.lookup(key, egui::Modifiers::default())
+    }
+
+    #[test]
+    fn binding_ctrl_shift_o_split_horizontal() {
+        assert_eq!(linux_ctrl_shift(egui::Key::O), Some(Action::SplitHorizontal));
+    }
+
+    #[test]
+    fn binding_ctrl_shift_e_split_vertical() {
+        assert_eq!(linux_ctrl_shift(egui::Key::E), Some(Action::SplitVertical));
+    }
+
+    #[test]
+    fn binding_ctrl_shift_w_close_pane() {
+        assert_eq!(linux_ctrl_shift(egui::Key::W), Some(Action::ClosePane));
+    }
+
+    #[test]
+    fn binding_ctrl_shift_q_close_window() {
+        assert_eq!(linux_ctrl_shift(egui::Key::Q), Some(Action::CloseWindow));
+    }
+
+    #[test]
+    fn binding_ctrl_shift_t_new_tab() {
+        assert_eq!(linux_ctrl_shift(egui::Key::T), Some(Action::NewTab));
+    }
+
+    #[test]
+    fn binding_ctrl_shift_i_new_window() {
+        assert_eq!(linux_ctrl_shift(egui::Key::I), Some(Action::NewWindow));
+    }
+
+    #[test]
+    fn binding_ctrl_tab_focus_next() {
+        assert_eq!(linux_ctrl_only(egui::Key::Tab), Some(Action::FocusNext));
+    }
+
+    #[test]
+    fn binding_ctrl_shift_tab_focus_prev() {
+        assert_eq!(linux_ctrl_shift(egui::Key::Tab), Some(Action::FocusPrev));
+    }
+
+    #[test]
+    fn binding_ctrl_pagedown_next_tab() {
+        assert_eq!(linux_ctrl_only(egui::Key::PageDown), Some(Action::NextTab));
+    }
+
+    #[test]
+    fn binding_ctrl_pageup_prev_tab() {
+        assert_eq!(linux_ctrl_only(egui::Key::PageUp), Some(Action::PrevTab));
+    }
+
+    #[test]
+    fn binding_ctrl_shift_up_resize_up() {
+        assert_eq!(linux_ctrl_shift(egui::Key::ArrowUp), Some(Action::ResizeUp));
+    }
+
+    #[test]
+    fn binding_ctrl_shift_down_resize_down() {
+        assert_eq!(linux_ctrl_shift(egui::Key::ArrowDown), Some(Action::ResizeDown));
+    }
+
+    #[test]
+    fn binding_ctrl_shift_left_resize_left() {
+        assert_eq!(linux_ctrl_shift(egui::Key::ArrowLeft), Some(Action::ResizeLeft));
+    }
+
+    #[test]
+    fn binding_ctrl_shift_right_resize_right() {
+        assert_eq!(linux_ctrl_shift(egui::Key::ArrowRight), Some(Action::ResizeRight));
+    }
+
+    #[test]
+    fn binding_f11_toggle_fullscreen() {
+        assert_eq!(linux_no_mods(egui::Key::F11), Some(Action::ToggleFullscreen));
+    }
+
+    #[test]
+    fn binding_ctrl_shift_x_toggle_zoom() {
+        assert_eq!(linux_ctrl_shift(egui::Key::X), Some(Action::ToggleZoom));
+    }
+
+    #[test]
+    fn binding_ctrl_equals_zoom_in() {
+        assert_eq!(linux_ctrl_only(egui::Key::Equals), Some(Action::ZoomIn));
+    }
+
+    #[test]
+    fn binding_ctrl_shift_equals_zoom_in() {
+        assert_eq!(linux_ctrl_shift(egui::Key::Equals), Some(Action::ZoomIn));
+    }
+
+    #[test]
+    fn binding_ctrl_minus_zoom_out() {
+        assert_eq!(linux_ctrl_only(egui::Key::Minus), Some(Action::ZoomOut));
+    }
+
+    #[test]
+    fn binding_ctrl_0_zoom_reset() {
+        assert_eq!(linux_ctrl_only(egui::Key::Num0), Some(Action::ZoomReset));
+    }
+
+    #[test]
+    fn binding_ctrl_shift_c_copy() {
+        assert_eq!(linux_ctrl_shift(egui::Key::C), Some(Action::Copy));
+    }
+
+    #[test]
+    fn binding_ctrl_shift_v_paste() {
+        assert_eq!(linux_ctrl_shift(egui::Key::V), Some(Action::Paste));
+    }
+
+    #[test]
+    fn binding_ctrl_shift_f_toggle_search() {
+        assert_eq!(linux_ctrl_shift(egui::Key::F), Some(Action::ToggleSearch));
+    }
+
+    #[test]
+    fn binding_ctrl_shift_r_reset_terminal() {
+        assert_eq!(linux_ctrl_shift(egui::Key::R), Some(Action::ResetTerminal));
+    }
+
+    #[test]
+    fn binding_ctrl_shift_g_reset_clear() {
+        assert_eq!(linux_ctrl_shift(egui::Key::G), Some(Action::ResetClear));
+    }
+
+    #[test]
+    fn binding_ctrl_shift_b_toggle_broadcast() {
+        assert_eq!(linux_ctrl_shift(egui::Key::B), Some(Action::ToggleBroadcast));
+    }
+
+    // ── macOS per-binding coverage ──────────────────────────────────
+
+    fn mac_table() -> BindingTable {
+        let mut t = BindingTable { map: HashMap::new() };
+        for (combo, action) in macos_defaults() {
+            if let Some(parsed) = parse_combo(combo) {
+                t.map.insert(parsed, action);
+            }
+        }
+        t
+    }
+
+    fn mac_cmd(key: egui::Key) -> Option<Action> {
+        let mods = egui::Modifiers { mac_cmd: true, ..Default::default() };
+        mac_table().lookup(key, mods)
+    }
+
+    fn mac_cmd_shift(key: egui::Key) -> Option<Action> {
+        let mods = egui::Modifiers { mac_cmd: true, shift: true, ..Default::default() };
+        mac_table().lookup(key, mods)
+    }
+
+    #[test]
+    fn mac_cmd_d_split_horizontal() {
+        assert_eq!(mac_cmd(egui::Key::D), Some(Action::SplitHorizontal));
+    }
+
+    #[test]
+    fn mac_cmd_shift_d_split_vertical() {
+        assert_eq!(mac_cmd_shift(egui::Key::D), Some(Action::SplitVertical));
+    }
+
+    #[test]
+    fn mac_cmd_w_close_pane() {
+        assert_eq!(mac_cmd(egui::Key::W), Some(Action::ClosePane));
+    }
+
+    #[test]
+    fn mac_cmd_q_close_window() {
+        assert_eq!(mac_cmd(egui::Key::Q), Some(Action::CloseWindow));
+    }
+
+    #[test]
+    fn mac_cmd_t_new_tab() {
+        assert_eq!(mac_cmd(egui::Key::T), Some(Action::NewTab));
+    }
+
+    #[test]
+    fn mac_cmd_n_new_window() {
+        assert_eq!(mac_cmd(egui::Key::N), Some(Action::NewWindow));
+    }
+
+    #[test]
+    fn mac_cmd_c_copy() {
+        assert_eq!(mac_cmd(egui::Key::C), Some(Action::Copy));
+    }
+
+    #[test]
+    fn mac_cmd_v_paste() {
+        assert_eq!(mac_cmd(egui::Key::V), Some(Action::Paste));
+    }
+
+    #[test]
+    fn mac_cmd_f_search() {
+        assert_eq!(mac_cmd(egui::Key::F), Some(Action::ToggleSearch));
+    }
+
+    #[test]
+    fn mac_cmd_comma_prefs() {
+        assert_eq!(mac_cmd(egui::Key::Comma), Some(Action::OpenPrefs));
+    }
+
+    #[test]
+    fn mac_cmd_equals_zoom_in() {
+        assert_eq!(mac_cmd(egui::Key::Equals), Some(Action::ZoomIn));
+    }
+
+    #[test]
+    fn mac_cmd_minus_zoom_out() {
+        assert_eq!(mac_cmd(egui::Key::Minus), Some(Action::ZoomOut));
+    }
+
+    #[test]
+    fn mac_cmd_0_zoom_reset() {
+        assert_eq!(mac_cmd(egui::Key::Num0), Some(Action::ZoomReset));
+    }
+
+    #[test]
+    fn mac_cmd_1_switch_tab() {
+        assert_eq!(mac_cmd(egui::Key::Num1), Some(Action::SwitchToTab(1)));
+    }
+
+    #[test]
+    fn mac_ctrl_tab_focus_next() {
+        let mods = egui::Modifiers { ctrl: true, ..Default::default() };
+        assert_eq!(mac_table().lookup(egui::Key::Tab, mods), Some(Action::FocusNext));
+    }
+
+    #[test]
+    fn mac_ctrl_passes_through() {
+        let mods = egui::Modifiers { ctrl: true, ..Default::default() };
+        assert_eq!(mac_table().lookup(egui::Key::C, mods), None);
+        assert_eq!(mac_table().lookup(egui::Key::D, mods), None);
+        assert_eq!(mac_table().lookup(egui::Key::Z, mods), None);
+    }
+
     // ── Gap inventory guardrails ──────────────────────────────────────
     // Each #[ignore] test validates that a new Action variant exists and
     // its string parses. Remove #[ignore] once implemented.
 
     // Gap #9: pane rotation
     #[test]
-    #[ignore = "gap #9: Action::RotateCW not yet implemented"]
     fn action_rotate_cw() {
         assert!(Action::from_str("rotate_cw").is_some());
     }
 
     #[test]
-    #[ignore = "gap #9: Action::RotateCCW not yet implemented"]
     fn action_rotate_ccw() {
         assert!(Action::from_str("rotate_ccw").is_some());
     }
 
     // Gap #29: tab reorder by keyboard
     #[test]
-    #[ignore = "gap #29: Action::MoveTabLeft not yet implemented"]
     fn action_move_tab_left() {
         assert!(Action::from_str("move_tab_left").is_some());
     }
 
     #[test]
-    #[ignore = "gap #29: Action::MoveTabRight not yet implemented"]
     fn action_move_tab_right() {
         assert!(Action::from_str("move_tab_right").is_some());
     }
@@ -357,22 +761,17 @@ mod tests {
         assert!(Action::from_str("scaled_zoom").is_some());
     }
 
-    // Gap #46: focus next/prev terminal (Ctrl+Shift+N/P)
     #[test]
-    #[ignore = "gap #46: Action::FocusNextTerminal not yet implemented"]
-    fn action_focus_next_terminal() {
-        assert!(Action::from_str("focus_next_terminal").is_some());
+    fn action_go_next() {
+        assert!(Action::from_str("go_next").is_some());
     }
 
     #[test]
-    #[ignore = "gap #46: Action::FocusPrevTerminal not yet implemented"]
-    fn action_focus_prev_terminal() {
-        assert!(Action::from_str("focus_prev_terminal").is_some());
+    fn action_go_prev() {
+        assert!(Action::from_str("go_prev").is_some());
     }
 
-    // Gap #25: toggle scrollbar
     #[test]
-    #[ignore = "gap #25: Action::ToggleScrollbar not yet implemented"]
     fn action_toggle_scrollbar() {
         assert!(Action::from_str("toggle_scrollbar").is_some());
     }
@@ -404,20 +803,16 @@ mod tests {
     #[test]
     #[ignore = "gap #13: default broadcast scope keybindings not yet added"]
     fn defaults_include_broadcast_scopes() {
-        let defs = defaults();
+        let defs = linux_defaults();
         let actions: Vec<_> = defs.iter().map(|(_, a)| a).collect();
         assert!(actions.contains(&&Action::from_str("broadcast_all").unwrap()));
     }
 
     // Gap #9: default bindings for rotation
     #[test]
-    #[ignore = "gap #9: default rotation keybindings not yet added"]
     fn defaults_include_rotation() {
-        let table = BindingTable::new();
-        let mods = egui::Modifiers {
-            mac_cmd: true,
-            ..Default::default()
-        };
-        assert!(table.lookup(egui::Key::R, mods).is_some());
+        let defs = linux_defaults();
+        assert!(defs.iter().any(|(_, a)| matches!(a, Action::RotateCW)));
+        assert!(defs.iter().any(|(_, a)| matches!(a, Action::RotateCCW)));
     }
 }

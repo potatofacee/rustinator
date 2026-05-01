@@ -33,3 +33,12 @@ glutin = { version = "0.32.3", default-features = false, features = ["egl", "glx
 glutin-winit = { version = "0.5.0", default-features = false, features = ["egl", "glx", "x11", "wayland"] }
 winit = { version = "0.30.13", features = ["x11", "wayland"] }
 x11rb = { version = "0.13", default-features = false }
+
+[package.metadata.bundle]
+name = "Rustinator"
+identifier = "com.rustinator.app"
+icon = ["assets/icon.icns"]
+osx_minimum_system_version = "10.15"
+
+[package.metadata.bundle.plist]
+LSUIElement = false

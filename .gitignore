@@ -1,3 +1,10 @@
 /target
 .codegraph/
 terminator/
+
+.DS_Store
+.claude/
+.venv/
+gap-analysis.md
+gen_icon.py
+tasks.md
