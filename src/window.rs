@@ -380,7 +380,7 @@ impl PrefsWindowState {
         });
 
         if close_requested {
-            app.prefs_open = false;
+            app.prefs.open = false;
         }
 
         self.egui_winit
@@ -421,8 +421,6 @@ struct HotkeyWindowState {
     painter: egui_glow::Painter,
     egui_ctx: egui::Context,
     egui_winit: egui_winit::State,
-    app: App,
-    pending_keys: Vec<egui::Event>,
     current_modifiers: winit::event::Modifiers,
     zoom_pixel_accumulator: f64,
     shown_at: Option<Instant>,
@@ -435,10 +433,9 @@ impl HotkeyWindowState {
         gl_config: &GlConfig,
         gl: &Arc<glow::Context>,
         main_context: &PossiblyCurrentContext,
-        proxy: EventLoopProxy<UserEvent>,
         height_pct: u32,
         always_on_top: bool,
-    ) -> Option<Self> {
+    ) -> Self {
         let window_attrs = WindowAttributes::default()
             .with_title("rustinator")
             .with_decorations(false)
@@ -493,31 +490,16 @@ impl HotkeyWindowState {
             gl_surface.resize(main_context, w, h);
         }
 
-        let app = match App::new(
-            Arc::clone(gl),
-            egui_ctx.clone(),
-            proxy,
-            window.scale_factor() as f32,
-        ) {
-            Ok(app) => app,
-            Err(e) => {
-                log::warn!("hotkey window: failed to create app: {e}");
-                return None;
-            }
-        };
-
-        Some(Self {
+        Self {
             window,
             gl_surface,
             painter,
             egui_ctx,
             egui_winit,
-            app,
-            pending_keys: Vec::new(),
             current_modifiers: winit::event::Modifiers::default(),
             zoom_pixel_accumulator: 0.0,
             shown_at: None,
-        })
+        }
     }
 
     fn destroy(mut self, main_context: &PossiblyCurrentContext) {
@@ -533,26 +515,25 @@ impl HotkeyWindowState {
         }
     }
 
-    fn paint(&mut self, main_context: &PossiblyCurrentContext) {
+    fn paint(&mut self, app: &mut App, main_context: &PossiblyCurrentContext) {
         main_context.make_current(&self.gl_surface).ok();
         let phys = self.window.inner_size();
         if let (Some(w), Some(h)) = (NonZeroU32::new(phys.width), NonZeroU32::new(phys.height)) {
             self.gl_surface.resize(main_context, w, h);
         }
 
-        let mut raw_input = self.egui_winit.take_egui_input(&self.window);
-        raw_input.events.append(&mut self.pending_keys);
+        let raw_input = self.egui_winit.take_egui_input(&self.window);
 
         let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
-            self.app.logic(ui.ctx());
-            self.app.ui(ui);
+            app.logic(ui.ctx());
+            app.ui(ui);
         });
 
         self.egui_winit
             .handle_platform_output(&self.window, full_output.platform_output);
 
-        if self.app.fullscreen_pending {
-            self.app.fullscreen_pending = false;
+        if app.fullscreen_pending {
+            app.fullscreen_pending = false;
         }
 
         if let Some(vp_out) = full_output.viewport_output.get(&egui::ViewportId::ROOT) {
@@ -568,7 +549,7 @@ impl HotkeyWindowState {
 
         let clipped_primitives = self.egui_ctx.tessellate(full_output.shapes, pixels_per_point);
 
-        let profile = self.app.user_config.active();
+        let profile = app.user_config.active();
         let [r, g, b] = profile.background_rgb();
         let opacity = profile.transparency.opacity;
         let clear_color = [
@@ -602,7 +583,6 @@ struct WinitApp {
     main_window_id: Option<WindowId>,
     prefs: Option<PrefsWindowState>,
     shutting_down: bool,
-    pending_keys: Vec<egui::Event>,
     current_modifiers: winit::event::Modifiers,
     zoom_pixel_accumulator: f64,
     hotkey_handle: Option<crate::hotkey::HotkeyHandle>,
@@ -624,7 +604,6 @@ impl WinitApp {
             main_window_id: None,
             prefs: None,
             shutting_down: false,
-            pending_keys: Vec::new(),
             current_modifiers: winit::event::Modifiers::default(),
             zoom_pixel_accumulator: 0.0,
             hotkey_handle: None,
@@ -682,16 +661,15 @@ impl ApplicationHandler<UserEvent> for WinitApp {
                 crate::hotkey::spawn(&hk_cfg.hotkey, self.event_loop_proxy.clone())
             {
                 self.hotkey_handle = Some(handle);
-                self.hotkey_window = HotkeyWindowState::new(
+                self.hotkey_window = Some(HotkeyWindowState::new(
                     event_loop,
                     &gl_state.gl_display,
                     &gl_state.gl_config,
                     &gl_state.gl,
                     &gl_state.gl_context,
-                    self.event_loop_proxy.clone(),
                     self.hotkey_height_pct,
                     hk_cfg.always_on_top,
-                );
+                ));
                 gl_state.make_current();
             }
         }
@@ -769,7 +747,7 @@ impl ApplicationHandler<UserEvent> for WinitApp {
                 match event {
                     WindowEvent::CloseRequested => {
                         if let Some(app) = &mut self.app {
-                            app.prefs_open = false;
+                            app.prefs.open = false;
                         }
                     }
                     WindowEvent::Resized(size) => {
@@ -798,6 +776,7 @@ impl ApplicationHandler<UserEvent> for WinitApp {
             .is_some_and(|h| window_id == h.window.id());
         if is_hotkey_window {
             let mut hk = self.hotkey_window.take().unwrap();
+            let app = self.app.as_mut().unwrap();
 
             if let WindowEvent::ModifiersChanged(mods) = &event {
                 hk.current_modifiers = *mods;
@@ -816,11 +795,8 @@ impl ApplicationHandler<UserEvent> for WinitApp {
                     self.hotkey_window = Some(hk);
                     return;
                 }
-                if let Some(egui_ev) = translate_key_event(key_event, hk.current_modifiers) {
-                    hk.pending_keys.push(egui_ev);
-                }
                 if let Some(raw) = encode_raw_key(key_event, hk.current_modifiers) {
-                    hk.app.pending_raw_keys.push(raw);
+                    app.pending_raw_keys.push(raw);
                 }
             }
 
@@ -835,18 +811,18 @@ impl ApplicationHandler<UserEvent> for WinitApp {
                         winit::event::MouseScrollDelta::LineDelta(_, y) => {
                             let direction = y.signum() as i32;
                             if direction != 0 {
-                                hk.app.pending_zoom_steps += direction;
+                                app.pending_zoom_steps += direction;
                             }
                         }
                         winit::event::MouseScrollDelta::PixelDelta(pos) => {
                             hk.zoom_pixel_accumulator += pos.y;
                             const THRESHOLD: f64 = 30.0;
                             while hk.zoom_pixel_accumulator >= THRESHOLD {
-                                hk.app.pending_zoom_steps += 1;
+                                app.pending_zoom_steps += 1;
                                 hk.zoom_pixel_accumulator -= THRESHOLD;
                             }
                             while hk.zoom_pixel_accumulator <= -THRESHOLD {
-                                hk.app.pending_zoom_steps -= 1;
+                                app.pending_zoom_steps -= 1;
                                 hk.zoom_pixel_accumulator += THRESHOLD;
                             }
                         }
@@ -873,7 +849,7 @@ impl ApplicationHandler<UserEvent> for WinitApp {
                         hk.window.request_redraw();
                     }
                     WindowEvent::Focused(focused) => {
-                        hk.app.notify_focus(focused);
+                        app.notify_focus(focused);
                         if !focused && self.hotkey_hide_on_focus_loss {
                             let dominated_by_grace = hk.shown_at
                                 .is_some_and(|t| t.elapsed().as_millis() < 500);
@@ -889,7 +865,7 @@ impl ApplicationHandler<UserEvent> for WinitApp {
                     }
                     WindowEvent::RedrawRequested => {
                         if let Some(gl_state) = &self.gl_state {
-                            hk.paint(&gl_state.gl_context);
+                            hk.paint(app, &gl_state.gl_context);
                             gl_state.make_current();
                         }
                     }
@@ -905,14 +881,13 @@ impl ApplicationHandler<UserEvent> for WinitApp {
         let Some(egui_winit) = &mut self.egui_winit else { return };
         let Some(app) = &mut self.app else { return };
 
+
+
         if let WindowEvent::ModifiersChanged(mods) = &event {
             self.current_modifiers = *mods;
         }
 
         if let WindowEvent::KeyboardInput { event: key_event, .. } = &event {
-            if let Some(egui_ev) = translate_key_event(key_event, self.current_modifiers) {
-                self.pending_keys.push(egui_ev);
-            }
             if let Some(raw) = encode_raw_key(key_event, self.current_modifiers) {
                 app.pending_raw_keys.push(raw);
             }
@@ -960,10 +935,10 @@ impl ApplicationHandler<UserEvent> for WinitApp {
 
         match event {
             WindowEvent::CloseRequested => {
-                if app.confirmed_close || !app.should_confirm_close() {
+                if app.dialogs.confirmed_close || !app.should_confirm_close() {
                     event_loop.exit();
                 } else {
-                    app.close_dialog_open = true;
+                    app.dialogs.close_dialog_open = true;
                     gl_state.window.request_redraw();
                 }
             }
@@ -1038,8 +1013,7 @@ impl WinitApp {
 
         gl_state.make_current();
 
-        let mut raw_input = egui_winit.take_egui_input(&gl_state.window);
-        raw_input.events.append(&mut self.pending_keys);
+        let raw_input = egui_winit.take_egui_input(&gl_state.window);
         let clear_color = app.clear_color();
 
         {
@@ -1081,16 +1055,15 @@ impl WinitApp {
                     crate::hotkey::spawn(&hk_cfg.hotkey, self.event_loop_proxy.clone())
                 {
                     self.hotkey_handle = Some(handle);
-                    self.hotkey_window = HotkeyWindowState::new(
+                    self.hotkey_window = Some(HotkeyWindowState::new(
                         event_loop,
                         &gl_state.gl_display,
                         &gl_state.gl_config,
                         &gl_state.gl,
                         &gl_state.gl_context,
-                        self.event_loop_proxy.clone(),
                         self.hotkey_height_pct,
                         hk_cfg.always_on_top,
-                    );
+                    ));
                     gl_state.make_current();
                 }
             } else {
@@ -1132,7 +1105,7 @@ impl WinitApp {
         gl_state.swap_buffers();
 
         // Manage prefs pop-out window lifecycle.
-        if app.prefs_open && self.prefs.is_none() {
+        if app.prefs.open && self.prefs.is_none() {
             self.prefs = Some(PrefsWindowState::new(
                 event_loop,
                 &gl_state.gl_display,
@@ -1141,37 +1114,13 @@ impl WinitApp {
                 &gl_state.gl_context,
             ));
             gl_state.make_current();
-        } else if !app.prefs_open && self.prefs.is_some() {
+        } else if !app.prefs.open && self.prefs.is_some() {
             if let Some(prefs) = self.prefs.take() {
                 prefs.destroy(&gl_state.gl_context);
             }
             gl_state.make_current();
         }
     }
-}
-
-fn translate_key_event(event: &winit::event::KeyEvent, modifiers: winit::event::Modifiers) -> Option<egui::Event> {
-    if !event.state.is_pressed() {
-        return None;
-    }
-    let mods = winit_mods_to_egui(modifiers);
-    if !mods.ctrl && !mods.alt {
-        return None;
-    }
-
-    let key = match &event.key_without_modifiers() {
-        Key::Character(c) => char_to_egui_key(c)?,
-        Key::Named(named) => named_to_egui_key(*named)?,
-        _ => return None,
-    };
-
-    Some(egui::Event::Key {
-        key,
-        physical_key: None,
-        pressed: true,
-        repeat: false,
-        modifiers: mods,
-    })
 }
 
 /// Encode a winit key event into legacy terminal bytes, using winit's
@@ -1207,12 +1156,17 @@ fn encode_raw_key(event: &winit::event::KeyEvent, modifiers: winit::event::Modif
         }
     }
 
-    // --- Printable characters: use text_with_all_modifiers ---
+    // Cmd+key on macOS is a shortcut, not terminal input -- skip text encoding.
+    if mods.mac_cmd {
+        return egui_key.map(|key| RawTermKey { key, mods, legacy_bytes: Vec::new() });
+    }
+
+    // Printable characters: use text_with_all_modifiers.
     // This gives us the OS-level result of the keypress with all modifiers
-    // applied (e.g. Ctrl+A → 0x01, Shift+A → "A").
+    // applied (e.g. Ctrl+A -> 0x01, Shift+A -> "A").
     if let Some(text) = event.text_with_all_modifiers() {
         if !text.is_empty() {
-            let egui_key = egui_key?;
+            let egui_key = egui_key.unwrap_or(egui::Key::Space);
             let mut bytes = text.as_bytes().to_vec();
             if alt {
                 bytes.insert(0, 0x1b);
@@ -1255,7 +1209,11 @@ fn encode_raw_key(event: &winit::event::KeyEvent, modifiers: winit::event::Modif
         }
     }
 
-    None
+    egui_key.map(|key| RawTermKey {
+        key,
+        mods,
+        legacy_bytes: Vec::new(),
+    })
 }
 
 fn legacy_mod_param(shift: bool, alt: bool, ctrl: bool) -> u8 {
@@ -1302,17 +1260,29 @@ fn encode_named_key(named: NamedKey, shift: bool, alt: bool, ctrl: bool) -> Opti
         }
     }
 
-    // CSI <final> keys — modified form is CSI 1;{mod} <final>.
-    let final_byte: Option<u8> = match named {
-        NamedKey::ArrowUp => Some(b'A'),
-        NamedKey::ArrowDown => Some(b'B'),
-        NamedKey::ArrowRight => Some(b'C'),
-        NamedKey::ArrowLeft => Some(b'D'),
+    // Home/End: SS3 unmodified, CSI 1;{mod} modified.
+    let home_end: Option<u8> = match named {
         NamedKey::Home => Some(b'H'),
         NamedKey::End => Some(b'F'),
         _ => None,
     };
-    if let Some(fb) = final_byte {
+    if let Some(fb) = home_end {
+        return if has_mods {
+            Some(format!("\x1b[1;{}{}", legacy_mod_param(shift, alt, ctrl), fb as char).into_bytes())
+        } else {
+            Some(vec![0x1b, b'O', fb])
+        };
+    }
+
+    // Arrow keys: CSI unmodified, CSI 1;{mod} modified.
+    let arrow: Option<u8> = match named {
+        NamedKey::ArrowUp => Some(b'A'),
+        NamedKey::ArrowDown => Some(b'B'),
+        NamedKey::ArrowRight => Some(b'C'),
+        NamedKey::ArrowLeft => Some(b'D'),
+        _ => None,
+    };
+    if let Some(fb) = arrow {
         return if has_mods {
             Some(format!("\x1b[1;{}{}", legacy_mod_param(shift, alt, ctrl), fb as char).into_bytes())
         } else {
@@ -1542,12 +1512,12 @@ mod tests {
 
     #[test]
     fn home_unmodified() {
-        assert_eq!(encode_named_key(NamedKey::Home, false, false, false).unwrap(), b"\x1b[H");
+        assert_eq!(encode_named_key(NamedKey::Home, false, false, false).unwrap(), b"\x1bOH");
     }
 
     #[test]
     fn end_unmodified() {
-        assert_eq!(encode_named_key(NamedKey::End, false, false, false).unwrap(), b"\x1b[F");
+        assert_eq!(encode_named_key(NamedKey::End, false, false, false).unwrap(), b"\x1bOF");
     }
 
     // ---- Arrows with modifiers ----

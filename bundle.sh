@@ -11,4 +11,8 @@ cargo bundle --release
 
 APP="target/release/bundle/osx/Rustinator.app"
 echo "App bundle created at ${APP}"
-echo "To install: cp -r \"${APP}\" /Applications/"
+
+echo "Installing to /Applications/..."
+rm -rf /Applications/Rustinator.app
+cp -r "${APP}" /Applications/
+echo "Installed to /Applications/Rustinator.app"

@@ -1,6 +1,7 @@
 /target
 .codegraph/
 terminator/
+iTerm2/
 
 .DS_Store
 .claude/

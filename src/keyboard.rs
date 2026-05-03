@@ -56,9 +56,9 @@ fn encode_mods(mods: egui::Modifiers) -> u32 {
     if mods.ctrl {
         m |= 0b100;
     }
-    if mods.mac_cmd || mods.command {
+    if mods.mac_cmd {
         m |= 0b1000;
-    } // super
+    }
     1 + m
 }
 
@@ -242,8 +242,8 @@ mod tests {
     }
 
     #[test]
-    fn encode_mods_super_via_command() {
-        let m = egui::Modifiers { command: true, ..Default::default() };
+    fn encode_mods_super_via_mac_cmd() {
+        let m = egui::Modifiers { mac_cmd: true, ..Default::default() };
         assert_eq!(encode_mods(m), 9);
     }
 
@@ -256,7 +256,7 @@ mod tests {
     #[test]
     fn encode_mods_all_four() {
         let m = egui::Modifiers {
-            shift: true, alt: true, ctrl: true, command: true, ..Default::default()
+            shift: true, alt: true, ctrl: true, mac_cmd: true, ..Default::default()
         };
         assert_eq!(encode_mods(m), 16);
     }

@@ -64,7 +64,10 @@ fi
 "#;
 
 fn integration_dir() -> PathBuf {
-    let dir = std::env::temp_dir().join("rustinator-shell-integration");
+    let base = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let dir = base.join("rustinator-shell-integration");
     let _ = std::fs::create_dir_all(&dir);
     dir
 }

@@ -175,73 +175,17 @@ pub fn defaults_for_platform(force_linux: bool) -> Vec<(&'static str, Action)> {
 }
 
 fn macos_defaults() -> Vec<(&'static str, Action)> {
-    vec![
-        // ── Creation & destruction ───────────────────────────────────
-        ("Cmd+D", Action::SplitHorizontal),
-        ("Cmd+Shift+D", Action::SplitVertical),
-        ("Cmd+W", Action::ClosePane),
-        ("Cmd+Q", Action::CloseWindow),
-        ("Cmd+T", Action::NewTab),
-        ("Cmd+N", Action::NewWindow),
-
-        // ── Navigation (focus) ───────────────────────────────────────
-        ("Ctrl+Tab", Action::FocusNext),
-        ("Ctrl+Shift+Tab", Action::FocusPrev),
-        ("Alt+Up", Action::GoUp),
-        ("Alt+Down", Action::GoDown),
-        ("Alt+Left", Action::GoLeft),
-        ("Alt+Right", Action::GoRight),
-
-        // ── Tab management ───────────────────────────────────────────
-        ("Cmd+Shift+Right", Action::NextTab),
-        ("Cmd+Shift+Left", Action::PrevTab),
-        ("Cmd+Shift+PageDown", Action::MoveTabRight),
-        ("Cmd+Shift+PageUp", Action::MoveTabLeft),
-        ("Cmd+1", Action::SwitchToTab(1)),
-        ("Cmd+2", Action::SwitchToTab(2)),
-        ("Cmd+3", Action::SwitchToTab(3)),
-        ("Cmd+4", Action::SwitchToTab(4)),
-        ("Cmd+5", Action::SwitchToTab(5)),
-        ("Cmd+6", Action::SwitchToTab(6)),
-        ("Cmd+7", Action::SwitchToTab(7)),
-        ("Cmd+8", Action::SwitchToTab(8)),
-        ("Cmd+9", Action::SwitchToTab(9)),
-
-        // ── Resize ───────────────────────────────────────────────────
-        ("Ctrl+Cmd+Up", Action::ResizeUp),
-        ("Ctrl+Cmd+Down", Action::ResizeDown),
-        ("Ctrl+Cmd+Left", Action::ResizeLeft),
-        ("Ctrl+Cmd+Right", Action::ResizeRight),
-
-        // ── Rotation ─────────────────────────────────────────────────
-        ("Ctrl+Cmd+R", Action::RotateCW),
-        ("Ctrl+Cmd+Shift+R", Action::RotateCCW),
-
-        // ── Zoom & fullscreen ────────────────────────────────────────
-        ("Cmd+Ctrl+F", Action::ToggleFullscreen),
-        ("Cmd+Shift+X", Action::ToggleZoom),
-        ("Cmd+Equals", Action::ZoomIn),
-        ("Cmd+Shift+Equals", Action::ZoomIn),
-        ("Cmd+Minus", Action::ZoomOut),
-        ("Cmd+0", Action::ZoomReset),
-
-        // ── Clipboard ────────────────────────────────────────────────
-        ("Cmd+C", Action::Copy),
-        ("Cmd+V", Action::Paste),
-
-        // ── Search ───────────────────────────────────────────────────
-        ("Cmd+F", Action::ToggleSearch),
-
-        // ── Terminal reset ───────────────────────────────────────────
-        ("Cmd+Shift+R", Action::ResetTerminal),
-        ("Cmd+Shift+G", Action::ResetClear),
-
-        // ── Grouping & broadcasting ──────────────────────────────────
-        ("Cmd+Shift+B", Action::ToggleBroadcast),
-
-        // ── Preferences ──────────────────────────────────────────────
-        ("Cmd+Comma", Action::OpenPrefs),
-    ]
+    let mut v: Vec<(&'static str, Action)> = linux_defaults()
+        .into_iter()
+        .filter(|(combo, _)| !combo.starts_with("Super+"))
+        .map(|(combo, action)| {
+            let mac_combo = combo.replace("Ctrl+", "Cmd+");
+            (Box::leak(mac_combo.into_boxed_str()) as &'static str, action)
+        })
+        .collect();
+    v.push(("Cmd+C", Action::Copy));
+    v.push(("Cmd+V", Action::Paste));
+    v
 }
 
 fn linux_defaults() -> Vec<(&'static str, Action)> {
@@ -637,53 +581,48 @@ mod tests {
     }
 
     #[test]
-    fn mac_cmd_d_split_horizontal() {
-        assert_eq!(mac_cmd(egui::Key::D), Some(Action::SplitHorizontal));
+    fn mac_cmd_shift_o_split_horizontal() {
+        assert_eq!(mac_cmd_shift(egui::Key::O), Some(Action::SplitHorizontal));
     }
 
     #[test]
-    fn mac_cmd_shift_d_split_vertical() {
-        assert_eq!(mac_cmd_shift(egui::Key::D), Some(Action::SplitVertical));
+    fn mac_cmd_shift_e_split_vertical() {
+        assert_eq!(mac_cmd_shift(egui::Key::E), Some(Action::SplitVertical));
     }
 
     #[test]
-    fn mac_cmd_w_close_pane() {
-        assert_eq!(mac_cmd(egui::Key::W), Some(Action::ClosePane));
+    fn mac_cmd_shift_w_close_pane() {
+        assert_eq!(mac_cmd_shift(egui::Key::W), Some(Action::ClosePane));
     }
 
     #[test]
-    fn mac_cmd_q_close_window() {
-        assert_eq!(mac_cmd(egui::Key::Q), Some(Action::CloseWindow));
+    fn mac_cmd_shift_q_close_window() {
+        assert_eq!(mac_cmd_shift(egui::Key::Q), Some(Action::CloseWindow));
     }
 
     #[test]
-    fn mac_cmd_t_new_tab() {
-        assert_eq!(mac_cmd(egui::Key::T), Some(Action::NewTab));
+    fn mac_cmd_shift_t_new_tab() {
+        assert_eq!(mac_cmd_shift(egui::Key::T), Some(Action::NewTab));
     }
 
     #[test]
-    fn mac_cmd_n_new_window() {
-        assert_eq!(mac_cmd(egui::Key::N), Some(Action::NewWindow));
+    fn mac_cmd_shift_i_new_window() {
+        assert_eq!(mac_cmd_shift(egui::Key::I), Some(Action::NewWindow));
     }
 
     #[test]
-    fn mac_cmd_c_copy() {
-        assert_eq!(mac_cmd(egui::Key::C), Some(Action::Copy));
+    fn mac_cmd_shift_c_copy() {
+        assert_eq!(mac_cmd_shift(egui::Key::C), Some(Action::Copy));
     }
 
     #[test]
-    fn mac_cmd_v_paste() {
-        assert_eq!(mac_cmd(egui::Key::V), Some(Action::Paste));
+    fn mac_cmd_shift_v_paste() {
+        assert_eq!(mac_cmd_shift(egui::Key::V), Some(Action::Paste));
     }
 
     #[test]
-    fn mac_cmd_f_search() {
-        assert_eq!(mac_cmd(egui::Key::F), Some(Action::ToggleSearch));
-    }
-
-    #[test]
-    fn mac_cmd_comma_prefs() {
-        assert_eq!(mac_cmd(egui::Key::Comma), Some(Action::OpenPrefs));
+    fn mac_cmd_shift_f_search() {
+        assert_eq!(mac_cmd_shift(egui::Key::F), Some(Action::ToggleSearch));
     }
 
     #[test]
@@ -702,22 +641,20 @@ mod tests {
     }
 
     #[test]
-    fn mac_cmd_1_switch_tab() {
-        assert_eq!(mac_cmd(egui::Key::Num1), Some(Action::SwitchToTab(1)));
+    fn mac_cmd_tab_focus_next() {
+        assert_eq!(mac_cmd(egui::Key::Tab), Some(Action::FocusNext));
     }
 
     #[test]
-    fn mac_ctrl_tab_focus_next() {
-        let mods = egui::Modifiers { ctrl: true, ..Default::default() };
-        assert_eq!(mac_table().lookup(egui::Key::Tab, mods), Some(Action::FocusNext));
-    }
-
-    #[test]
-    fn mac_ctrl_passes_through() {
-        let mods = egui::Modifiers { ctrl: true, ..Default::default() };
-        assert_eq!(mac_table().lookup(egui::Key::C, mods), None);
-        assert_eq!(mac_table().lookup(egui::Key::D, mods), None);
-        assert_eq!(mac_table().lookup(egui::Key::Z, mods), None);
+    fn mac_is_linux_with_ctrl_swapped_to_cmd() {
+        let linux_bindings = linux_defaults();
+        let mac_bindings = macos_defaults();
+        let super_only = linux_bindings
+            .iter()
+            .filter(|(combo, _)| combo.starts_with("Super+"))
+            .count();
+        let mac_extras = 2; // Cmd+C (Copy) and Cmd+V (Paste) without Shift
+        assert_eq!(linux_bindings.len() - super_only + mac_extras, mac_bindings.len());
     }
 
     // ── Gap inventory guardrails ──────────────────────────────────────

@@ -323,6 +323,7 @@ pub struct Pane {
     pub defaults: PaneDefaults,
     pub read_only: bool,
     pub scrollbar_visible: bool,
+    ui_selection: Mutex<Option<Selection>>,
 }
 
 impl Pane {
@@ -391,6 +392,7 @@ impl Pane {
             defaults,
             read_only: false,
             scrollbar_visible: true,
+            ui_selection: Mutex::new(None),
         })
     }
 
@@ -427,7 +429,9 @@ impl Pane {
     /// Returns the pane's current Frame, rebuilding only if the pane is marked dirty
     /// (or has no cache yet). Clears the dirty flag after a rebuild.
     pub fn frame(&mut self) -> Arc<Frame> {
-        if self.cached.is_none() || self.dirty.swap(false, Ordering::AcqRel) {
+        let was_dirty = self.dirty.swap(false, Ordering::AcqRel);
+        let no_cache = self.cached.is_none();
+        if no_cache || was_dirty {
             self.cached = Some(Arc::new(self.snapshot()));
         }
         Arc::clone(self.cached.as_ref().unwrap())
@@ -438,14 +442,6 @@ impl Pane {
             return;
         }
         let _ = self.pty_tx.send(Msg::Input(bytes.into()));
-    }
-
-    /// True when the term currently swallows Text events itself (REPORT_ALL_KEYS_AS_ESC).
-    pub fn text_is_suppressed(&self) -> bool {
-        self.terminal
-            .lock()
-            .mode()
-            .contains(TermMode::REPORT_ALL_KEYS_AS_ESC)
     }
 
     /// Encode and send a key event, using Kitty keyboard protocol when the term
@@ -489,7 +485,9 @@ impl Pane {
         let mut term = self.terminal.lock();
         let display_offset = term.grid().display_offset() as i32;
         let point = point_from_grid(col, row, display_offset);
-        term.selection = Some(Selection::new(ty, point, Side::Left));
+        let sel = Selection::new(ty, point, Side::Left);
+        term.selection = Some(sel.clone());
+        *self.ui_selection.lock().unwrap() = Some(sel);
         self.dirty.store(true, Ordering::Release);
     }
 
@@ -497,8 +495,10 @@ impl Pane {
         let mut term = self.terminal.lock();
         let display_offset = term.grid().display_offset() as i32;
         let point = point_from_grid(col, row, display_offset);
-        if let Some(sel) = term.selection.as_mut() {
+        let mut ui_sel = self.ui_selection.lock().unwrap();
+        if let Some(sel) = ui_sel.as_mut() {
             sel.update(point, Side::Right);
+            term.selection = Some(sel.clone());
             self.dirty.store(true, Ordering::Release);
         }
     }
@@ -510,13 +510,17 @@ impl Pane {
         let row = if delta > 0 { 0 } else { term.screen_lines() as i32 - 1 };
         let col = if delta > 0 { 0 } else { cols.saturating_sub(1) };
         let point = point_from_grid(col, row, display_offset);
-        if let Some(sel) = term.selection.as_mut() {
+        let mut ui_sel = self.ui_selection.lock().unwrap();
+        if let Some(sel) = ui_sel.as_mut() {
             sel.update(point, Side::Right);
+            term.selection = Some(sel.clone());
         }
+        drop(ui_sel);
         self.dirty.store(true, Ordering::Release);
     }
 
     pub fn clear_selection(&self) {
+        *self.ui_selection.lock().unwrap() = None;
         let mut term = self.terminal.lock();
         if term.selection.is_some() {
             term.selection = None;
@@ -525,7 +529,13 @@ impl Pane {
     }
 
     pub fn selection_text(&self) -> Option<String> {
-        self.terminal.lock().selection_to_string()
+        let mut term = self.terminal.lock();
+        let ui_sel = self.ui_selection.lock().unwrap();
+        if let Some(sel) = ui_sel.as_ref() {
+            term.selection = Some(sel.clone());
+        }
+        drop(ui_sel);
+        term.selection_to_string()
     }
 
     pub fn mouse_reporting(&self) -> bool {
@@ -645,7 +655,12 @@ impl Pane {
     }
 
     pub fn snapshot(&self) -> Frame {
-        let term = self.terminal.lock();
+        let mut term = self.terminal.lock();
+        let ui_sel = self.ui_selection.lock().unwrap();
+        if let Some(sel) = ui_sel.as_ref() {
+            term.selection = Some(sel.clone());
+        }
+        drop(ui_sel);
         let lines = term.screen_lines() as i32;
         let content = term.renderable_content();
         let palette = content.colors;
@@ -665,7 +680,6 @@ impl Pane {
         let cursor_col = content.cursor.point.column.0 as i32;
         let cursor_row = content.cursor.point.line.0 + display_offset;
         let selection = content.selection;
-
 
         let cursor_color = {
             let [r, g, b] = self.defaults.cursor;
