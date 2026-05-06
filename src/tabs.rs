@@ -5,7 +5,6 @@ use egui;
 use winit::event_loop::EventLoopProxy;
 
 use crate::dialogs::DialogState;
-use crate::keybindings::Action;
 use crate::layout::{self, Direction, Node};
 use crate::pane::{Pane, PaneDefaults, PaneId};
 
@@ -38,104 +37,11 @@ impl Tab {
     }
 }
 
-pub(crate) enum PaneAction {
-    SplitHorizontal,
-    SplitVertical,
-    SplitAuto,
-    Close,
-    FocusNext,
-    FocusPrev,
-    NewTab,
-    NextTab,
-    PrevTab,
-    OpenPrefs,
-    Copy,
-    Paste,
-    ToggleZoom,
-    ToggleBroadcast,
-    ToggleSearch,
-    ToggleReadOnly,
-    SetTitle,
-    ZoomIn,
-    ZoomOut,
-    ZoomReset,
-    CloseWindow,
-    ToggleFullscreen,
-    ResizeLeft,
-    ResizeRight,
-    ResizeUp,
-    ResizeDown,
-    ResetTerminal,
-    ResetClear,
-    NewWindow,
-    OpenTerminalHere,
-    QuitHotkeyWindow,
-    MoveTabLeft,
-    MoveTabRight,
-    SwitchToTab(u8),
-    GoUp,
-    GoDown,
-    GoLeft,
-    GoRight,
-    GoNext,
-    GoPrev,
-    RotateCW,
-    RotateCCW,
-    ToggleScrollbar,
-    HideWindow,
-}
-
 pub(crate) enum FocusDir {
     Up,
     Down,
     Left,
     Right,
-}
-
-pub(crate) fn action_to_pane_action(a: Action) -> PaneAction {
-    match a {
-        Action::SplitHorizontal => PaneAction::SplitHorizontal,
-        Action::SplitVertical => PaneAction::SplitVertical,
-        Action::ClosePane => PaneAction::Close,
-        Action::NewTab => PaneAction::NewTab,
-        Action::NextTab => PaneAction::NextTab,
-        Action::PrevTab => PaneAction::PrevTab,
-        Action::FocusNext => PaneAction::FocusNext,
-        Action::FocusPrev => PaneAction::FocusPrev,
-        Action::Copy => PaneAction::Copy,
-        Action::Paste => PaneAction::Paste,
-        Action::OpenPrefs => PaneAction::OpenPrefs,
-        Action::ToggleZoom => PaneAction::ToggleZoom,
-        Action::ToggleBroadcast => PaneAction::ToggleBroadcast,
-        Action::ToggleSearch => PaneAction::ToggleSearch,
-        Action::ZoomIn => PaneAction::ZoomIn,
-        Action::ZoomOut => PaneAction::ZoomOut,
-        Action::ZoomReset => PaneAction::ZoomReset,
-        Action::CloseWindow => PaneAction::CloseWindow,
-        Action::ToggleFullscreen => PaneAction::ToggleFullscreen,
-        Action::ResizeLeft => PaneAction::ResizeLeft,
-        Action::ResizeRight => PaneAction::ResizeRight,
-        Action::ResizeUp => PaneAction::ResizeUp,
-        Action::ResizeDown => PaneAction::ResizeDown,
-        Action::ResetTerminal => PaneAction::ResetTerminal,
-        Action::ResetClear => PaneAction::ResetClear,
-        Action::NewWindow => PaneAction::NewWindow,
-        Action::QuitHotkeyWindow => PaneAction::QuitHotkeyWindow,
-        Action::MoveTabLeft => PaneAction::MoveTabLeft,
-        Action::MoveTabRight => PaneAction::MoveTabRight,
-        Action::SwitchToTab(n) => PaneAction::SwitchToTab(n),
-        Action::GoUp => PaneAction::GoUp,
-        Action::GoDown => PaneAction::GoDown,
-        Action::GoLeft => PaneAction::GoLeft,
-        Action::GoRight => PaneAction::GoRight,
-        Action::GoNext => PaneAction::GoNext,
-        Action::GoPrev => PaneAction::GoPrev,
-        Action::RotateCW => PaneAction::RotateCW,
-        Action::RotateCCW => PaneAction::RotateCCW,
-        Action::SplitAuto => PaneAction::SplitAuto,
-        Action::ToggleScrollbar => PaneAction::ToggleScrollbar,
-        Action::HideWindow => PaneAction::HideWindow,
-    }
 }
 
 pub(crate) struct PaneFactory {
@@ -287,6 +193,10 @@ impl TabManager {
         } else if idx < self.active_tab {
             self.active_tab -= 1;
         }
+        let focused = self.tabs[self.active_tab].focused;
+        if let Some(p) = self.tabs[self.active_tab].panes.get(&focused) {
+            p.send_focus_event(true);
+        }
     }
 
     pub(crate) fn close_pane(&mut self, tab_idx: usize, pane_id: PaneId, egui_ctx: &egui::Context, dialogs: &mut DialogState) {
@@ -317,8 +227,15 @@ impl TabManager {
         let new_id = self.next_pane_id;
         self.next_pane_id += 1;
         let Some(pane) = self.spawn_pane(new_id, INITIAL_COLS as usize, INITIAL_LINES as usize, None, factory) else { return };
+        for p in self.tabs[self.active_tab].panes.values() {
+            p.send_focus_event(false);
+        }
         self.tabs.push(Tab::new(pane));
         self.active_tab = self.tabs.len() - 1;
+        let focused = self.tabs[self.active_tab].focused;
+        if let Some(p) = self.tabs[self.active_tab].panes.get(&focused) {
+            p.send_focus_event(true);
+        }
     }
 
     pub(crate) fn switch_tab(&mut self, step: i32) {
@@ -326,14 +243,33 @@ impl TabManager {
         if n == 0 {
             return;
         }
-        let idx = self.active_tab as i32;
-        self.active_tab = (((idx + step) % n + n) % n) as usize;
+        let old = self.active_tab;
+        let idx = old as i32;
+        let new = (((idx + step) % n + n) % n) as usize;
+        if old == new {
+            return;
+        }
+        for pane in self.tabs[old].panes.values() {
+            pane.send_focus_event(false);
+        }
+        self.active_tab = new;
+        let focused = self.tabs[new].focused;
+        if let Some(pane) = self.tabs[new].panes.get(&focused) {
+            pane.send_focus_event(true);
+        }
     }
 
     pub(crate) fn switch_tab_direct(&mut self, tab_number: u8) {
         let idx = (tab_number as usize).saturating_sub(1);
-        if idx < self.tabs.len() {
+        if idx < self.tabs.len() && idx != self.active_tab {
+            for pane in self.tabs[self.active_tab].panes.values() {
+                pane.send_focus_event(false);
+            }
             self.active_tab = idx;
+            let focused = self.tabs[idx].focused;
+            if let Some(pane) = self.tabs[idx].panes.get(&focused) {
+                pane.send_focus_event(true);
+            }
         }
     }
 
@@ -356,7 +292,17 @@ impl TabManager {
         let idx = leaves.iter().position(|&id| id == tab.focused).unwrap_or(0) as i32;
         let n = leaves.len() as i32;
         let new_idx = ((idx + step) % n + n) % n;
-        tab.focused = leaves[new_idx as usize];
+        let old_focused = tab.focused;
+        let new_focused = leaves[new_idx as usize];
+        if old_focused != new_focused {
+            if let Some(p) = tab.panes.get(&old_focused) {
+                p.send_focus_event(false);
+            }
+            tab.focused = new_focused;
+            if let Some(p) = tab.panes.get(&new_focused) {
+                p.send_focus_event(true);
+            }
+        }
     }
 
     pub(crate) fn focus_direction(&mut self, dir: FocusDir, last_pane_rect: Option<egui::Rect>) {
@@ -386,7 +332,17 @@ impl TabManager {
             });
 
         if let Some((id, _)) = best {
-            self.tabs[self.active_tab].focused = *id;
+            let old_focused = self.tabs[self.active_tab].focused;
+            let new_focused = *id;
+            if old_focused != new_focused {
+                if let Some(p) = self.tabs[self.active_tab].panes.get(&old_focused) {
+                    p.send_focus_event(false);
+                }
+                self.tabs[self.active_tab].focused = new_focused;
+                if let Some(p) = self.tabs[self.active_tab].panes.get(&new_focused) {
+                    p.send_focus_event(true);
+                }
+            }
         }
     }
 
@@ -457,10 +413,10 @@ impl TabManager {
     pub(crate) fn reset_focused_terminal(&self, clear: bool) {
         let tab = &self.tabs[self.active_tab];
         if let Some(pane) = tab.panes.get(&tab.focused) {
+            pane.send_bytes(b"\x1bc".to_vec());
             if clear {
                 pane.send_bytes(b"\x1b[2J\x1b[H".to_vec());
             }
-            pane.send_bytes(b"\x1bc".to_vec());
         }
     }
 
@@ -599,23 +555,21 @@ impl TabManager {
                             break;
                         }
                         ExitAction::Restart => {
-                            let (cols, lines) = match self.tabs.get(t)
-                                .and_then(|tab| tab.panes.get(&id))
-                            {
-                                Some(pane) => (pane.cols, pane.lines),
+                            let tab = match self.tabs.get_mut(t) {
+                                Some(tab) => tab,
                                 None => break,
                             };
-                            let new_id = self.next_pane_id;
-                            self.next_pane_id += 1;
-                            if let Some(new_pane) = self.spawn_pane(new_id, cols, lines, None, factory) {
-                                let tab = &mut self.tabs[t];
-                                tab.layout.swap_leaves(id, new_id);
-                                tab.panes.remove(&id);
-                                tab.panes.insert(new_id, new_pane);
-                                if tab.focused == id {
-                                    tab.focused = new_id;
-                                }
-                            } else {
+                            let pane = match tab.panes.get_mut(&id) {
+                                Some(p) => p,
+                                None => break,
+                            };
+                            if pane.respawn(
+                                factory.cell_w,
+                                factory.cell_h,
+                                factory.egui_ctx.clone(),
+                                factory.term_config.clone(),
+                                Some(factory.event_loop_proxy.clone()),
+                            ).is_err() {
                                 self.close_pane(t, id, egui_ctx, dialogs);
                             }
                         }

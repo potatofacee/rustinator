@@ -158,8 +158,8 @@ impl EventListener for EventProxy {
                 self.dirty.store(true, Ordering::Release);
                 self.wake();
             }
-            Event::Title(t) => {
-                *self.title.lock().unwrap() = Some(t);
+            Event::Title(ref t) => {
+                *self.title.lock().unwrap() = Some(t.clone());
                 self.dirty.store(true, Ordering::Release);
                 self.wake();
             }
@@ -396,6 +396,62 @@ impl Pane {
         })
     }
 
+    pub fn respawn(
+        &mut self,
+        cell_w: f32,
+        cell_h: f32,
+        ctx: egui::Context,
+        term_config: Config,
+        winit_proxy: Option<winit::event_loop::EventLoopProxy<crate::window::UserEvent>>,
+    ) -> Result<(), String> {
+        let proxy = EventProxy::new(ctx, winit_proxy);
+        let dirty = Arc::clone(&proxy.dirty);
+        let exited = Arc::clone(&proxy.exited);
+        let title = Arc::clone(&proxy.title);
+
+        let dims = TermDims { cols: self.cols, lines: self.lines };
+        let term = Term::new(term_config, &dims, proxy.clone());
+        let terminal = Arc::new(FairMutex::new(term));
+
+        let window_size = WindowSize {
+            num_lines: self.lines as u16,
+            num_cols: self.cols as u16,
+            cell_width: cell_w.round() as u16,
+            cell_height: cell_h.round() as u16,
+        };
+
+        let mut pty_opts = tty::Options::default();
+        #[cfg(not(target_os = "macos"))]
+        {
+            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+            pty_opts.shell = Some(tty::Shell::new(shell, vec!["--login".into()]));
+        }
+        pty_opts.env.insert("TERM".into(), "xterm-256color".into());
+        pty_opts.env.insert("COLORTERM".into(), "truecolor".into());
+        pty_opts.env.insert("TERM_PROGRAM".into(), "rustinator".into());
+        pty_opts.env.insert("CLICOLOR".into(), "1".into());
+        pty_opts.env.insert("CLICOLOR_FORCE".into(), "1".into());
+        crate::shell_integration::inject_env(&mut pty_opts.env);
+        let pty = tty::new(&pty_opts, window_size, self.id)
+            .map_err(|e| format!("failed to open pty: {e}"))?;
+        let child_pid = pty.child().id();
+        let event_loop = EventLoop::new(Arc::clone(&terminal), proxy, pty, false, false)
+            .map_err(|e| format!("failed to create pty event loop: {e}"))?;
+        let pty_tx = event_loop.channel();
+        let _handle = event_loop.spawn();
+
+        self.terminal = terminal;
+        self.pty_tx = pty_tx;
+        self.child_pid = child_pid;
+        self.dirty = dirty;
+        self.exited = exited;
+        self.title = title;
+        self.cached = None;
+        *self.ui_selection.lock().unwrap() = None;
+
+        Ok(())
+    }
+
     pub fn title(&self) -> Option<String> {
         self.title.lock().unwrap().clone()
     }
@@ -413,6 +469,10 @@ impl Pane {
             let mut term = self.terminal.lock();
             term.resize(dims);
         }
+        self.cols = cols;
+        self.lines = lines;
+        self.dirty.store(true, Ordering::Release);
+        self.cached = None;
         let ws = WindowSize {
             num_lines: lines as u16,
             num_cols: cols as u16,
@@ -420,18 +480,21 @@ impl Pane {
             cell_height: cell_h.round() as u16,
         };
         let _ = self.pty_tx.send(Msg::Resize(ws));
-        self.cols = cols;
-        self.lines = lines;
-        self.dirty.store(true, Ordering::Release);
-        self.cached = None;
     }
 
-    /// Returns the pane's current Frame, rebuilding only if the pane is marked dirty
-    /// (or has no cache yet). Clears the dirty flag after a rebuild.
+    pub fn force_pty_resize(&mut self, cell_w: f32, cell_h: f32) {
+        let ws = WindowSize {
+            num_lines: self.lines as u16,
+            num_cols: self.cols as u16,
+            cell_width: cell_w.round() as u16,
+            cell_height: cell_h.round() as u16,
+        };
+        let _ = self.pty_tx.send(Msg::Resize(ws));
+    }
+
     pub fn frame(&mut self) -> Arc<Frame> {
         let was_dirty = self.dirty.swap(false, Ordering::AcqRel);
-        let no_cache = self.cached.is_none();
-        if no_cache || was_dirty {
+        if was_dirty || self.cached.is_none() {
             self.cached = Some(Arc::new(self.snapshot()));
         }
         Arc::clone(self.cached.as_ref().unwrap())
