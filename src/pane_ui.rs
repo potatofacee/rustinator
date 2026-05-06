@@ -10,7 +10,8 @@ use crate::layout::{self, Direction, LayoutTemplate};
 use crate::mouse::{MouseButton, MouseKind, MouseMods};
 use crate::pane::{CursorOverlay, PaneId, UrlMatch};
 use crate::renderer::{BgInstance, Renderer};
-use crate::tabs::{PaneAction, TabManager, PANE_GAP};
+use crate::keybindings::Action;
+use crate::tabs::{TabManager, PANE_GAP};
 
 const FOCUS_BORDER: f32 = 1.0;
 const PANE_TITLE_HEIGHT: f32 = 20.0;
@@ -18,6 +19,7 @@ const PANE_TITLE_HEIGHT: f32 = 20.0;
 pub(crate) struct PaneViewState {
     pub drag_source_pane: Option<PaneId>,
     pub last_pane_rect: Option<egui::Rect>,
+    pub last_root_rect: Option<egui::Rect>,
     pub layout_restore_pending: Option<LayoutTemplate>,
 }
 
@@ -26,6 +28,7 @@ impl PaneViewState {
         Self {
             drag_source_pane: None,
             last_pane_rect: None,
+            last_root_rect: None,
             layout_restore_pending: None,
         }
     }
@@ -47,8 +50,9 @@ pub(crate) fn draw_panes(
     state: &mut PaneViewState,
     ctx: &mut PaneViewCtx<'_>,
     ui: &mut egui::Ui,
-) -> Vec<PaneAction> {
+) -> Vec<Action> {
     let root_rect = ui.available_rect_before_wrap();
+    state.last_root_rect = Some(root_rect);
     let mut leaves = Vec::new();
     let zoomed = ctx.tab_mgr.tabs[ctx.tab_mgr.active_tab].zoomed;
     if let Some(zid) = zoomed {
@@ -63,49 +67,7 @@ pub(crate) fn draw_panes(
             .layout
             .walk_rects(root_rect, PANE_GAP, &mut leaves);
 
-        let mut dividers = Vec::new();
-        ctx.tab_mgr.tabs[ctx.tab_mgr.active_tab]
-            .layout
-            .walk_dividers(root_rect, PANE_GAP, &mut dividers);
-        for div in dividers {
-            let resp = ui.interact(
-                div.rect,
-                egui::Id::new(("divider", ctx.tab_mgr.active_tab, div.path.clone())),
-                egui::Sense::click_and_drag(),
-            );
-            let divider_color = if resp.hovered() || resp.dragged() {
-                egui::Color32::from_gray(80)
-            } else {
-                egui::Color32::from_gray(40)
-            };
-            ui.painter().rect_filled(div.rect, 0.0, divider_color);
-            let cursor = match div.dir {
-                layout::Direction::Horizontal => egui::CursorIcon::ResizeRow,
-                layout::Direction::Vertical => egui::CursorIcon::ResizeColumn,
-            };
-            if resp.hovered() || resp.dragged() {
-                ui.ctx().set_cursor_icon(cursor);
-            }
-            if resp.double_clicked() {
-                ctx.tab_mgr.tabs[ctx.tab_mgr.active_tab]
-                    .layout
-                    .set_ratio(&div.path, 0.5);
-            } else if resp.dragged() {
-                if let Some(pointer) = resp.interact_pointer_pos() {
-                    let new_ratio = match div.dir {
-                        layout::Direction::Vertical => {
-                            (pointer.x - div.parent_rect.left()) / div.parent_rect.width()
-                        }
-                        layout::Direction::Horizontal => {
-                            (pointer.y - div.parent_rect.top()) / div.parent_rect.height()
-                        }
-                    };
-                    ctx.tab_mgr.tabs[ctx.tab_mgr.active_tab]
-                        .layout
-                        .set_ratio(&div.path, new_ratio);
-                }
-            }
-        }
+        handle_dividers(ctx.tab_mgr.active_tab, &mut ctx.tab_mgr.tabs[ctx.tab_mgr.active_tab], root_rect, ui);
     }
 
     let ppp = ui.ctx().pixels_per_point();
@@ -115,15 +77,9 @@ pub(crate) fn draw_panes(
     let ctrl_held = mods.ctrl;
     let shift_held = mods.shift;
     let alt_held = mods.alt;
-    let mut deferred: Vec<PaneAction> = Vec::new();
+    let mut deferred: Vec<Action> = Vec::new();
     let show_title_bars = leaves.len() > 1;
     let mut pane_drop_rects: Vec<(PaneId, egui::Rect)> = Vec::new();
-
-    {
-        let elapsed_ms = ctx.cursor_blink_epoch.elapsed().as_millis() as u64;
-        let next_toggle = 530 - (elapsed_ms % 530);
-        ui.ctx().request_repaint_after(std::time::Duration::from_millis(next_toggle));
-    }
 
     for (id, rect) in leaves {
         let (title_rect, terminal_rect) = if show_title_bars {
@@ -165,12 +121,20 @@ pub(crate) fn draw_panes(
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
             }
 
+            // Compute dimensions from the current frame's terminal_rect so the
+            // title bar never shows stale values from a previous frame.  This
+            // uses the same formula as paint_pane (inner_rect = shrink by
+            // FOCUS_BORDER, then pixel-space ÷ cell size).
+            let inner = terminal_rect.shrink(FOCUS_BORDER);
+            let current_cols = ((inner.width() * ppp / cell_w).floor() as usize).max(1);
+            let current_lines = ((inner.height() * ppp / cell_h).floor() as usize).max(1);
+
             let title_text = ctx.tab_mgr.tabs[ctx.tab_mgr.active_tab]
                 .panes
                 .get(&id)
                 .map(|pane| {
                     let name = pane.title().unwrap_or_default();
-                    let dims = format!("{}x{}", pane.cols, pane.lines);
+                    let dims = format!("{}x{}", current_cols, current_lines);
                     if name.is_empty() {
                         dims
                     } else {
@@ -216,140 +180,23 @@ pub(crate) fn draw_panes(
             ctx.tab_mgr.paste_primary(id);
         }
 
-        let pointer = response
-            .interact_pointer_pos()
-            .or_else(|| response.hover_pos());
-        let pointer_cell = pointer.map(|p| cell_at(p, terminal_rect, ppp, cell_w, cell_h));
-        let url_at_pointer = pointer_cell.and_then(|(col, row)| {
-            let frame = ctx
-                .tab_mgr.tabs[ctx.tab_mgr.active_tab]
-                .panes
-                .get(&id)?
-                .cached
-                .as_ref()?
-                .clone();
-            frame
-                .urls
-                .iter()
-                .find(|u| u.row == row && col >= u.start_col && col < u.end_col)
-                .cloned()
-        });
-        let url_highlight = if ctrl_held && response.hovered() {
-            url_at_pointer.clone()
-        } else {
-            None
-        };
-
-        let handled_by_url = if ctrl_held && response.clicked() {
-            if let Some(url) = url_at_pointer.as_ref() {
-                let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
-                let _ = std::process::Command::new(opener).arg(&url.url).spawn();
-                true
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-
-        let mouse_to_app = ctx
-            .tab_mgr.tabs[ctx.tab_mgr.active_tab]
-            .panes
-            .get(&id)
-            .map(|p| p.mouse_reporting())
-            .unwrap_or(false)
-            && !shift_held;
-
-        let primary_down = response.is_pointer_button_down_on();
-
-        let mem_id = egui::Id::new(("pane_sel_down", ctx.tab_mgr.active_tab, id));
-        let was_down: bool = ui.ctx().data(|d| d.get_temp(mem_id).unwrap_or(false));
-        ui.ctx().data_mut(|d| d.insert_temp(mem_id, primary_down));
-        let just_pressed = primary_down && !was_down;
-
-        if mouse_to_app && !handled_by_url {
-            if let Some((col, row)) = pointer_cell {
-                if let Some(pane) = ctx.tab_mgr.tabs[ctx.tab_mgr.active_tab].panes.get(&id) {
-                    let mm = MouseMods { shift: shift_held, alt: alt_held, ctrl: ctrl_held };
-                    let send_click = |btn| {
-                        pane.send_mouse(MouseKind::Press, btn, col, row, mm);
-                        pane.send_mouse(MouseKind::Release, btn, col, row, mm);
-                    };
-                    if response.clicked() {
-                        send_click(MouseButton::Left);
-                    }
-                    if response.secondary_clicked() {
-                        send_click(MouseButton::Right);
-                    }
-                    if response.middle_clicked() {
-                        send_click(MouseButton::Middle);
-                    }
-                    if response.hovered() {
-                        let scroll_y = ui.ctx().input(|i| i.smooth_scroll_delta.y);
-                        if scroll_y.abs() > 1.0 {
-                            let steps = (scroll_y.abs() / cell_h.max(1.0)).ceil() as i32;
-                            let btn = if scroll_y > 0.0 { MouseButton::WheelUp } else { MouseButton::WheelDown };
-                            for _ in 0..steps.min(8) {
-                                pane.send_mouse(MouseKind::Press, btn, col, row, mm);
-                            }
-                        }
-                    }
-                }
-            }
-        } else if !handled_by_url {
-            if let Some((col, row)) = pointer_cell {
-                if let Some(pane) = ctx.tab_mgr.tabs[ctx.tab_mgr.active_tab].panes.get(&id) {
-                    if response.triple_clicked() {
-                        pane.begin_selection(col, row, SelectionType::Lines);
-                    } else if response.double_clicked() {
-                        pane.begin_selection(col, row, SelectionType::Semantic);
-                    } else if just_pressed {
-                        pane.begin_selection(col, row, SelectionType::Simple);
-                    } else if primary_down {
-                        if let Some(p) = pointer {
-                            let visible_cols = (terminal_rect.width() * ppp / cell_w).floor() as i32;
-                            if p.y < terminal_rect.top() {
-                                pane.selection_auto_scroll(1, visible_cols);
-                            } else if p.y > terminal_rect.bottom() {
-                                pane.selection_auto_scroll(-1, visible_cols);
-                            } else {
-                                pane.update_selection(col, row);
-                            }
-                        }
-                    } else if response.clicked() {
-                        pane.clear_selection();
-                    }
-                }
-
-                let gesture_ended = (!primary_down && was_down)
-                    || response.double_clicked()
-                    || response.triple_clicked();
-                if gesture_ended {
-                    if let Some(pane) = ctx.tab_mgr.tabs[ctx.tab_mgr.active_tab].panes.get(&id) {
-                        if let Some(text) = pane.selection_text() {
-                            if !text.is_empty() {
-                                write_primary(&text);
-                                if ctx.user_config.active().copy_on_selection {
-                                    ctx.egui_ctx.copy_text(text);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            if response.hovered() {
-                let scroll_y = ui.ctx().input(|i| i.smooth_scroll_delta.y);
-                if scroll_y.abs() > 0.5 {
-                    let lines = (scroll_y * ppp / cell_h).round() as i32;
-                    if lines != 0 {
-                        if let Some(pane) = ctx.tab_mgr.tabs[ctx.tab_mgr.active_tab].panes.get(&id) {
-                            pane.scroll_by(lines);
-                        }
-                    }
-                }
-            }
-        }
+        let (handled_by_url, url_highlight) = handle_pane_mouse(
+            id,
+            ctx.tab_mgr.active_tab,
+            &mut ctx.tab_mgr.tabs[ctx.tab_mgr.active_tab],
+            &response,
+            terminal_rect,
+            ui,
+            cell_w,
+            cell_h,
+            ppp,
+            ctrl_held,
+            shift_held,
+            alt_held,
+            ctx.user_config,
+            ctx.egui_ctx,
+        );
+        let _ = handled_by_url;
 
         let focused = id == ctx.tab_mgr.tabs[ctx.tab_mgr.active_tab].focused;
         paint_pane(ctx, ui, id, terminal_rect, focused, url_highlight);
@@ -371,104 +218,329 @@ pub(crate) fn draw_panes(
 
         state.last_pane_rect = Some(terminal_rect);
         response.context_menu(|ui| {
-            if ui.button("Copy").clicked() {
-                deferred.push(PaneAction::Copy);
-                ui.close();
-            }
-            if ui.button("Paste").clicked() {
-                deferred.push(PaneAction::Paste);
-                ui.close();
-            }
-            ui.separator();
-            if ui.button("Split Horizontally").clicked() {
-                deferred.push(PaneAction::SplitHorizontal);
-                ui.close();
-            }
-            if ui.button("Split Vertically").clicked() {
-                deferred.push(PaneAction::SplitVertical);
-                ui.close();
-            }
-            if ui.button("Split Auto").clicked() {
-                deferred.push(PaneAction::SplitAuto);
-                ui.close();
-            }
-            ui.separator();
-            let zoom_label = if zoomed.is_some() {
-                "Restore all terminals"
-            } else {
-                "Maximize terminal"
-            };
-            if ui.button(zoom_label).clicked() {
-                deferred.push(PaneAction::ToggleZoom);
-                ui.close();
-            }
-            let read_only = ctx.tab_mgr.tabs[ctx.tab_mgr.active_tab]
-                .panes.get(&id).map_or(false, |p| p.read_only);
-            let ro_label = if read_only { "Disable read-only" } else { "Read-only" };
-            if ui.button(ro_label).clicked() {
-                deferred.push(PaneAction::ToggleReadOnly);
-                ui.close();
-            }
-            let broadcast_label = if ctx.tab_mgr.tabs[ctx.tab_mgr.active_tab].broadcast {
-                "Stop broadcasting"
-            } else {
-                "Broadcast input to all panes"
-            };
-            if ui.button(broadcast_label).clicked() {
-                deferred.push(PaneAction::ToggleBroadcast);
-                ui.close();
-            }
-            ui.separator();
-            if ui.button("Set title\u{2026}").clicked() {
-                deferred.push(PaneAction::SetTitle);
-                ui.close();
-            }
-            if ui.button("Open Terminal Here").clicked() {
-                deferred.push(PaneAction::OpenTerminalHere);
-                ui.close();
-            }
-            if ui.button("Close Pane").clicked() {
-                deferred.push(PaneAction::Close);
-                ui.close();
-            }
-            ui.separator();
-            ui.menu_button("Layouts", |ui| {
-                if ui.button("Save current layout\u{2026}").clicked() {
-                    ctx.dialogs.layout_save_buf.clear();
-                    ctx.dialogs.layout_save_dialog = true;
-                    ui.close();
-                }
-                let layouts = ctx.user_config.layouts.clone();
-                if !layouts.is_empty() {
-                    ui.separator();
-                    for layout in &layouts {
-                        if ui.button(&layout.name).clicked() {
-                            state.layout_restore_pending = Some(layout.template.clone());
-                            ui.close();
-                        }
-                    }
-                }
-            });
-            ui.separator();
-            if ui.button("New Tab").clicked() {
-                deferred.push(PaneAction::NewTab);
-                ui.close();
-            }
-            ui.separator();
-            if ui.button("Preferences\u{2026}").clicked() {
-                deferred.push(PaneAction::OpenPrefs);
-                ui.close();
-            }
+            build_context_menu(
+                ui,
+                id,
+                &ctx.tab_mgr.tabs[ctx.tab_mgr.active_tab],
+                zoomed,
+                ctx.user_config,
+                ctx.dialogs,
+                state,
+                &mut deferred,
+            );
         });
     }
 
+    handle_drag_drop(state, &mut ctx.tab_mgr.tabs[ctx.tab_mgr.active_tab], &pane_drop_rects, ui);
+
+    deferred
+}
+
+fn handle_dividers(tab_idx: usize, tab: &mut crate::tabs::Tab, root_rect: egui::Rect, ui: &mut egui::Ui) {
+    let mut dividers = Vec::new();
+    tab.layout.walk_dividers(root_rect, PANE_GAP, &mut dividers);
+    for div in dividers {
+        let resp = ui.interact(
+            div.rect,
+            egui::Id::new(("divider", tab_idx, div.path.clone())),
+            egui::Sense::click_and_drag(),
+        );
+        let divider_color = if resp.hovered() || resp.dragged() {
+            egui::Color32::from_gray(80)
+        } else {
+            egui::Color32::from_gray(40)
+        };
+        ui.painter().rect_filled(div.rect, 0.0, divider_color);
+        let cursor = match div.dir {
+            layout::Direction::Horizontal => egui::CursorIcon::ResizeRow,
+            layout::Direction::Vertical => egui::CursorIcon::ResizeColumn,
+        };
+        if resp.hovered() || resp.dragged() {
+            ui.ctx().set_cursor_icon(cursor);
+        }
+        if resp.double_clicked() {
+            tab.layout.set_ratio(&div.path, 0.5);
+        } else if resp.dragged() {
+            if let Some(pointer) = resp.interact_pointer_pos() {
+                let new_ratio = match div.dir {
+                    layout::Direction::Vertical => {
+                        (pointer.x - div.parent_rect.left()) / div.parent_rect.width()
+                    }
+                    layout::Direction::Horizontal => {
+                        (pointer.y - div.parent_rect.top()) / div.parent_rect.height()
+                    }
+                };
+                tab.layout.set_ratio(&div.path, new_ratio);
+            }
+        }
+    }
+}
+
+fn handle_pane_mouse(
+    pane_id: PaneId,
+    tab_idx: usize,
+    tab: &mut crate::tabs::Tab,
+    response: &egui::Response,
+    terminal_rect: egui::Rect,
+    ui: &mut egui::Ui,
+    cell_w: f32,
+    cell_h: f32,
+    ppp: f32,
+    ctrl_held: bool,
+    shift_held: bool,
+    alt_held: bool,
+    user_config: &Config,
+    egui_ctx: &egui::Context,
+) -> (bool, Option<UrlMatch>) {
+    let pointer = response
+        .interact_pointer_pos()
+        .or_else(|| response.hover_pos());
+    let inner_rect = terminal_rect.shrink(FOCUS_BORDER);
+    let pointer_cell = pointer.map(|p| cell_at(p, inner_rect, ppp, cell_w, cell_h));
+    let url_at_pointer = pointer_cell.and_then(|(col, row)| {
+        let frame = tab
+            .panes
+            .get(&pane_id)?
+            .cached
+            .as_ref()?
+            .clone();
+        frame
+            .urls
+            .iter()
+            .find(|u| u.row == row && col >= u.start_col && col < u.end_col)
+            .cloned()
+    });
+    let url_highlight = if ctrl_held && response.hovered() {
+        url_at_pointer.clone()
+    } else {
+        None
+    };
+
+    let handled_by_url = if ctrl_held && response.clicked() {
+        if let Some(url) = url_at_pointer.as_ref() {
+            let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+            let _ = std::process::Command::new(opener).arg(&url.url).spawn();
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    let mouse_to_app = tab
+        .panes
+        .get(&pane_id)
+        .map(|p| p.mouse_reporting())
+        .unwrap_or(false)
+        && !shift_held;
+
+    let primary_down = response.is_pointer_button_down_on();
+
+    let mem_id = egui::Id::new(("pane_sel_down", tab_idx, pane_id));
+    let was_down: bool = ui.ctx().data(|d| d.get_temp(mem_id).unwrap_or(false));
+    ui.ctx().data_mut(|d| d.insert_temp(mem_id, primary_down));
+    let just_pressed = primary_down && !was_down;
+
+    if mouse_to_app && !handled_by_url {
+        if let Some((col, row)) = pointer_cell {
+            if let Some(pane) = tab.panes.get(&pane_id) {
+                let mm = MouseMods { shift: shift_held, alt: alt_held, ctrl: ctrl_held };
+                let send_click = |btn| {
+                    pane.send_mouse(MouseKind::Press, btn, col, row, mm);
+                    pane.send_mouse(MouseKind::Release, btn, col, row, mm);
+                };
+                if response.clicked() {
+                    send_click(MouseButton::Left);
+                }
+                if response.secondary_clicked() {
+                    send_click(MouseButton::Right);
+                }
+                if response.middle_clicked() {
+                    send_click(MouseButton::Middle);
+                }
+                if response.hovered() {
+                    let scroll_y = ui.ctx().input(|i| i.smooth_scroll_delta.y);
+                    if scroll_y.abs() > 1.0 {
+                        let steps = (scroll_y.abs() / cell_h.max(1.0)).ceil() as i32;
+                        let btn = if scroll_y > 0.0 { MouseButton::WheelUp } else { MouseButton::WheelDown };
+                        for _ in 0..steps.min(8) {
+                            pane.send_mouse(MouseKind::Press, btn, col, row, mm);
+                        }
+                    }
+                }
+            }
+        }
+    } else if !handled_by_url {
+        if let Some((col, row)) = pointer_cell {
+            if let Some(pane) = tab.panes.get(&pane_id) {
+                if response.triple_clicked() {
+                    pane.begin_selection(col, row, SelectionType::Lines);
+                } else if response.double_clicked() {
+                    pane.begin_selection(col, row, SelectionType::Semantic);
+                } else if just_pressed {
+                    pane.begin_selection(col, row, SelectionType::Simple);
+                } else if primary_down {
+                    if let Some(p) = pointer {
+                        let visible_cols = (terminal_rect.width() * ppp / cell_w).floor() as i32;
+                        if p.y < terminal_rect.top() {
+                            pane.selection_auto_scroll(1, visible_cols);
+                        } else if p.y > terminal_rect.bottom() {
+                            pane.selection_auto_scroll(-1, visible_cols);
+                        } else {
+                            pane.update_selection(col, row);
+                        }
+                    }
+                } else if response.clicked() {
+                    pane.clear_selection();
+                }
+            }
+
+            let gesture_ended = (!primary_down && was_down)
+                || response.double_clicked()
+                || response.triple_clicked();
+            if gesture_ended {
+                if let Some(pane) = tab.panes.get(&pane_id) {
+                    if let Some(text) = pane.selection_text() {
+                        if !text.is_empty() {
+                            write_primary(&text);
+                            if user_config.active().copy_on_selection {
+                                egui_ctx.copy_text(text);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if response.hovered() {
+            let scroll_y = ui.ctx().input(|i| i.smooth_scroll_delta.y);
+            if scroll_y.abs() > 0.5 {
+                let lines = (scroll_y * ppp / cell_h).round() as i32;
+                if lines != 0 {
+                    if let Some(pane) = tab.panes.get(&pane_id) {
+                        pane.scroll_by(lines);
+                    }
+                }
+            }
+        }
+    }
+
+    (handled_by_url, url_highlight)
+}
+
+fn build_context_menu(
+    ui: &mut egui::Ui,
+    pane_id: PaneId,
+    tab: &crate::tabs::Tab,
+    zoomed: Option<PaneId>,
+    user_config: &Config,
+    dialogs: &mut crate::dialogs::DialogState,
+    state: &mut PaneViewState,
+    deferred: &mut Vec<Action>,
+) {
+    if ui.button("Copy").clicked() {
+        deferred.push(Action::Copy);
+        ui.close();
+    }
+    if ui.button("Paste").clicked() {
+        deferred.push(Action::Paste);
+        ui.close();
+    }
+    ui.separator();
+    if ui.button("Split Horizontally").clicked() {
+        deferred.push(Action::SplitHorizontal);
+        ui.close();
+    }
+    if ui.button("Split Vertically").clicked() {
+        deferred.push(Action::SplitVertical);
+        ui.close();
+    }
+    if ui.button("Split Auto").clicked() {
+        deferred.push(Action::SplitAuto);
+        ui.close();
+    }
+    ui.separator();
+    let zoom_label = if zoomed.is_some() {
+        "Restore all terminals"
+    } else {
+        "Maximize terminal"
+    };
+    if ui.button(zoom_label).clicked() {
+        deferred.push(Action::ToggleZoom);
+        ui.close();
+    }
+    let read_only = tab
+        .panes.get(&pane_id).map_or(false, |p| p.read_only);
+    let ro_label = if read_only { "Disable read-only" } else { "Read-only" };
+    if ui.button(ro_label).clicked() {
+        deferred.push(Action::ToggleReadOnly);
+        ui.close();
+    }
+    let broadcast_label = if tab.broadcast {
+        "Stop broadcasting"
+    } else {
+        "Broadcast input to all panes"
+    };
+    if ui.button(broadcast_label).clicked() {
+        deferred.push(Action::ToggleBroadcast);
+        ui.close();
+    }
+    ui.separator();
+    if ui.button("Set title\u{2026}").clicked() {
+        deferred.push(Action::SetTitle);
+        ui.close();
+    }
+    if ui.button("Open Terminal Here").clicked() {
+        deferred.push(Action::OpenTerminalHere);
+        ui.close();
+    }
+    if ui.button("Close Pane").clicked() {
+        deferred.push(Action::ClosePane);
+        ui.close();
+    }
+    ui.separator();
+    ui.menu_button("Layouts", |ui| {
+        if ui.button("Save current layout\u{2026}").clicked() {
+            dialogs.layout_save_buf.clear();
+            dialogs.layout_save_dialog = true;
+            ui.close();
+        }
+        let layouts = user_config.layouts.clone();
+        if !layouts.is_empty() {
+            ui.separator();
+            for layout in &layouts {
+                if ui.button(&layout.name).clicked() {
+                    state.layout_restore_pending = Some(layout.template.clone());
+                    ui.close();
+                }
+            }
+        }
+    });
+    ui.separator();
+    if ui.button("New Tab").clicked() {
+        deferred.push(Action::NewTab);
+        ui.close();
+    }
+    ui.separator();
+    if ui.button("Preferences\u{2026}").clicked() {
+        deferred.push(Action::OpenPrefs);
+        ui.close();
+    }
+}
+
+fn handle_drag_drop(
+    state: &mut PaneViewState,
+    tab: &mut crate::tabs::Tab,
+    pane_drop_rects: &[(PaneId, egui::Rect)],
+    ui: &mut egui::Ui,
+) {
     if state.drag_source_pane.is_some() && !ui.input(|i| i.pointer.any_down()) {
         if let Some(src) = state.drag_source_pane.take() {
             if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
-                for (tid, full_rect) in &pane_drop_rects {
+                for (tid, full_rect) in pane_drop_rects {
                     if *tid != src && full_rect.contains(pos) {
                         let (dir, src_first) = drop_zone_direction(*full_rect, pos);
-                        let tab = &mut ctx.tab_mgr.tabs[ctx.tab_mgr.active_tab];
                         tab.layout.remove_leaf(src);
                         if src_first {
                             tab.layout.split_leaf(*tid, src, dir);
@@ -483,8 +555,75 @@ pub(crate) fn draw_panes(
             }
         }
     }
+}
 
-    deferred
+fn paint_scrollbar(
+    ui: &mut egui::Ui,
+    tab_idx: usize,
+    tab: &crate::tabs::Tab,
+    pane_id: PaneId,
+    inner_rect: egui::Rect,
+) {
+    if let Some(pane) = tab.panes.get(&pane_id) {
+        let (offset, history, screen) = pane.scroll_info();
+        if history > 0 && pane.scrollbar_visible {
+            let total = history + screen;
+            let sb_width = 8.0;
+            let track = egui::Rect::from_min_max(
+                egui::pos2(inner_rect.right() - sb_width, inner_rect.top()),
+                inner_rect.right_bottom(),
+            );
+            let track_h = track.height();
+            let thumb_frac = (screen as f32 / total as f32).clamp(0.05, 1.0);
+            let thumb_h = (track_h * thumb_frac).max(16.0);
+            let scrollable = track_h - thumb_h;
+            let thumb_top = if history > 0 {
+                track.top() + scrollable * (1.0 - offset as f32 / history as f32)
+            } else {
+                track.top()
+            };
+            let thumb_rect = egui::Rect::from_min_size(
+                egui::pos2(track.left(), thumb_top),
+                egui::vec2(sb_width, thumb_h),
+            );
+
+            let sb_id = egui::Id::new(("scrollbar", tab_idx, pane_id));
+            let resp = ui.interact(track, sb_id, egui::Sense::click_and_drag());
+
+            let hovered = resp.hovered() || resp.dragged();
+            let track_color = if hovered {
+                egui::Color32::from_white_alpha(20)
+            } else {
+                egui::Color32::TRANSPARENT
+            };
+            let thumb_color = if resp.dragged() {
+                egui::Color32::from_white_alpha(140)
+            } else if hovered {
+                egui::Color32::from_white_alpha(100)
+            } else {
+                egui::Color32::from_white_alpha(50)
+            };
+
+            ui.painter().rect_filled(track, 0.0, track_color);
+            ui.painter().rect_filled(thumb_rect, sb_width / 2.0, thumb_color);
+
+            if resp.dragged() {
+                if let Some(pos) = resp.interact_pointer_pos() {
+                    let frac = ((pos.y - track.top() - thumb_h / 2.0) / scrollable)
+                        .clamp(0.0, 1.0);
+                    let new_offset = ((1.0 - frac) * history as f32).round() as usize;
+                    pane.scroll_to_position(new_offset);
+                }
+            } else if resp.clicked() {
+                if let Some(pos) = resp.interact_pointer_pos() {
+                    let frac = ((pos.y - track.top() - thumb_h / 2.0) / scrollable)
+                        .clamp(0.0, 1.0);
+                    let new_offset = ((1.0 - frac) * history as f32).round() as usize;
+                    pane.scroll_to_position(new_offset);
+                }
+            }
+        }
+    }
 }
 
 fn paint_pane(
@@ -507,11 +646,7 @@ fn paint_pane(
     };
 
     let ppp = ui.ctx().pixels_per_point();
-    let inner_rect = if focused {
-        rect.shrink(FOCUS_BORDER)
-    } else {
-        rect
-    };
+    let inner_rect = rect.shrink(FOCUS_BORDER);
     let width_px = inner_rect.width() * ppp;
     let height_px = inner_rect.height() * ppp;
     let new_cols = ((width_px / cell_w).floor() as usize).max(1);
@@ -524,6 +659,15 @@ fn paint_pane(
     let blink_off = should_blink
         && focused
         && (blink_elapsed.as_millis() / 530) % 2 == 1;
+
+    // Schedule the next cursor blink repaint only when this pane is focused
+    // and blinking is active. This avoids continuously repainting when idle.
+    if focused && should_blink && frame.cursor.is_some() {
+        let elapsed_ms = blink_elapsed.as_millis() as u64;
+        let next_toggle = 530 - (elapsed_ms % 530);
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(next_toggle));
+    }
+
     let cursor_override = match frame.cursor {
         Some(CursorOverlay::Block { col, row, color }) if !focused => {
             Some(Some(CursorOverlay::HollowBlock { col, row, color }))
@@ -553,17 +697,27 @@ fn paint_pane(
             use glow::HasContext as _;
             let gl = painter.gl();
             gl.scissor(vp.left_px, vp.from_bottom_px, vp.width_px, vp.height_px);
-            let a = frame.default_bg[3];
-            gl.clear_color(
-                frame.default_bg[0],
-                frame.default_bg[1],
-                frame.default_bg[2],
-                a,
-            );
-            gl.clear(glow::COLOR_BUFFER_BIT);
+            // NOTE: We intentionally do NOT call gl.clear() here. Clearing the
+            // viewport before drawing content causes visible flicker in full-
+            // screen terminal applications (vi, htop, less) because the cleared
+            // frame can briefly appear on-screen before content is painted.
+            // Instead, we draw the default background as a full-viewport quad
+            // below, which is rendered atomically with the rest of the content.
         }
 
-        let mut bg = Vec::with_capacity(frame.cells.len());
+        // Compute how many cells cover the viewport so we can draw a single
+        // background quad that fills the entire pane without needing gl.clear.
+        let cols_cover = (vp.width_px as f32 / renderer.cell_w).ceil() as i32;
+        let rows_cover = (vp.height_px as f32 / renderer.cell_h).ceil() as i32;
+
+        let mut bg = Vec::with_capacity(frame.cells.len() + 1);
+        // Full-pane default-bg quad (replaces gl.clear).
+        bg.push(BgInstance {
+            cell: [0, 0],
+            color: frame.default_bg,
+            offset_cells: [0.0, 0.0],
+            size_cells: [cols_cover as f32, rows_cover as f32],
+        });
         let mut gl_instances = Vec::with_capacity(frame.cells.len());
         for cell in &frame.cells {
             if cell.bg[..3] != frame.default_bg[..3] {
@@ -656,66 +810,7 @@ fn paint_pane(
         );
     }
 
-    if let Some(pane) = ctx.tab_mgr.tabs[ctx.tab_mgr.active_tab].panes.get(&pane_id) {
-        let (offset, history, screen) = pane.scroll_info();
-        if history > 0 && pane.scrollbar_visible {
-            let total = history + screen;
-            let sb_width = 8.0;
-            let track = egui::Rect::from_min_max(
-                egui::pos2(inner_rect.right() - sb_width, inner_rect.top()),
-                inner_rect.right_bottom(),
-            );
-            let track_h = track.height();
-            let thumb_frac = (screen as f32 / total as f32).clamp(0.05, 1.0);
-            let thumb_h = (track_h * thumb_frac).max(16.0);
-            let scrollable = track_h - thumb_h;
-            let thumb_top = if history > 0 {
-                track.top() + scrollable * (1.0 - offset as f32 / history as f32)
-            } else {
-                track.top()
-            };
-            let thumb_rect = egui::Rect::from_min_size(
-                egui::pos2(track.left(), thumb_top),
-                egui::vec2(sb_width, thumb_h),
-            );
-
-            let sb_id = egui::Id::new(("scrollbar", ctx.tab_mgr.active_tab, pane_id));
-            let resp = ui.interact(track, sb_id, egui::Sense::click_and_drag());
-
-            let hovered = resp.hovered() || resp.dragged();
-            let track_color = if hovered {
-                egui::Color32::from_white_alpha(20)
-            } else {
-                egui::Color32::TRANSPARENT
-            };
-            let thumb_color = if resp.dragged() {
-                egui::Color32::from_white_alpha(140)
-            } else if hovered {
-                egui::Color32::from_white_alpha(100)
-            } else {
-                egui::Color32::from_white_alpha(50)
-            };
-
-            ui.painter().rect_filled(track, 0.0, track_color);
-            ui.painter().rect_filled(thumb_rect, sb_width / 2.0, thumb_color);
-
-            if resp.dragged() {
-                if let Some(pos) = resp.interact_pointer_pos() {
-                    let frac = ((pos.y - track.top() - thumb_h / 2.0) / scrollable)
-                        .clamp(0.0, 1.0);
-                    let new_offset = ((1.0 - frac) * history as f32).round() as usize;
-                    pane.scroll_to_position(new_offset);
-                }
-            } else if resp.clicked() {
-                if let Some(pos) = resp.interact_pointer_pos() {
-                    let frac = ((pos.y - track.top() - thumb_h / 2.0) / scrollable)
-                        .clamp(0.0, 1.0);
-                    let new_offset = ((1.0 - frac) * history as f32).round() as usize;
-                    pane.scroll_to_position(new_offset);
-                }
-            }
-        }
-    }
+    paint_scrollbar(ui, ctx.tab_mgr.active_tab, &ctx.tab_mgr.tabs[ctx.tab_mgr.active_tab], pane_id, inner_rect);
 
     if focused && std::env::var("RUSTINATOR_NO_FOCUS_BORDER").is_err() {
         let color = if ctx.tab_mgr.tabs[ctx.tab_mgr.active_tab].broadcast {

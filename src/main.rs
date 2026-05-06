@@ -1,6 +1,8 @@
 mod config;
 mod dialogs;
 mod font;
+mod gl_setup;
+mod gl_window;
 mod hotkey;
 mod input;
 mod keybindings;
@@ -9,6 +11,7 @@ mod layout;
 mod mouse;
 mod pane;
 mod pane_ui;
+mod platform;
 mod prefs_ui;
 mod presets;
 mod renderer;
@@ -19,7 +22,7 @@ pub mod window;
 use crate::dialogs::{DialogAction, DialogState};
 use crate::pane_ui::{PaneViewCtx, PaneViewState};
 use crate::prefs_ui::{PrefsResult, PrefsState};
-use crate::tabs::{FocusDir, PaneAction, PaneFactory, TabManager};
+use crate::tabs::{FocusDir, PaneFactory, TabManager};
 
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -31,44 +34,114 @@ use winit::event_loop::EventLoopProxy;
 
 use crate::config::Config;
 use crate::font::FontContext;
-use crate::keybindings::BindingTable;
+use crate::keybindings::{Action, BindingTable};
 use crate::layout::Direction;
 use crate::pane::{Pane, PaneDefaults, PaneId};
 use crate::renderer::Renderer;
 
 pub(crate) use input::RawTermKey;
 
+pub(crate) struct FontState {
+    pub(crate) ctx: Arc<Mutex<FontContext>>,
+    pub(crate) cell_w: f32,
+    pub(crate) cell_h: f32,
+    pub(crate) base_size: f32,
+    pub(crate) size_override: Option<f32>,
+    pub(crate) scale_factor: f32,
+}
+
+impl FontState {
+    fn adjust_font_size(&mut self, delta: f32, renderer: &Arc<Mutex<Renderer>>, font_family: &str, tab_mgr: &mut TabManager) {
+        let current = self.size_override.unwrap_or(self.base_size);
+        let new_size = (current + delta).clamp(4.0, 72.0);
+        self.apply_font_size(new_size, renderer, font_family, tab_mgr);
+    }
+
+    fn reset_font_size(&mut self, renderer: &Arc<Mutex<Renderer>>, font_family: &str, tab_mgr: &mut TabManager) {
+        self.size_override = None;
+        let size = self.base_size;
+        if let Ok(fc) = FontContext::new(font_family, size * self.scale_factor) {
+            self.cell_w = fc.cell_width();
+            self.cell_h = fc.cell_height();
+            {
+                let mut renderer = renderer.lock().unwrap();
+                renderer.reload_font(&fc);
+            }
+            *self.ctx.lock().unwrap() = fc;
+            for tab in &mut tab_mgr.tabs {
+                for pane in tab.panes.values_mut() {
+                    pane.dirty.store(true, std::sync::atomic::Ordering::Release);
+                    pane.cached = None;
+                }
+            }
+        }
+    }
+
+    fn apply_font_size(&mut self, size: f32, renderer: &Arc<Mutex<Renderer>>, font_family: &str, tab_mgr: &mut TabManager) {
+        self.size_override = Some(size);
+        if let Ok(fc) = FontContext::new(font_family, size * self.scale_factor) {
+            self.cell_w = fc.cell_width();
+            self.cell_h = fc.cell_height();
+            {
+                let mut renderer = renderer.lock().unwrap();
+                renderer.reload_font(&fc);
+            }
+            *self.ctx.lock().unwrap() = fc;
+            for tab in &mut tab_mgr.tabs {
+                for pane in tab.panes.values_mut() {
+                    pane.dirty.store(true, std::sync::atomic::Ordering::Release);
+                    pane.cached = None;
+                }
+            }
+        }
+    }
+
+    fn reload_font(&mut self, family: &str, size: f32, renderer: &Arc<Mutex<Renderer>>) -> Result<(), crossfont::Error> {
+        let new_font = FontContext::new(family, size * self.scale_factor)?;
+        let cell_w = new_font.cell_width();
+        let cell_h = new_font.cell_height();
+        renderer.lock().unwrap().reload_font(&new_font);
+        *self.ctx.lock().unwrap() = new_font;
+        self.cell_w = cell_w;
+        self.cell_h = cell_h;
+        Ok(())
+    }
+}
+
+pub(crate) struct RendererState {
+    pub(crate) renderer: Arc<Mutex<Renderer>>,
+}
+
+pub(crate) struct InputState {
+    pub(crate) bindings: BindingTable,
+    pub(crate) pending_raw_keys: Vec<RawTermKey>,
+    pub(crate) cursor_blink_epoch: Instant,
+}
+
 pub(crate) struct App {
     pub(crate) tab_mgr: TabManager,
     egui_ctx: egui::Context,
     event_loop_proxy: EventLoopProxy<window::UserEvent>,
-    font: Arc<Mutex<FontContext>>,
-    renderer: Arc<Mutex<Renderer>>,
-    cell_w: f32,
-    cell_h: f32,
+    pub(crate) font: FontState,
+    pub(crate) render: RendererState,
+    pub(crate) input: InputState,
     term_config: TermConfig,
     pane_defaults: PaneDefaults,
     pub(crate) user_config: Config,
     pub(crate) prefs: PrefsState,
-    current_title: String,
     pub(crate) dialogs: DialogState,
-    bindings: BindingTable,
     pub(crate) pane_view: PaneViewState,
-    base_font_size: f32,
-    font_size_override: Option<f32>,
-    scale_factor: f32,
+    current_title: String,
     pub(crate) fullscreen_pending: bool,
     pub(crate) hotkey_changed: bool,
     pub(crate) pending_zoom_steps: i32,
-    cursor_blink_epoch: Instant,
-    pub(crate) pending_raw_keys: Vec<RawTermKey>,
 }
 
 impl App {
     fn pane_factory(&self) -> PaneFactory {
         PaneFactory {
-            cell_w: self.cell_w,
-            cell_h: self.cell_h,
+            cell_w: self.font.cell_w,
+            cell_h: self.font.cell_h,
             egui_ctx: self.egui_ctx.clone(),
             term_config: self.term_config.clone(),
             pane_defaults: self.pane_defaults,
@@ -147,26 +220,32 @@ impl App {
             tab_mgr: TabManager::new(pane),
             egui_ctx,
             event_loop_proxy,
-            font: Arc::new(Mutex::new(font_ctx)),
-            renderer: Arc::new(Mutex::new(renderer)),
-            cell_w,
-            cell_h,
+            font: FontState {
+                ctx: Arc::new(Mutex::new(font_ctx)),
+                cell_w,
+                cell_h,
+                base_size: base_font_size,
+                size_override: None,
+                scale_factor,
+            },
+            render: RendererState {
+                renderer: Arc::new(Mutex::new(renderer)),
+            },
+            input: InputState {
+                bindings,
+                pending_raw_keys: Vec::new(),
+                cursor_blink_epoch: Instant::now(),
+            },
             term_config,
             pane_defaults,
             user_config: user_config.clone(),
             prefs: PrefsState::new(),
             current_title: "rustinator".into(),
             dialogs: DialogState::new(),
-            bindings,
             pane_view: PaneViewState::new(),
-            base_font_size,
-            font_size_override: None,
-            scale_factor,
             fullscreen_pending: false,
             hotkey_changed: false,
             pending_zoom_steps: 0,
-            cursor_blink_epoch: Instant::now(),
-            pending_raw_keys: Vec::new(),
         })
     }
 
@@ -196,28 +275,28 @@ impl App {
         }
     }
 
-    fn execute_pane_actions(&mut self, ctx: &egui::Context, actions: Vec<PaneAction>) {
+    fn execute_pane_actions(&mut self, ctx: &egui::Context, actions: Vec<Action>) {
         let factory = self.pane_factory();
         for action in actions {
             match action {
-                PaneAction::SplitHorizontal => self.tab_mgr.split(Direction::Horizontal, &factory),
-                PaneAction::SplitVertical => self.tab_mgr.split(Direction::Vertical, &factory),
-                PaneAction::Close => self.tab_mgr.close_focused(&self.egui_ctx, &mut self.dialogs),
-                PaneAction::FocusNext => self.tab_mgr.cycle_focus(1),
-                PaneAction::FocusPrev => self.tab_mgr.cycle_focus(-1),
-                PaneAction::NewTab => self.tab_mgr.new_tab(&factory),
-                PaneAction::NextTab => self.tab_mgr.switch_tab(1),
-                PaneAction::PrevTab => self.tab_mgr.switch_tab(-1),
-                PaneAction::OpenPrefs => self.open_prefs(),
-                PaneAction::Copy => self.tab_mgr.copy_selection(&self.egui_ctx, self.user_config.active().smart_copy),
-                PaneAction::Paste => self.tab_mgr.paste_from_clipboard(),
-                PaneAction::ToggleZoom => self.tab_mgr.toggle_zoom(),
-                PaneAction::ToggleBroadcast => self.tab_mgr.toggle_broadcast(),
-                PaneAction::ToggleSearch => self.tab_mgr.toggle_search(&mut self.dialogs),
-                PaneAction::ZoomIn => self.adjust_font_size(1.0),
-                PaneAction::ZoomOut => self.adjust_font_size(-1.0),
-                PaneAction::ZoomReset => self.reset_font_size(),
-                PaneAction::CloseWindow => {
+                Action::SplitHorizontal => self.tab_mgr.split(Direction::Horizontal, &factory),
+                Action::SplitVertical => self.tab_mgr.split(Direction::Vertical, &factory),
+                Action::ClosePane => self.tab_mgr.close_focused(&self.egui_ctx, &mut self.dialogs),
+                Action::FocusNext => self.tab_mgr.cycle_focus(1),
+                Action::FocusPrev => self.tab_mgr.cycle_focus(-1),
+                Action::NewTab => self.tab_mgr.new_tab(&factory),
+                Action::NextTab => self.tab_mgr.switch_tab(1),
+                Action::PrevTab => self.tab_mgr.switch_tab(-1),
+                Action::OpenPrefs => self.open_prefs(),
+                Action::Copy => self.tab_mgr.copy_selection(&self.egui_ctx, self.user_config.active().smart_copy),
+                Action::Paste => self.tab_mgr.paste_from_clipboard(),
+                Action::ToggleZoom => self.tab_mgr.toggle_zoom(),
+                Action::ToggleBroadcast => self.tab_mgr.toggle_broadcast(),
+                Action::ToggleSearch => self.tab_mgr.toggle_search(&mut self.dialogs),
+                Action::ZoomIn => self.font.adjust_font_size(1.0, &self.render.renderer, &self.user_config.active().font.family.clone(), &mut self.tab_mgr),
+                Action::ZoomOut => self.font.adjust_font_size(-1.0, &self.render.renderer, &self.user_config.active().font.family.clone(), &mut self.tab_mgr),
+                Action::ZoomReset => self.font.reset_font_size(&self.render.renderer, &self.user_config.active().font.family.clone(), &mut self.tab_mgr),
+                Action::CloseWindow => {
                     if self.should_confirm_close() {
                         self.dialogs.close_dialog_open = true;
                     } else {
@@ -225,80 +304,61 @@ impl App {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                 }
-                PaneAction::ToggleFullscreen => self.fullscreen_pending = !self.fullscreen_pending,
-                PaneAction::ResizeLeft => self.tab_mgr.resize_split(-0.05, false, self.pane_view.last_pane_rect),
-                PaneAction::ResizeRight => self.tab_mgr.resize_split(0.05, false, self.pane_view.last_pane_rect),
-                PaneAction::ResizeUp => self.tab_mgr.resize_split(-0.05, true, self.pane_view.last_pane_rect),
-                PaneAction::ResizeDown => self.tab_mgr.resize_split(0.05, true, self.pane_view.last_pane_rect),
-                PaneAction::ResetTerminal => self.tab_mgr.reset_focused_terminal(false),
-                PaneAction::ResetClear => self.tab_mgr.reset_focused_terminal(true),
-                PaneAction::NewWindow => { let _ = std::process::Command::new(std::env::current_exe().unwrap_or_default()).spawn(); }
-                PaneAction::OpenTerminalHere => self.tab_mgr.split_here(self.pane_view.last_pane_rect, &factory),
-                PaneAction::QuitHotkeyWindow => {
+                Action::ToggleFullscreen => self.fullscreen_pending = !self.fullscreen_pending,
+                Action::ResizeLeft => self.tab_mgr.resize_split(-0.05, false, self.pane_view.last_root_rect),
+                Action::ResizeRight => self.tab_mgr.resize_split(0.05, false, self.pane_view.last_root_rect),
+                Action::ResizeUp => self.tab_mgr.resize_split(-0.05, true, self.pane_view.last_root_rect),
+                Action::ResizeDown => self.tab_mgr.resize_split(0.05, true, self.pane_view.last_root_rect),
+                Action::ResetTerminal => self.tab_mgr.reset_focused_terminal(false),
+                Action::ResetClear => self.tab_mgr.reset_focused_terminal(true),
+                Action::NewWindow => { let _ = std::process::Command::new(std::env::current_exe().unwrap_or_default()).spawn(); }
+                Action::OpenTerminalHere => self.tab_mgr.split_here(self.pane_view.last_pane_rect, &factory),
+                Action::QuitHotkeyWindow => {
                     self.dialogs.confirmed_close = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
-                PaneAction::SwitchToTab(n) => self.tab_mgr.switch_tab_direct(n),
-                PaneAction::MoveTabLeft => self.tab_mgr.move_tab(-1),
-                PaneAction::MoveTabRight => self.tab_mgr.move_tab(1),
-                PaneAction::GoUp => self.tab_mgr.focus_direction(FocusDir::Up, self.pane_view.last_pane_rect),
-                PaneAction::GoDown => self.tab_mgr.focus_direction(FocusDir::Down, self.pane_view.last_pane_rect),
-                PaneAction::GoLeft => self.tab_mgr.focus_direction(FocusDir::Left, self.pane_view.last_pane_rect),
-                PaneAction::GoRight => self.tab_mgr.focus_direction(FocusDir::Right, self.pane_view.last_pane_rect),
-                PaneAction::GoNext => self.tab_mgr.cycle_focus(1),
-                PaneAction::GoPrev => self.tab_mgr.cycle_focus(-1),
-                PaneAction::RotateCW => self.tab_mgr.tabs[self.tab_mgr.active_tab].layout.rotate_cw(),
-                PaneAction::RotateCCW => self.tab_mgr.tabs[self.tab_mgr.active_tab].layout.rotate_ccw(),
-                PaneAction::SplitAuto => {
+                Action::SwitchToTab(n) => self.tab_mgr.switch_tab_direct(n),
+                Action::MoveTabLeft => self.tab_mgr.move_tab(-1),
+                Action::MoveTabRight => self.tab_mgr.move_tab(1),
+                Action::GoUp => self.tab_mgr.focus_direction(FocusDir::Up, self.pane_view.last_root_rect),
+                Action::GoDown => self.tab_mgr.focus_direction(FocusDir::Down, self.pane_view.last_root_rect),
+                Action::GoLeft => self.tab_mgr.focus_direction(FocusDir::Left, self.pane_view.last_root_rect),
+                Action::GoRight => self.tab_mgr.focus_direction(FocusDir::Right, self.pane_view.last_root_rect),
+                Action::GoNext => self.tab_mgr.cycle_focus(1),
+                Action::GoPrev => self.tab_mgr.cycle_focus(-1),
+                Action::RotateCW => self.tab_mgr.tabs[self.tab_mgr.active_tab].layout.rotate_cw(),
+                Action::RotateCCW => self.tab_mgr.tabs[self.tab_mgr.active_tab].layout.rotate_ccw(),
+                Action::SplitAuto => {
                     let dir = match self.pane_view.last_pane_rect {
                         Some(r) if r.width() >= r.height() => Direction::Vertical,
                         _ => Direction::Horizontal,
                     };
                     self.tab_mgr.split(dir, &factory);
                 }
-                PaneAction::ToggleScrollbar => {
+                Action::ToggleScrollbar => {
                     if let Some(pane) = self.tab_mgr.active_pane_mut() {
                         pane.scrollbar_visible = !pane.scrollbar_visible;
                     }
                 }
-                PaneAction::HideWindow => {
+                Action::HideWindow => {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
                 }
-                PaneAction::ToggleReadOnly | PaneAction::SetTitle => {}
-            }
-        }
-    }
-
-    fn adjust_font_size(&mut self, delta: f32) {
-        let current = self.font_size_override.unwrap_or(self.base_font_size);
-        let new_size = (current + delta).clamp(4.0, 72.0);
-        self.apply_font_size(new_size);
-    }
-
-    fn reset_font_size(&mut self) {
-        self.font_size_override = None;
-        self.apply_font_size(self.base_font_size);
-    }
-
-    fn apply_font_size(&mut self, size: f32) {
-        self.font_size_override = Some(size);
-        let profile = self.user_config.active();
-        if let Ok(fc) = FontContext::new(&profile.font.family, size * self.scale_factor) {
-            self.cell_w = fc.cell_width();
-            self.cell_h = fc.cell_height();
-            {
-                let mut renderer = self.renderer.lock().unwrap();
-                renderer.reload_font(&fc);
-            }
-            *self.font.lock().unwrap() = fc;
-            for tab in &mut self.tab_mgr.tabs {
-                for pane in tab.panes.values() {
-                    pane.dirty.store(true, std::sync::atomic::Ordering::Release);
-                    pane.cached.as_ref();
+                Action::ToggleReadOnly => {
+                    if let Some(pane) = self.tab_mgr.active_pane_mut() {
+                        pane.read_only = !pane.read_only;
+                    }
+                }
+                Action::SetTitle => {
+                    let current = self.tab_mgr.tabs[self.tab_mgr.active_tab].custom_title
+                        .clone()
+                        .unwrap_or_default();
+                    self.dialogs.title_dialog_buf = current;
+                    self.dialogs.title_dialog_open = true;
                 }
             }
         }
     }
+
 
     fn open_prefs(&mut self) {
         self.prefs.open(&self.user_config);
@@ -320,8 +380,8 @@ impl App {
             self.hotkey_changed = true;
         }
 
-        self.bindings = BindingTable::new(self.user_config.global.use_linux_keybindings);
-        self.bindings.apply_user(
+        self.input.bindings = BindingTable::new(self.user_config.global.use_linux_keybindings);
+        self.input.bindings.apply_user(
             &self
                 .user_config
                 .keybindings
@@ -342,8 +402,16 @@ impl App {
         let font_changed = profile.font.family != old_profile.font.family
             || (profile.font.size - old_profile.font.size).abs() > 0.001;
         if font_changed {
-            match self.reload_font(&profile.font.family, profile.font.size) {
-                Ok(()) => {}
+            match self.font.reload_font(&profile.font.family, profile.font.size, &self.render.renderer) {
+                Ok(()) => {
+                    let cell_w = self.font.cell_w;
+                    let cell_h = self.font.cell_h;
+                    for tab in &mut self.tab_mgr.tabs {
+                        for pane in tab.panes.values_mut() {
+                            pane.force_pty_resize(cell_w, cell_h);
+                        }
+                    }
+                }
                 Err(e) => {
                     self.prefs.status = Some(format!("Font reload failed: {e}"));
                 }
@@ -355,23 +423,8 @@ impl App {
                 pane.defaults = self.pane_defaults;
                 pane.dirty.store(true, std::sync::atomic::Ordering::Release);
                 pane.cached = None;
-                if font_changed {
-                    pane.cols = 0;
-                    pane.lines = 0;
-                }
             }
         }
-    }
-
-    fn reload_font(&mut self, family: &str, size: f32) -> Result<(), crossfont::Error> {
-        let new_font = FontContext::new(family, size * self.scale_factor)?;
-        let cell_w = new_font.cell_width();
-        let cell_h = new_font.cell_height();
-        self.renderer.lock().unwrap().reload_font(&new_font);
-        *self.font.lock().unwrap() = new_font;
-        self.cell_w = cell_w;
-        self.cell_h = cell_h;
-        Ok(())
     }
 
     pub(crate) fn draw_prefs_content(&mut self, ui: &mut egui::Ui) {
@@ -398,7 +451,7 @@ impl App {
 
     pub(crate) fn notify_focus(&self, focused: bool) {
         if let Some(tab) = self.tab_mgr.tabs.get(self.tab_mgr.active_tab) {
-            for pane in tab.panes.values() {
+            if let Some(pane) = tab.panes.get(&tab.focused) {
                 pane.send_focus_event(focused);
             }
         }
@@ -418,9 +471,9 @@ impl App {
             }
         }
         if self.tab_mgr.tabs.is_empty() || ctx.egui_wants_keyboard_input() {
-            self.pending_raw_keys.clear();
+            self.input.pending_raw_keys.clear();
         } else {
-            let raw_keys = std::mem::take(&mut self.pending_raw_keys);
+            let raw_keys = std::mem::take(&mut self.input.pending_raw_keys);
             let tab = self.tab_mgr.active_tab();
             let targets: Vec<&Pane> = if tab.broadcast {
                 tab.panes.values().filter(|p| !p.read_only).collect()
@@ -428,7 +481,7 @@ impl App {
                 tab.panes.get(&tab.focused).into_iter().filter(|p| !p.read_only).collect()
             };
             let scroll_on_keystroke = self.user_config.active().scroll_on_keystroke;
-            let actions = input::process_keys(ctx, &self.bindings, raw_keys, &targets, scroll_on_keystroke);
+            let actions = input::process_keys(ctx, &self.input.bindings, raw_keys, &targets, scroll_on_keystroke);
             self.execute_pane_actions(ctx, actions);
         }
     }
@@ -566,7 +619,7 @@ impl App {
         if let Some(i) = closed_tab {
             self.tab_mgr.close_tab(i, &self.egui_ctx, &mut self.dialogs);
         } else if let Some(i) = clicked_tab {
-            self.tab_mgr.active_tab = i;
+            self.tab_mgr.switch_tab_direct((i + 1) as u8);
         }
         if new_tab_requested {
             let factory = self.pane_factory();
@@ -577,17 +630,18 @@ impl App {
             if self.pending_zoom_steps != 0 {
                 let steps = self.pending_zoom_steps;
                 self.pending_zoom_steps = 0;
-                self.adjust_font_size(steps as f32);
+                let family = self.user_config.active().font.family.clone();
+                self.font.adjust_font_size(steps as f32, &self.render.renderer, &family, &mut self.tab_mgr);
             }
 
             let egui_ctx = self.egui_ctx.clone();
             let mut pv_ctx = PaneViewCtx {
                 tab_mgr: &mut self.tab_mgr,
-                cell_w: self.cell_w,
-                cell_h: self.cell_h,
-                font: &self.font,
-                renderer: &self.renderer,
-                cursor_blink_epoch: self.cursor_blink_epoch,
+                cell_w: self.font.cell_w,
+                cell_h: self.font.cell_h,
+                font: &self.font.ctx,
+                renderer: &self.render.renderer,
+                cursor_blink_epoch: self.input.cursor_blink_epoch,
                 user_config: &self.user_config,
                 egui_ctx: &egui_ctx,
                 dialogs: &mut self.dialogs,
@@ -598,41 +652,7 @@ impl App {
                 ui,
             );
 
-            let factory = self.pane_factory();
-            for action in deferred {
-                match action {
-                    PaneAction::SplitHorizontal => self.tab_mgr.split(Direction::Horizontal, &factory),
-                    PaneAction::SplitVertical => self.tab_mgr.split(Direction::Vertical, &factory),
-                    PaneAction::SplitAuto => {
-                        let dir = match self.pane_view.last_pane_rect {
-                            Some(r) if r.width() >= r.height() => Direction::Vertical,
-                            _ => Direction::Horizontal,
-                        };
-                        self.tab_mgr.split(dir, &factory);
-                    }
-                    PaneAction::Close => self.tab_mgr.close_focused(&self.egui_ctx, &mut self.dialogs),
-                    PaneAction::NewTab => self.tab_mgr.new_tab(&factory),
-                    PaneAction::OpenPrefs => self.open_prefs(),
-                    PaneAction::Copy => self.tab_mgr.copy_selection(&self.egui_ctx, self.user_config.active().smart_copy),
-                    PaneAction::Paste => self.tab_mgr.paste_from_clipboard(),
-                    PaneAction::ToggleReadOnly => {
-                        if let Some(pane) = self.tab_mgr.active_pane_mut() {
-                            pane.read_only = !pane.read_only;
-                        }
-                    }
-                    PaneAction::SetTitle => {
-                        let current = self.tab_mgr.tabs[self.tab_mgr.active_tab].custom_title
-                            .clone()
-                            .unwrap_or_default();
-                        self.dialogs.title_dialog_buf = current;
-                        self.dialogs.title_dialog_open = true;
-                    }
-                    PaneAction::ToggleZoom => self.tab_mgr.toggle_zoom(),
-                    PaneAction::ToggleBroadcast => self.tab_mgr.toggle_broadcast(),
-                    PaneAction::OpenTerminalHere => self.tab_mgr.split_here(self.pane_view.last_pane_rect, &factory),
-                    _ => {}
-                }
-            }
+            self.execute_pane_actions(ui.ctx(), deferred);
 
             if let Some(template) = self.pane_view.layout_restore_pending.take() {
                 let factory = self.pane_factory();

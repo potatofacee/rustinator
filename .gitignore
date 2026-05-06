@@ -2,6 +2,8 @@
 .codegraph/
 terminator/
 iTerm2/
+alacritty/
+docs/
 
 .DS_Store
 .claude/

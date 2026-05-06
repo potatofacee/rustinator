@@ -1,6 +1,8 @@
-use crate::keybindings::BindingTable;
+use winit::keyboard::{Key, NamedKey};
+use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
+
+use crate::keybindings::{Action, BindingTable};
 use crate::pane::Pane;
-use crate::tabs::{action_to_pane_action, PaneAction};
 
 pub(crate) struct RawTermKey {
     pub key: egui::Key,
@@ -14,19 +16,18 @@ pub(crate) fn process_keys(
     raw_keys: Vec<RawTermKey>,
     targets: &[&Pane],
     scroll_on_keystroke: bool,
-) -> Vec<PaneAction> {
-    let mut actions: Vec<PaneAction> = Vec::new();
+) -> Vec<Action> {
+    let mut actions: Vec<Action> = Vec::new();
 
     if targets.is_empty() {
         return actions;
     }
 
-    // Step 1: Check app bindings on raw keys, collecting consumed (key, mods) pairs.
     let consumed: Vec<bool> = raw_keys
         .iter()
         .map(|rk| {
             if let Some(action) = bindings.lookup(rk.key, rk.mods) {
-                actions.push(action_to_pane_action(action));
+                actions.push(action);
                 true
             } else {
                 false
@@ -34,8 +35,6 @@ pub(crate) fn process_keys(
         })
         .collect();
 
-    // Step 2: Drain matching Key events from egui so bound keys don't reach widgets.
-    // Also check egui-only key events for bindings (e.g. keys that only came through egui).
     ctx.input_mut(|i| {
         i.events.retain(|ev| {
             if let egui::Event::Key {
@@ -45,18 +44,7 @@ pub(crate) fn process_keys(
                 ..
             } = ev
             {
-                if let Some(action) = bindings.lookup(*key, *modifiers) {
-                    // Only add if not already found via raw keys to avoid duplicates.
-                    let already_matched = raw_keys.iter().zip(consumed.iter()).any(|(rk, &c)| {
-                        c && rk.key == *key
-                            && rk.mods.ctrl == modifiers.ctrl
-                            && rk.mods.alt == modifiers.alt
-                            && rk.mods.shift == modifiers.shift
-                            && rk.mods.mac_cmd == modifiers.mac_cmd
-                    });
-                    if !already_matched {
-                        actions.push(action_to_pane_action(action));
-                    }
+                if bindings.lookup(*key, *modifiers).is_some() {
                     return false;
                 }
             }
@@ -64,7 +52,6 @@ pub(crate) fn process_keys(
         });
     });
 
-    // Step 3: Scroll to bottom on any non-consumed input.
     let has_unconsumed = consumed.iter().any(|c| !c);
     if has_unconsumed && scroll_on_keystroke {
         for pane in targets {
@@ -72,7 +59,6 @@ pub(crate) fn process_keys(
         }
     }
 
-    // Step 4: Send all non-consumed raw keys to the terminal. No dedup, no has_text_event check.
     raw_keys
         .iter()
         .zip(consumed.iter())
@@ -83,9 +69,7 @@ pub(crate) fn process_keys(
             }
         });
 
-    // Step 5: Handle paste from egui events as fallback for OS-level paste
-    // that doesn't arrive as a raw key (e.g. middle-click paste on X11).
-    let handled_paste = actions.iter().any(|a| matches!(a, PaneAction::Paste));
+    let handled_paste = actions.iter().any(|a| matches!(a, Action::Paste));
     ctx.input(|i| {
         if !handled_paste {
             for event in &i.events {
@@ -98,8 +82,6 @@ pub(crate) fn process_keys(
         }
     });
 
-    // Step 6: Drain Text and pressed Key events from egui so they don't leak to
-    // widgets when the terminal has focus. This prevents the double-send.
     ctx.input_mut(|i| {
         i.events.retain(|ev| match ev {
             egui::Event::Text(_) => false,
@@ -110,4 +92,762 @@ pub(crate) fn process_keys(
     });
 
     actions
+}
+
+pub(crate) fn encode_raw_key(event: &winit::event::KeyEvent, modifiers: winit::event::Modifiers) -> Option<RawTermKey> {
+    if !event.state.is_pressed() {
+        return None;
+    }
+    let mods = winit_mods_to_egui(modifiers);
+    let state = modifiers.state();
+    let alt = state.alt_key();
+    let ctrl = state.control_key();
+    let shift = state.shift_key();
+
+    let egui_key = match &event.key_without_modifiers() {
+        Key::Character(c) => char_to_egui_key(c),
+        Key::Named(named) => named_to_egui_key(*named),
+        _ => None,
+    };
+
+    if let Key::Named(named) = &event.logical_key {
+        if let Some(bytes) = encode_named_key(*named, shift, alt, ctrl) {
+            return Some(RawTermKey {
+                key: egui_key.unwrap_or(egui::Key::Escape),
+                mods,
+                legacy_bytes: bytes,
+            });
+        }
+    }
+
+    if mods.mac_cmd {
+        return egui_key.map(|key| RawTermKey { key, mods, legacy_bytes: Vec::new() });
+    }
+
+    if let Some(text) = event.text_with_all_modifiers() {
+        if !text.is_empty() {
+            let egui_key = egui_key.unwrap_or(egui::Key::Space);
+            let mut bytes = text.as_bytes().to_vec();
+            if alt {
+                bytes.insert(0, 0x1b);
+            }
+            return Some(RawTermKey {
+                key: egui_key,
+                mods,
+                legacy_bytes: bytes,
+            });
+        }
+    }
+
+    if ctrl {
+        let unmod = event.key_without_modifiers();
+        let ctrl_byte: Option<u8> = match &unmod {
+            Key::Character(c) => match c.as_ref() {
+                "[" => Some(0x1b),
+                "\\" => Some(0x1c),
+                "]" => Some(0x1d),
+                "^" | "6" => Some(0x1e),
+                "_" | "-" => Some(0x1f),
+                "2" | "@" | " " => Some(0x00),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(b) = ctrl_byte {
+            let egui_key = egui_key?;
+            let mut bytes = vec![b];
+            if alt {
+                bytes.insert(0, 0x1b);
+            }
+            return Some(RawTermKey {
+                key: egui_key,
+                mods,
+                legacy_bytes: bytes,
+            });
+        }
+    }
+
+    egui_key.map(|key| RawTermKey {
+        key,
+        mods,
+        legacy_bytes: Vec::new(),
+    })
+}
+
+pub(crate) fn legacy_mod_param(shift: bool, alt: bool, ctrl: bool) -> u8 {
+    let mut m: u8 = 0;
+    if shift { m |= 1; }
+    if alt { m |= 2; }
+    if ctrl { m |= 4; }
+    1 + m
+}
+
+pub(crate) fn encode_named_key(named: NamedKey, shift: bool, alt: bool, ctrl: bool) -> Option<Vec<u8>> {
+    let has_mods = shift || alt || ctrl;
+
+    if named == NamedKey::Tab && shift && !alt && !ctrl {
+        return Some(b"\x1b[Z".to_vec());
+    }
+
+    if !has_mods {
+        let seq: &[u8] = match named {
+            NamedKey::Enter => b"\r",
+            NamedKey::Backspace => b"\x7f",
+            NamedKey::Tab => b"\t",
+            NamedKey::Escape => b"\x1b",
+            NamedKey::Space => b" ",
+            _ => &[],
+        };
+        if !seq.is_empty() {
+            return Some(seq.to_vec());
+        }
+    }
+
+    if alt && !ctrl {
+        let base: Option<u8> = match named {
+            NamedKey::Enter => Some(b'\r'),
+            NamedKey::Backspace => Some(0x7f),
+            NamedKey::Space => Some(b' '),
+            _ => None,
+        };
+        if let Some(b) = base {
+            return Some(vec![0x1b, b]);
+        }
+    }
+
+    let home_end: Option<u8> = match named {
+        NamedKey::Home => Some(b'H'),
+        NamedKey::End => Some(b'F'),
+        _ => None,
+    };
+    if let Some(fb) = home_end {
+        return if has_mods {
+            Some(format!("\x1b[1;{}{}", legacy_mod_param(shift, alt, ctrl), fb as char).into_bytes())
+        } else {
+            Some(vec![0x1b, b'O', fb])
+        };
+    }
+
+    let arrow: Option<u8> = match named {
+        NamedKey::ArrowUp => Some(b'A'),
+        NamedKey::ArrowDown => Some(b'B'),
+        NamedKey::ArrowRight => Some(b'C'),
+        NamedKey::ArrowLeft => Some(b'D'),
+        _ => None,
+    };
+    if let Some(fb) = arrow {
+        return if has_mods {
+            Some(format!("\x1b[1;{}{}", legacy_mod_param(shift, alt, ctrl), fb as char).into_bytes())
+        } else {
+            Some(vec![0x1b, b'[', fb])
+        };
+    }
+
+    let tilde_num: Option<u8> = match named {
+        NamedKey::Insert => Some(2),
+        NamedKey::Delete => Some(3),
+        NamedKey::PageUp => Some(5),
+        NamedKey::PageDown => Some(6),
+        _ => None,
+    };
+    if let Some(num) = tilde_num {
+        return if has_mods {
+            Some(format!("\x1b[{};{}~", num, legacy_mod_param(shift, alt, ctrl)).into_bytes())
+        } else {
+            Some(format!("\x1b[{}~", num).into_bytes())
+        };
+    }
+
+    let fkey: Option<(&[u8], u8)> = match named {
+        NamedKey::F1 => Some((b"\x1bOP", b'P')),
+        NamedKey::F2 => Some((b"\x1bOQ", b'Q')),
+        NamedKey::F3 => Some((b"\x1bOR", b'R')),
+        NamedKey::F4 => Some((b"\x1bOS", b'S')),
+        _ => None,
+    };
+    if let Some((unmod, fb)) = fkey {
+        return if has_mods {
+            Some(format!("\x1b[1;{}{}", legacy_mod_param(shift, alt, ctrl), fb as char).into_bytes())
+        } else {
+            Some(unmod.to_vec())
+        };
+    }
+    let fkey_tilde: Option<u8> = match named {
+        NamedKey::F5 => Some(15),
+        NamedKey::F6 => Some(17),
+        NamedKey::F7 => Some(18),
+        NamedKey::F8 => Some(19),
+        NamedKey::F9 => Some(20),
+        NamedKey::F10 => Some(21),
+        NamedKey::F11 => Some(23),
+        NamedKey::F12 => Some(24),
+        _ => None,
+    };
+    if let Some(num) = fkey_tilde {
+        return if has_mods {
+            Some(format!("\x1b[{};{}~", num, legacy_mod_param(shift, alt, ctrl)).into_bytes())
+        } else {
+            Some(format!("\x1b[{}~", num).into_bytes())
+        };
+    }
+
+    None
+}
+
+pub(crate) fn winit_mods_to_egui(mods: winit::event::Modifiers) -> egui::Modifiers {
+    let state = mods.state();
+    egui::Modifiers {
+        alt: state.alt_key(),
+        ctrl: state.control_key(),
+        shift: state.shift_key(),
+        mac_cmd: state.super_key(),
+        command: state.control_key() || state.super_key(),
+    }
+}
+
+pub(crate) fn char_to_egui_key(c: &str) -> Option<egui::Key> {
+    let ch = c.chars().next()?;
+    Some(match ch.to_ascii_lowercase() {
+        'a' => egui::Key::A, 'b' => egui::Key::B, 'c' => egui::Key::C,
+        'd' => egui::Key::D, 'e' => egui::Key::E, 'f' => egui::Key::F,
+        'g' => egui::Key::G, 'h' => egui::Key::H, 'i' => egui::Key::I,
+        'j' => egui::Key::J, 'k' => egui::Key::K, 'l' => egui::Key::L,
+        'm' => egui::Key::M, 'n' => egui::Key::N, 'o' => egui::Key::O,
+        'p' => egui::Key::P, 'q' => egui::Key::Q, 'r' => egui::Key::R,
+        's' => egui::Key::S, 't' => egui::Key::T, 'u' => egui::Key::U,
+        'v' => egui::Key::V, 'w' => egui::Key::W, 'x' => egui::Key::X,
+        'y' => egui::Key::Y, 'z' => egui::Key::Z,
+        '0' => egui::Key::Num0, '1' => egui::Key::Num1, '2' => egui::Key::Num2,
+        '3' => egui::Key::Num3, '4' => egui::Key::Num4, '5' => egui::Key::Num5,
+        '6' => egui::Key::Num6, '7' => egui::Key::Num7, '8' => egui::Key::Num8,
+        '9' => egui::Key::Num9,
+        '[' => egui::Key::OpenBracket, ']' => egui::Key::CloseBracket,
+        '\\' => egui::Key::Backslash, ';' => egui::Key::Semicolon,
+        '\'' => egui::Key::Quote, '`' => egui::Key::Backtick,
+        ',' => egui::Key::Comma, '.' => egui::Key::Period,
+        '/' => egui::Key::Slash, '-' => egui::Key::Minus, '=' => egui::Key::Equals,
+        _ => return None,
+    })
+}
+
+pub(crate) fn named_to_egui_key(named: NamedKey) -> Option<egui::Key> {
+    Some(match named {
+        NamedKey::Enter => egui::Key::Enter,
+        NamedKey::Tab => egui::Key::Tab,
+        NamedKey::Backspace => egui::Key::Backspace,
+        NamedKey::Escape => egui::Key::Escape,
+        NamedKey::Space => egui::Key::Space,
+        NamedKey::Delete => egui::Key::Delete,
+        NamedKey::Insert => egui::Key::Insert,
+        NamedKey::Home => egui::Key::Home,
+        NamedKey::End => egui::Key::End,
+        NamedKey::PageUp => egui::Key::PageUp,
+        NamedKey::PageDown => egui::Key::PageDown,
+        NamedKey::ArrowUp => egui::Key::ArrowUp,
+        NamedKey::ArrowDown => egui::Key::ArrowDown,
+        NamedKey::ArrowLeft => egui::Key::ArrowLeft,
+        NamedKey::ArrowRight => egui::Key::ArrowRight,
+        NamedKey::F1 => egui::Key::F1, NamedKey::F2 => egui::Key::F2,
+        NamedKey::F3 => egui::Key::F3, NamedKey::F4 => egui::Key::F4,
+        NamedKey::F5 => egui::Key::F5, NamedKey::F6 => egui::Key::F6,
+        NamedKey::F7 => egui::Key::F7, NamedKey::F8 => egui::Key::F8,
+        NamedKey::F9 => egui::Key::F9, NamedKey::F10 => egui::Key::F10,
+        NamedKey::F11 => egui::Key::F11, NamedKey::F12 => egui::Key::F12,
+        _ => return None,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mod_param_no_mods() {
+        assert_eq!(legacy_mod_param(false, false, false), 1);
+    }
+
+    #[test]
+    fn mod_param_shift() {
+        assert_eq!(legacy_mod_param(true, false, false), 2);
+    }
+
+    #[test]
+    fn mod_param_alt() {
+        assert_eq!(legacy_mod_param(false, true, false), 3);
+    }
+
+    #[test]
+    fn mod_param_ctrl() {
+        assert_eq!(legacy_mod_param(false, false, true), 5);
+    }
+
+    #[test]
+    fn mod_param_shift_alt_ctrl() {
+        assert_eq!(legacy_mod_param(true, true, true), 8);
+    }
+
+    #[test]
+    fn enter_unmodified() {
+        assert_eq!(encode_named_key(NamedKey::Enter, false, false, false).unwrap(), b"\r");
+    }
+
+    #[test]
+    fn backspace_unmodified() {
+        assert_eq!(encode_named_key(NamedKey::Backspace, false, false, false).unwrap(), b"\x7f");
+    }
+
+    #[test]
+    fn tab_unmodified() {
+        assert_eq!(encode_named_key(NamedKey::Tab, false, false, false).unwrap(), b"\t");
+    }
+
+    #[test]
+    fn escape_unmodified() {
+        assert_eq!(encode_named_key(NamedKey::Escape, false, false, false).unwrap(), b"\x1b");
+    }
+
+    #[test]
+    fn space_unmodified() {
+        assert_eq!(encode_named_key(NamedKey::Space, false, false, false).unwrap(), b" ");
+    }
+
+    #[test]
+    fn shift_tab_is_backtab() {
+        assert_eq!(encode_named_key(NamedKey::Tab, true, false, false).unwrap(), b"\x1b[Z");
+    }
+
+    #[test]
+    fn alt_enter() {
+        assert_eq!(encode_named_key(NamedKey::Enter, false, true, false).unwrap(), b"\x1b\r");
+    }
+
+    #[test]
+    fn alt_backspace() {
+        assert_eq!(encode_named_key(NamedKey::Backspace, false, true, false).unwrap(), b"\x1b\x7f");
+    }
+
+    #[test]
+    fn alt_space() {
+        assert_eq!(encode_named_key(NamedKey::Space, false, true, false).unwrap(), b"\x1b ");
+    }
+
+    #[test]
+    fn arrow_up() {
+        assert_eq!(encode_named_key(NamedKey::ArrowUp, false, false, false).unwrap(), b"\x1b[A");
+    }
+
+    #[test]
+    fn arrow_down() {
+        assert_eq!(encode_named_key(NamedKey::ArrowDown, false, false, false).unwrap(), b"\x1b[B");
+    }
+
+    #[test]
+    fn arrow_right() {
+        assert_eq!(encode_named_key(NamedKey::ArrowRight, false, false, false).unwrap(), b"\x1b[C");
+    }
+
+    #[test]
+    fn arrow_left() {
+        assert_eq!(encode_named_key(NamedKey::ArrowLeft, false, false, false).unwrap(), b"\x1b[D");
+    }
+
+    #[test]
+    fn home_unmodified() {
+        assert_eq!(encode_named_key(NamedKey::Home, false, false, false).unwrap(), b"\x1bOH");
+    }
+
+    #[test]
+    fn end_unmodified() {
+        assert_eq!(encode_named_key(NamedKey::End, false, false, false).unwrap(), b"\x1bOF");
+    }
+
+    #[test]
+    fn ctrl_arrow_up() {
+        assert_eq!(
+            encode_named_key(NamedKey::ArrowUp, false, false, true).unwrap(),
+            b"\x1b[1;5A"
+        );
+    }
+
+    #[test]
+    fn shift_arrow_left() {
+        assert_eq!(
+            encode_named_key(NamedKey::ArrowLeft, true, false, false).unwrap(),
+            b"\x1b[1;2D"
+        );
+    }
+
+    #[test]
+    fn alt_shift_arrow_right() {
+        assert_eq!(
+            encode_named_key(NamedKey::ArrowRight, true, true, false).unwrap(),
+            b"\x1b[1;4C"
+        );
+    }
+
+    #[test]
+    fn insert_unmodified() {
+        assert_eq!(encode_named_key(NamedKey::Insert, false, false, false).unwrap(), b"\x1b[2~");
+    }
+
+    #[test]
+    fn delete_unmodified() {
+        assert_eq!(encode_named_key(NamedKey::Delete, false, false, false).unwrap(), b"\x1b[3~");
+    }
+
+    #[test]
+    fn page_up_unmodified() {
+        assert_eq!(encode_named_key(NamedKey::PageUp, false, false, false).unwrap(), b"\x1b[5~");
+    }
+
+    #[test]
+    fn page_down_unmodified() {
+        assert_eq!(encode_named_key(NamedKey::PageDown, false, false, false).unwrap(), b"\x1b[6~");
+    }
+
+    #[test]
+    fn ctrl_delete() {
+        assert_eq!(
+            encode_named_key(NamedKey::Delete, false, false, true).unwrap(),
+            b"\x1b[3;5~"
+        );
+    }
+
+    #[test]
+    fn shift_page_up() {
+        assert_eq!(
+            encode_named_key(NamedKey::PageUp, true, false, false).unwrap(),
+            b"\x1b[5;2~"
+        );
+    }
+
+    #[test]
+    fn f1_unmodified() {
+        assert_eq!(encode_named_key(NamedKey::F1, false, false, false).unwrap(), b"\x1bOP");
+    }
+
+    #[test]
+    fn f2_unmodified() {
+        assert_eq!(encode_named_key(NamedKey::F2, false, false, false).unwrap(), b"\x1bOQ");
+    }
+
+    #[test]
+    fn f3_unmodified() {
+        assert_eq!(encode_named_key(NamedKey::F3, false, false, false).unwrap(), b"\x1bOR");
+    }
+
+    #[test]
+    fn f4_unmodified() {
+        assert_eq!(encode_named_key(NamedKey::F4, false, false, false).unwrap(), b"\x1bOS");
+    }
+
+    #[test]
+    fn shift_f1() {
+        assert_eq!(
+            encode_named_key(NamedKey::F1, true, false, false).unwrap(),
+            b"\x1b[1;2P"
+        );
+    }
+
+    #[test]
+    fn ctrl_f3() {
+        assert_eq!(
+            encode_named_key(NamedKey::F3, false, false, true).unwrap(),
+            b"\x1b[1;5R"
+        );
+    }
+
+    #[test]
+    fn f5_unmodified() {
+        assert_eq!(encode_named_key(NamedKey::F5, false, false, false).unwrap(), b"\x1b[15~");
+    }
+
+    #[test]
+    fn f6_unmodified() {
+        assert_eq!(encode_named_key(NamedKey::F6, false, false, false).unwrap(), b"\x1b[17~");
+    }
+
+    #[test]
+    fn f7_unmodified() {
+        assert_eq!(encode_named_key(NamedKey::F7, false, false, false).unwrap(), b"\x1b[18~");
+    }
+
+    #[test]
+    fn f8_unmodified() {
+        assert_eq!(encode_named_key(NamedKey::F8, false, false, false).unwrap(), b"\x1b[19~");
+    }
+
+    #[test]
+    fn f9_unmodified() {
+        assert_eq!(encode_named_key(NamedKey::F9, false, false, false).unwrap(), b"\x1b[20~");
+    }
+
+    #[test]
+    fn f10_unmodified() {
+        assert_eq!(encode_named_key(NamedKey::F10, false, false, false).unwrap(), b"\x1b[21~");
+    }
+
+    #[test]
+    fn f11_unmodified() {
+        assert_eq!(encode_named_key(NamedKey::F11, false, false, false).unwrap(), b"\x1b[23~");
+    }
+
+    #[test]
+    fn f12_unmodified() {
+        assert_eq!(encode_named_key(NamedKey::F12, false, false, false).unwrap(), b"\x1b[24~");
+    }
+
+    #[test]
+    fn alt_f12() {
+        assert_eq!(
+            encode_named_key(NamedKey::F12, false, true, false).unwrap(),
+            b"\x1b[24;3~"
+        );
+    }
+
+    #[test]
+    fn unknown_named_key() {
+        assert_eq!(encode_named_key(NamedKey::CapsLock, false, false, false), None);
+    }
+
+    #[test]
+    fn char_to_key_letter() {
+        assert_eq!(char_to_egui_key("a"), Some(egui::Key::A));
+        assert_eq!(char_to_egui_key("A"), Some(egui::Key::A));
+    }
+
+    #[test]
+    fn char_to_key_digit() {
+        assert_eq!(char_to_egui_key("5"), Some(egui::Key::Num5));
+    }
+
+    #[test]
+    fn char_to_key_punctuation() {
+        assert_eq!(char_to_egui_key("["), Some(egui::Key::OpenBracket));
+        assert_eq!(char_to_egui_key("]"), Some(egui::Key::CloseBracket));
+        assert_eq!(char_to_egui_key("/"), Some(egui::Key::Slash));
+        assert_eq!(char_to_egui_key("-"), Some(egui::Key::Minus));
+    }
+
+    #[test]
+    fn char_to_key_unknown() {
+        assert_eq!(char_to_egui_key("€"), None);
+    }
+
+    #[test]
+    fn named_to_egui_arrows() {
+        assert_eq!(named_to_egui_key(NamedKey::ArrowUp), Some(egui::Key::ArrowUp));
+        assert_eq!(named_to_egui_key(NamedKey::ArrowDown), Some(egui::Key::ArrowDown));
+    }
+
+    #[test]
+    fn named_to_egui_fkeys() {
+        assert_eq!(named_to_egui_key(NamedKey::F1), Some(egui::Key::F1));
+        assert_eq!(named_to_egui_key(NamedKey::F12), Some(egui::Key::F12));
+    }
+
+    #[test]
+    fn named_to_egui_unknown() {
+        assert_eq!(named_to_egui_key(NamedKey::CapsLock), None);
+    }
+
+    #[test]
+    fn mod_param_shift_alt() {
+        assert_eq!(legacy_mod_param(true, true, false), 4);
+    }
+
+    #[test]
+    fn mod_param_shift_ctrl() {
+        assert_eq!(legacy_mod_param(true, false, true), 6);
+    }
+
+    #[test]
+    fn mod_param_alt_ctrl() {
+        assert_eq!(legacy_mod_param(false, true, true), 7);
+    }
+
+    #[test]
+    fn alt_arrow_up() {
+        assert_eq!(
+            encode_named_key(NamedKey::ArrowUp, false, true, false).unwrap(),
+            b"\x1b[1;3A"
+        );
+    }
+
+    #[test]
+    fn ctrl_alt_arrow_down() {
+        assert_eq!(
+            encode_named_key(NamedKey::ArrowDown, false, true, true).unwrap(),
+            b"\x1b[1;7B"
+        );
+    }
+
+    #[test]
+    fn shift_ctrl_arrow_right() {
+        assert_eq!(
+            encode_named_key(NamedKey::ArrowRight, true, false, true).unwrap(),
+            b"\x1b[1;6C"
+        );
+    }
+
+    #[test]
+    fn shift_alt_ctrl_arrow_left() {
+        assert_eq!(
+            encode_named_key(NamedKey::ArrowLeft, true, true, true).unwrap(),
+            b"\x1b[1;8D"
+        );
+    }
+
+    #[test]
+    fn ctrl_home() {
+        assert_eq!(
+            encode_named_key(NamedKey::Home, false, false, true).unwrap(),
+            b"\x1b[1;5H"
+        );
+    }
+
+    #[test]
+    fn shift_end() {
+        assert_eq!(
+            encode_named_key(NamedKey::End, true, false, false).unwrap(),
+            b"\x1b[1;2F"
+        );
+    }
+
+    #[test]
+    fn alt_insert() {
+        assert_eq!(
+            encode_named_key(NamedKey::Insert, false, true, false).unwrap(),
+            b"\x1b[2;3~"
+        );
+    }
+
+    #[test]
+    fn shift_ctrl_delete() {
+        assert_eq!(
+            encode_named_key(NamedKey::Delete, true, false, true).unwrap(),
+            b"\x1b[3;6~"
+        );
+    }
+
+    #[test]
+    fn alt_page_down() {
+        assert_eq!(
+            encode_named_key(NamedKey::PageDown, false, true, false).unwrap(),
+            b"\x1b[6;3~"
+        );
+    }
+
+    #[test]
+    fn alt_f1() {
+        assert_eq!(
+            encode_named_key(NamedKey::F1, false, true, false).unwrap(),
+            b"\x1b[1;3P"
+        );
+    }
+
+    #[test]
+    fn ctrl_alt_f4() {
+        assert_eq!(
+            encode_named_key(NamedKey::F4, false, true, true).unwrap(),
+            b"\x1b[1;7S"
+        );
+    }
+
+    #[test]
+    fn shift_f5() {
+        assert_eq!(
+            encode_named_key(NamedKey::F5, true, false, false).unwrap(),
+            b"\x1b[15;2~"
+        );
+    }
+
+    #[test]
+    fn ctrl_f9() {
+        assert_eq!(
+            encode_named_key(NamedKey::F9, false, false, true).unwrap(),
+            b"\x1b[20;5~"
+        );
+    }
+
+    #[test]
+    fn shift_alt_ctrl_f12() {
+        assert_eq!(
+            encode_named_key(NamedKey::F12, true, true, true).unwrap(),
+            b"\x1b[24;8~"
+        );
+    }
+
+    #[test]
+    fn ctrl_tab_returns_none() {
+        assert_eq!(encode_named_key(NamedKey::Tab, false, false, true), None);
+    }
+
+    #[test]
+    fn alt_tab_returns_none() {
+        assert_eq!(encode_named_key(NamedKey::Tab, false, true, false), None);
+    }
+
+    #[test]
+    fn ctrl_enter_returns_none() {
+        assert_eq!(encode_named_key(NamedKey::Enter, false, false, true), None);
+    }
+
+    #[test]
+    fn shift_enter_returns_none() {
+        assert_eq!(encode_named_key(NamedKey::Enter, true, false, false), None);
+    }
+
+    #[test]
+    fn ctrl_backspace_returns_none() {
+        assert_eq!(encode_named_key(NamedKey::Backspace, false, false, true), None);
+    }
+
+    #[test]
+    fn shift_escape_returns_none() {
+        assert_eq!(encode_named_key(NamedKey::Escape, true, false, false), None);
+    }
+
+    #[test]
+    fn ctrl_space_returns_none() {
+        assert_eq!(encode_named_key(NamedKey::Space, false, false, true), None);
+    }
+
+    #[test]
+    fn char_to_key_all_punct() {
+        assert_eq!(char_to_egui_key("\\"), Some(egui::Key::Backslash));
+        assert_eq!(char_to_egui_key(";"), Some(egui::Key::Semicolon));
+        assert_eq!(char_to_egui_key("'"), Some(egui::Key::Quote));
+        assert_eq!(char_to_egui_key("`"), Some(egui::Key::Backtick));
+        assert_eq!(char_to_egui_key(","), Some(egui::Key::Comma));
+        assert_eq!(char_to_egui_key("."), Some(egui::Key::Period));
+        assert_eq!(char_to_egui_key("="), Some(egui::Key::Equals));
+    }
+
+    #[test]
+    fn char_to_key_empty_string() {
+        assert_eq!(char_to_egui_key(""), None);
+    }
+
+    #[test]
+    fn char_to_key_multi_char_uses_first() {
+        assert_eq!(char_to_egui_key("abc"), Some(egui::Key::A));
+    }
+
+    #[test]
+    fn named_to_egui_enter_tab_space() {
+        assert_eq!(named_to_egui_key(NamedKey::Enter), Some(egui::Key::Enter));
+        assert_eq!(named_to_egui_key(NamedKey::Tab), Some(egui::Key::Tab));
+        assert_eq!(named_to_egui_key(NamedKey::Space), Some(egui::Key::Space));
+    }
+
+    #[test]
+    fn named_to_egui_navigation() {
+        assert_eq!(named_to_egui_key(NamedKey::Home), Some(egui::Key::Home));
+        assert_eq!(named_to_egui_key(NamedKey::End), Some(egui::Key::End));
+        assert_eq!(named_to_egui_key(NamedKey::PageUp), Some(egui::Key::PageUp));
+        assert_eq!(named_to_egui_key(NamedKey::PageDown), Some(egui::Key::PageDown));
+        assert_eq!(named_to_egui_key(NamedKey::Insert), Some(egui::Key::Insert));
+        assert_eq!(named_to_egui_key(NamedKey::Delete), Some(egui::Key::Delete));
+    }
 }

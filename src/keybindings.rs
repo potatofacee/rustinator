@@ -50,6 +50,9 @@ pub enum Action {
     SplitAuto,
     ToggleScrollbar,
     HideWindow,
+    ToggleReadOnly,
+    SetTitle,
+    OpenTerminalHere,
 }
 
 impl Action {
@@ -105,6 +108,9 @@ impl Action {
             "split_auto" => Action::SplitAuto,
             "toggle_scrollbar" => Action::ToggleScrollbar,
             "hide_window" => Action::HideWindow,
+            "toggle_read_only" => Action::ToggleReadOnly,
+            "set_title" => Action::SetTitle,
+            "open_terminal_here" => Action::OpenTerminalHere,
             _ => return None,
         })
     }
@@ -138,7 +144,7 @@ impl BindingTable {
     pub fn new(force_linux: bool) -> Self {
         let mut t = Self { map: HashMap::new() };
         for (combo, action) in defaults_for_platform(force_linux) {
-            if let Some(parsed) = parse_combo(combo) {
+            if let Some(parsed) = parse_combo(&combo) {
                 t.map.insert(parsed, action);
             }
         }
@@ -166,7 +172,7 @@ impl BindingTable {
     }
 }
 
-pub fn defaults_for_platform(force_linux: bool) -> Vec<(&'static str, Action)> {
+pub fn defaults_for_platform(force_linux: bool) -> Vec<(String, Action)> {
     if cfg!(target_os = "macos") && !force_linux {
         macos_defaults()
     } else {
@@ -174,90 +180,90 @@ pub fn defaults_for_platform(force_linux: bool) -> Vec<(&'static str, Action)> {
     }
 }
 
-fn macos_defaults() -> Vec<(&'static str, Action)> {
-    let mut v: Vec<(&'static str, Action)> = linux_defaults()
+fn macos_defaults() -> Vec<(String, Action)> {
+    let mut v: Vec<(String, Action)> = linux_defaults()
         .into_iter()
         .filter(|(combo, _)| !combo.starts_with("Super+"))
         .map(|(combo, action)| {
             let mac_combo = combo.replace("Ctrl+", "Cmd+");
-            (Box::leak(mac_combo.into_boxed_str()) as &'static str, action)
+            (mac_combo, action)
         })
         .collect();
-    v.push(("Cmd+C", Action::Copy));
-    v.push(("Cmd+V", Action::Paste));
+    v.push(("Cmd+C".into(), Action::Copy));
+    v.push(("Cmd+V".into(), Action::Paste));
     v
 }
 
-fn linux_defaults() -> Vec<(&'static str, Action)> {
+fn linux_defaults() -> Vec<(String, Action)> {
     vec![
         // ── Creation & destruction ───────────────────────────────────
-        ("Ctrl+Shift+O", Action::SplitHorizontal),   // split_horiz
-        ("Ctrl+Shift+E", Action::SplitVertical),      // split_vert
-        ("Ctrl+Shift+A", Action::SplitAuto),
-        ("Ctrl+Shift+W", Action::ClosePane),          // close_term
-        ("Ctrl+Shift+Q", Action::CloseWindow),        // close_window
-        ("Ctrl+Shift+T", Action::NewTab),             // new_tab
-        ("Ctrl+Shift+I", Action::NewWindow),          // new_window
+        ("Ctrl+Shift+O".into(), Action::SplitHorizontal),   // split_horiz
+        ("Ctrl+Shift+E".into(), Action::SplitVertical),      // split_vert
+        ("Ctrl+Shift+A".into(), Action::SplitAuto),
+        ("Ctrl+Shift+W".into(), Action::ClosePane),          // close_term
+        ("Ctrl+Shift+Q".into(), Action::CloseWindow),        // close_window
+        ("Ctrl+Shift+T".into(), Action::NewTab),             // new_tab
+        ("Ctrl+Shift+I".into(), Action::NewWindow),          // new_window
         // ("Super+I", Action::NewTerminator),         // new_terminator — not implemented
         // ("Alt+L", Action::LayoutLauncher),          // layout_launcher — not implemented
 
         // ── Navigation (focus) ───────────────────────────────────────
-        ("Ctrl+Tab", Action::FocusNext),              // cycle_next
-        ("Ctrl+Shift+Tab", Action::FocusPrev),        // cycle_prev
-        ("Ctrl+Shift+N", Action::GoNext),             // go_next
-        ("Ctrl+Shift+P", Action::GoPrev),             // go_prev
-        ("Alt+Up", Action::GoUp),                     // go_up
-        ("Alt+Down", Action::GoDown),                 // go_down
-        ("Alt+Left", Action::GoLeft),                 // go_left
-        ("Alt+Right", Action::GoRight),               // go_right
+        ("Ctrl+Tab".into(), Action::FocusNext),              // cycle_next
+        ("Ctrl+Shift+Tab".into(), Action::FocusPrev),        // cycle_prev
+        ("Ctrl+Shift+N".into(), Action::GoNext),             // go_next
+        ("Ctrl+Shift+P".into(), Action::GoPrev),             // go_prev
+        ("Alt+Up".into(), Action::GoUp),                     // go_up
+        ("Alt+Down".into(), Action::GoDown),                 // go_down
+        ("Alt+Left".into(), Action::GoLeft),                 // go_left
+        ("Alt+Right".into(), Action::GoRight),               // go_right
 
         // ── Tab management ───────────────────────────────────────────
-        ("Ctrl+PageDown", Action::NextTab),           // next_tab
-        ("Ctrl+PageUp", Action::PrevTab),             // prev_tab
-        ("Ctrl+Shift+PageDown", Action::MoveTabRight),
-        ("Ctrl+Shift+PageUp", Action::MoveTabLeft),
+        ("Ctrl+PageDown".into(), Action::NextTab),           // next_tab
+        ("Ctrl+PageUp".into(), Action::PrevTab),             // prev_tab
+        ("Ctrl+Shift+PageDown".into(), Action::MoveTabRight),
+        ("Ctrl+Shift+PageUp".into(), Action::MoveTabLeft),
         // switch_to_tab_1..10 — unbound by default in Terminator
 
         // ── Resize ───────────────────────────────────────────────────
-        ("Ctrl+Shift+Up", Action::ResizeUp),          // resize_up
-        ("Ctrl+Shift+Down", Action::ResizeDown),      // resize_down
-        ("Ctrl+Shift+Left", Action::ResizeLeft),      // resize_left
-        ("Ctrl+Shift+Right", Action::ResizeRight),    // resize_right
-        ("Super+R", Action::RotateCW),
-        ("Super+Shift+R", Action::RotateCCW),
+        ("Ctrl+Shift+Up".into(), Action::ResizeUp),          // resize_up
+        ("Ctrl+Shift+Down".into(), Action::ResizeDown),      // resize_down
+        ("Ctrl+Shift+Left".into(), Action::ResizeLeft),      // resize_left
+        ("Ctrl+Shift+Right".into(), Action::ResizeRight),    // resize_right
+        ("Super+R".into(), Action::RotateCW),
+        ("Super+Shift+R".into(), Action::RotateCCW),
 
         // ── Zoom & fullscreen ────────────────────────────────────────
-        ("F11", Action::ToggleFullscreen),             // full_screen
-        ("Ctrl+Shift+X", Action::ToggleZoom),          // toggle_zoom
+        ("F11".into(), Action::ToggleFullscreen),             // full_screen
+        ("Ctrl+Shift+X".into(), Action::ToggleZoom),          // toggle_zoom
         // ("Ctrl+Shift+Z", Action::ScaledZoom),       // scaled_zoom — not implemented
-        ("Ctrl+Shift+Alt+A", Action::HideWindow),
-        ("Ctrl+Equals", Action::ZoomIn),               // zoom_in (Ctrl+Plus)
-        ("Ctrl+Shift+Equals", Action::ZoomIn),         // zoom_in (shifted = literal +)
-        ("Ctrl+Minus", Action::ZoomOut),                // zoom_out
-        ("Ctrl+0", Action::ZoomReset),                  // zoom_normal
+        ("Ctrl+Shift+Alt+A".into(), Action::HideWindow),
+        ("Ctrl+Equals".into(), Action::ZoomIn),               // zoom_in (Ctrl+Plus)
+        ("Ctrl+Shift+Equals".into(), Action::ZoomIn),         // zoom_in (shifted = literal +)
+        ("Ctrl+Minus".into(), Action::ZoomOut),                // zoom_out
+        ("Ctrl+0".into(), Action::ZoomReset),                  // zoom_normal
         // ("", Action::ZoomInAll),                     // zoom_in_all — not implemented
         // ("", Action::ZoomOutAll),                    // zoom_out_all — not implemented
         // ("", Action::ZoomResetAll),                  // zoom_normal_all — not implemented
 
         // ── Clipboard ────────────────────────────────────────────────
-        ("Ctrl+Shift+C", Action::Copy),                // copy
-        ("Ctrl+Shift+V", Action::Paste),               // paste
+        ("Ctrl+Shift+C".into(), Action::Copy),                // copy
+        ("Ctrl+Shift+V".into(), Action::Paste),               // paste
         // ("", Action::PasteSelection),               // paste_selection — not implemented
 
         // ── Search ───────────────────────────────────────────────────
-        ("Ctrl+Shift+F", Action::ToggleSearch),        // search
+        ("Ctrl+Shift+F".into(), Action::ToggleSearch),        // search
 
         // ── Terminal reset ───────────────────────────────────────────
-        ("Ctrl+Shift+R", Action::ResetTerminal),       // reset
-        ("Ctrl+Shift+G", Action::ResetClear),          // reset_clear
+        ("Ctrl+Shift+R".into(), Action::ResetTerminal),       // reset
+        ("Ctrl+Shift+G".into(), Action::ResetClear),          // reset_clear
 
         // ── Scrollbar & profiles ─────────────────────────────────────
-        ("Ctrl+Shift+S", Action::ToggleScrollbar),
+        ("Ctrl+Shift+S".into(), Action::ToggleScrollbar),
         // ("", Action::NextProfile),                   // next_profile — not implemented
         // ("", Action::PreviousProfile),               // previous_profile — not implemented
 
         // ── Grouping & broadcasting ──────────────────────────────────
-        ("Ctrl+Shift+B", Action::ToggleBroadcast),     // (rustinator toggle — Terminator uses separate scopes)
+        ("Ctrl+Shift+B".into(), Action::ToggleBroadcast),     // (rustinator toggle — Terminator uses separate scopes)
         // ("Super+G", Action::GroupAll),               // group_all — not implemented
         // ("Super+Shift+G", Action::UngroupAll),       // ungroup_all — not implemented
         // ("Super+T", Action::GroupTab),               // group_tab — not implemented
@@ -375,14 +381,14 @@ mod tests {
     #[test]
     fn linux_defaults_all_parse() {
         for (combo, _) in linux_defaults() {
-            assert!(parse_combo(combo).is_some(), "failed: {combo}");
+            assert!(parse_combo(&combo).is_some(), "failed: {combo}");
         }
     }
 
     #[test]
     fn macos_defaults_all_parse() {
         for (combo, _) in macos_defaults() {
-            assert!(parse_combo(combo).is_some(), "failed: {combo}");
+            assert!(parse_combo(&combo).is_some(), "failed: {combo}");
         }
     }
 
@@ -563,7 +569,7 @@ mod tests {
     fn mac_table() -> BindingTable {
         let mut t = BindingTable { map: HashMap::new() };
         for (combo, action) in macos_defaults() {
-            if let Some(parsed) = parse_combo(combo) {
+            if let Some(parsed) = parse_combo(&combo) {
                 t.map.insert(parsed, action);
             }
         }
