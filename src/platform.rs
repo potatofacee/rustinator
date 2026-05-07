@@ -5,6 +5,7 @@ fn macos_screen_insets(window: &Window) -> Option<(f64, f64, f64, f64)> {
     use objc2::MainThreadMarker;
     use objc2::runtime::AnyObject;
     use objc2_app_kit::NSScreen;
+    use raw_window_handle::HasWindowHandle as _;
 
     let (full, visible) = unsafe {
         let mut result = None;
