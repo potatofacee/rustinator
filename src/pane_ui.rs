@@ -15,6 +15,7 @@ use crate::tabs::{TabManager, PANE_GAP};
 
 const FOCUS_BORDER: f32 = 1.0;
 const PANE_TITLE_HEIGHT: f32 = 20.0;
+const CURSOR_BLINK_INTERVAL_MS: u128 = 530;
 
 pub(crate) struct PaneViewState {
     pub drag_source_pane: Option<PaneId>,
@@ -658,14 +659,10 @@ fn paint_pane(
     let should_blink = cursor_blink_enabled || frame.cursor_blink_requested;
     let blink_off = should_blink
         && focused
-        && (blink_elapsed.as_millis() / 530) % 2 == 1;
+        && (blink_elapsed.as_millis() / CURSOR_BLINK_INTERVAL_MS) % 2 == 1;
 
-    // Schedule the next cursor blink repaint only when this pane is focused
-    // and blinking is active. This avoids continuously repainting when idle.
     if focused && should_blink && frame.cursor.is_some() {
-        let elapsed_ms = blink_elapsed.as_millis() as u64;
-        let next_toggle = 530 - (elapsed_ms % 530);
-        ui.ctx().request_repaint_after(std::time::Duration::from_millis(next_toggle));
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(CURSOR_BLINK_INTERVAL_MS as u64));
     }
 
     let cursor_override = match frame.cursor {

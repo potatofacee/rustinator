@@ -116,6 +116,12 @@ impl GlWindow {
         self.egui_winit
             .handle_platform_output(&self.window, full_output.platform_output);
 
+        if let Some(vp_out) = full_output.viewport_output.get(&self.egui_ctx.viewport_id()) {
+            if vp_out.repaint_delay.is_zero() {
+                self.window.request_redraw();
+            }
+        }
+
         let screen_size: [u32; 2] = self.window.inner_size().into();
         let pixels_per_point = egui_winit::pixels_per_point(&self.egui_ctx, &self.window);
 

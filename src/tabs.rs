@@ -47,7 +47,6 @@ pub(crate) enum FocusDir {
 pub(crate) struct PaneFactory {
     pub cell_w: f32,
     pub cell_h: f32,
-    pub egui_ctx: egui::Context,
     pub term_config: TermConfig,
     pub pane_defaults: PaneDefaults,
     pub event_loop_proxy: EventLoopProxy<crate::window::UserEvent>,
@@ -100,7 +99,6 @@ impl TabManager {
             lines,
             factory.cell_w,
             factory.cell_h,
-            factory.egui_ctx.clone(),
             factory.term_config.clone(),
             factory.pane_defaults,
             Some(factory.event_loop_proxy.clone()),
@@ -566,7 +564,6 @@ impl TabManager {
                             if pane.respawn(
                                 factory.cell_w,
                                 factory.cell_h,
-                                factory.egui_ctx.clone(),
                                 factory.term_config.clone(),
                                 Some(factory.event_loop_proxy.clone()),
                             ).is_err() {

@@ -122,7 +122,6 @@ fn resolve_color(
 
 #[derive(Clone)]
 pub struct EventProxy {
-    pub ctx: egui::Context,
     pub dirty: Arc<AtomicBool>,
     pub exited: Arc<AtomicBool>,
     pub title: Arc<Mutex<Option<String>>>,
@@ -131,11 +130,9 @@ pub struct EventProxy {
 
 impl EventProxy {
     pub fn new(
-        ctx: egui::Context,
         winit_proxy: Option<winit::event_loop::EventLoopProxy<crate::window::UserEvent>>,
     ) -> Self {
         Self {
-            ctx,
             dirty: Arc::new(AtomicBool::new(true)),
             exited: Arc::new(AtomicBool::new(false)),
             title: Arc::new(Mutex::new(None)),
@@ -144,7 +141,6 @@ impl EventProxy {
     }
 
     fn wake(&self) {
-        self.ctx.request_repaint();
         if let Some(proxy) = &self.winit_proxy {
             let _ = proxy.send_event(crate::window::UserEvent::Repaint);
         }
@@ -333,13 +329,12 @@ impl Pane {
         lines: usize,
         cell_w: f32,
         cell_h: f32,
-        ctx: egui::Context,
         term_config: Config,
         defaults: PaneDefaults,
         winit_proxy: Option<winit::event_loop::EventLoopProxy<crate::window::UserEvent>>,
         working_dir: Option<&std::path::Path>,
     ) -> Result<Self, String> {
-        let proxy = EventProxy::new(ctx, winit_proxy);
+        let proxy = EventProxy::new(winit_proxy);
         let dirty = Arc::clone(&proxy.dirty);
         let exited = Arc::clone(&proxy.exited);
         let title = Arc::clone(&proxy.title);
@@ -400,11 +395,10 @@ impl Pane {
         &mut self,
         cell_w: f32,
         cell_h: f32,
-        ctx: egui::Context,
         term_config: Config,
         winit_proxy: Option<winit::event_loop::EventLoopProxy<crate::window::UserEvent>>,
     ) -> Result<(), String> {
-        let proxy = EventProxy::new(ctx, winit_proxy);
+        let proxy = EventProxy::new(winit_proxy);
         let dirty = Arc::clone(&proxy.dirty);
         let exited = Arc::clone(&proxy.exited);
         let title = Arc::clone(&proxy.title);
