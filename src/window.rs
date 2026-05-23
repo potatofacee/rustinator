@@ -584,9 +584,6 @@ impl ApplicationHandler<UserEvent> for WinitApp {
                 gl_state.window.request_redraw();
             }
         }
-        if let Some(prefs) = &self.prefs {
-            prefs.gl_window.window.request_redraw();
-        }
         if let Some(hk) = &self.hotkey_window {
             if hk.shown_at.is_some() {
                 hk.gl_window.window.request_redraw();

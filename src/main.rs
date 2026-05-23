@@ -142,7 +142,6 @@ impl App {
         PaneFactory {
             cell_w: self.font.cell_w,
             cell_h: self.font.cell_h,
-            egui_ctx: self.egui_ctx.clone(),
             term_config: self.term_config.clone(),
             pane_defaults: self.pane_defaults,
             event_loop_proxy: self.event_loop_proxy.clone(),
@@ -209,7 +208,6 @@ impl App {
             tabs::INITIAL_LINES as usize,
             cell_w,
             cell_h,
-            egui_ctx.clone(),
             term_config.clone(),
             pane_defaults,
             Some(event_loop_proxy.clone()),
