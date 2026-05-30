@@ -632,13 +632,18 @@ impl WinitApp {
             self.egui_ctx.set_global_style(style);
         }
 
+        // When the hotkey dropdown is open it owns keyboard/input processing, so
+        // the main window must not also run `app.logic` (that would drain the
+        // shared pending-key queue out from under the hotkey window). It MUST,
+        // however, keep running `app.ui` so the main window continues to paint
+        // its terminal content instead of going blank while the dropdown is up.
         let hotkey_visible = self.hotkey_window.as_ref()
             .is_some_and(|hk| hk.shown_at.is_some());
         let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
             if !hotkey_visible {
                 app.logic(ui.ctx());
-                app.ui(ui);
             }
+            app.ui(ui);
         });
 
         egui_winit.handle_platform_output(&gl_state.window, full_output.platform_output);

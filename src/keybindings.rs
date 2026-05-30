@@ -184,14 +184,54 @@ fn macos_defaults() -> Vec<(String, Action)> {
     let mut v: Vec<(String, Action)> = linux_defaults()
         .into_iter()
         .filter(|(combo, _)| !combo.starts_with("Super+"))
-        .map(|(combo, action)| {
-            let mac_combo = combo.replace("Ctrl+", "Cmd+");
-            (mac_combo, action)
-        })
+        .map(|(combo, action)| (ctrl_to_cmd(&combo), action))
         .collect();
     v.push(("Cmd+C".into(), Action::Copy));
     v.push(("Cmd+V".into(), Action::Paste));
     v
+}
+
+/// Convert a Linux/Windows-style combo to its macOS equivalent by mapping the
+/// `Ctrl` modifier to `Cmd` at the *structured* level rather than via string
+/// substitution.
+///
+/// We tokenize the combo on `+`, identify which tokens are modifiers (matching
+/// the same vocabulary `parse_combo` accepts), and rewrite only a `Ctrl`/
+/// `Control` modifier token to `Cmd`. The final (non-modifier) token is the key
+/// and is never touched — so a key whose name happens to contain "Ctrl" cannot
+/// be mangled, and multi-modifier combos (e.g. `Ctrl+Shift+T`, `Ctrl+Shift+Alt+A`)
+/// convert correctly because each modifier is handled independently.
+///
+/// If the combo doesn't parse into a recognizable shape, it is returned
+/// unchanged so it can later be reported by `parse_combo`'s error path.
+fn ctrl_to_cmd(combo: &str) -> String {
+    let parts: Vec<&str> = combo
+        .split('+')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .collect();
+    if parts.is_empty() {
+        return combo.to_string();
+    }
+    let last = parts.len() - 1;
+    let converted: Vec<String> = parts
+        .iter()
+        .enumerate()
+        .map(|(i, part)| {
+            // Only the modifier slots (everything before the final key token)
+            // are candidates for remapping.
+            if i != last && is_ctrl_modifier(part) {
+                "Cmd".to_string()
+            } else {
+                part.to_string()
+            }
+        })
+        .collect();
+    converted.join("+")
+}
+
+fn is_ctrl_modifier(token: &str) -> bool {
+    matches!(token.to_ascii_lowercase().as_str(), "ctrl" | "control")
 }
 
 fn linux_defaults() -> Vec<(String, Action)> {
@@ -649,6 +689,70 @@ mod tests {
     #[test]
     fn mac_cmd_tab_focus_next() {
         assert_eq!(mac_cmd(egui::Key::Tab), Some(Action::FocusNext));
+    }
+
+    // ── Ctrl→Cmd structured conversion ───────────────────────────────
+
+    #[test]
+    fn ctrl_to_cmd_single_modifier() {
+        assert_eq!(ctrl_to_cmd("Ctrl+C"), "Cmd+C");
+    }
+
+    #[test]
+    fn ctrl_to_cmd_multi_modifier() {
+        // The flagged failure mode: multi-modifier combos must convert the
+        // Ctrl modifier while leaving every other modifier and the key intact.
+        assert_eq!(ctrl_to_cmd("Ctrl+Shift+T"), "Cmd+Shift+T");
+        assert_eq!(ctrl_to_cmd("Ctrl+Alt+X"), "Cmd+Alt+X");
+        assert_eq!(ctrl_to_cmd("Ctrl+Shift+Alt+A"), "Cmd+Shift+Alt+A");
+    }
+
+    #[test]
+    fn ctrl_to_cmd_control_spelling() {
+        assert_eq!(ctrl_to_cmd("Control+Shift+T"), "Cmd+Shift+T");
+    }
+
+    #[test]
+    fn ctrl_to_cmd_case_insensitive_modifier() {
+        assert_eq!(ctrl_to_cmd("ctrl+shift+t"), "Cmd+shift+t");
+    }
+
+    #[test]
+    fn ctrl_to_cmd_leaves_non_ctrl_combos_untouched() {
+        assert_eq!(ctrl_to_cmd("Alt+Up"), "Alt+Up");
+        assert_eq!(ctrl_to_cmd("F11"), "F11");
+        assert_eq!(ctrl_to_cmd("Shift+Tab"), "Shift+Tab");
+    }
+
+    #[test]
+    fn ctrl_to_cmd_does_not_mangle_key_token() {
+        // The key is always the final token and must never be remapped, even if
+        // its (hypothetical) name contained the substring "ctrl". This guards
+        // against the substring-replacement bug that motivated the refactor.
+        assert_eq!(ctrl_to_cmd("Shift+Ctrl"), "Shift+Ctrl");
+        assert_eq!(ctrl_to_cmd("Ctrl"), "Ctrl");
+    }
+
+    #[test]
+    fn ctrl_to_cmd_result_parses_to_cmd_modifier() {
+        // End-to-end: a converted multi-modifier combo parses into the expected
+        // structured modifiers (mac_cmd set, ctrl cleared, shift preserved).
+        let (mods, key) = parse_combo(&ctrl_to_cmd("Ctrl+Shift+T")).unwrap();
+        assert!(mods.mac_cmd && mods.shift && !mods.ctrl && !mods.alt);
+        assert_eq!(key, egui::Key::T);
+    }
+
+    #[test]
+    fn mac_multi_modifier_combo_looks_up_via_cmd() {
+        // The real default Ctrl+Shift+Alt+A (HideWindow) must be reachable on
+        // macOS via Cmd+Shift+Alt+A.
+        let mods = egui::Modifiers {
+            mac_cmd: true,
+            shift: true,
+            alt: true,
+            ..Default::default()
+        };
+        assert_eq!(mac_table().lookup(egui::Key::A, mods), Some(Action::HideWindow));
     }
 
     #[test]

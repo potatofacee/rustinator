@@ -54,6 +54,11 @@ pub(crate) fn draw_panes(
 ) -> Vec<Action> {
     let root_rect = ui.available_rect_before_wrap();
     state.last_root_rect = Some(root_rect);
+    // Keep cell metrics on the tab manager fresh so keyboard split-resize can
+    // enforce a minimum pane size (see TabManager::resize_split).
+    ctx.tab_mgr.cell_w = ctx.cell_w;
+    ctx.tab_mgr.cell_h = ctx.cell_h;
+    ctx.tab_mgr.ppp = ui.ctx().pixels_per_point();
     let mut leaves = Vec::new();
     let zoomed = ctx.tab_mgr.tabs[ctx.tab_mgr.active_tab].zoomed;
     if let Some(zid) = zoomed {
@@ -68,7 +73,16 @@ pub(crate) fn draw_panes(
             .layout
             .walk_rects(root_rect, PANE_GAP, &mut leaves);
 
-        handle_dividers(ctx.tab_mgr.active_tab, &mut ctx.tab_mgr.tabs[ctx.tab_mgr.active_tab], root_rect, ui);
+        let ppp = ui.ctx().pixels_per_point();
+        handle_dividers(
+            ctx.tab_mgr.active_tab,
+            &mut ctx.tab_mgr.tabs[ctx.tab_mgr.active_tab],
+            root_rect,
+            ui,
+            ctx.cell_w,
+            ctx.cell_h,
+            ppp,
+        );
     }
 
     let ppp = ui.ctx().pixels_per_point();
@@ -217,7 +231,9 @@ pub(crate) fn draw_panes(
             }
         }
 
-        state.last_pane_rect = Some(terminal_rect);
+        if focused {
+            state.last_pane_rect = Some(terminal_rect);
+        }
         response.context_menu(|ui| {
             build_context_menu(
                 ui,
@@ -237,7 +253,15 @@ pub(crate) fn draw_panes(
     deferred
 }
 
-fn handle_dividers(tab_idx: usize, tab: &mut crate::tabs::Tab, root_rect: egui::Rect, ui: &mut egui::Ui) {
+fn handle_dividers(
+    tab_idx: usize,
+    tab: &mut crate::tabs::Tab,
+    root_rect: egui::Rect,
+    ui: &mut egui::Ui,
+    cell_w: f32,
+    cell_h: f32,
+    ppp: f32,
+) {
     let mut dividers = Vec::new();
     tab.layout.walk_dividers(root_rect, PANE_GAP, &mut dividers);
     for div in dividers {
@@ -263,15 +287,32 @@ fn handle_dividers(tab_idx: usize, tab: &mut crate::tabs::Tab, root_rect: egui::
             tab.layout.set_ratio(&div.path, 0.5);
         } else if resp.dragged() {
             if let Some(pointer) = resp.interact_pointer_pos() {
-                let new_ratio = match div.dir {
-                    layout::Direction::Vertical => {
-                        (pointer.x - div.parent_rect.left()) / div.parent_rect.width()
-                    }
-                    layout::Direction::Horizontal => {
-                        (pointer.y - div.parent_rect.top()) / div.parent_rect.height()
-                    }
+                // Minimum pane size: 3 columns wide for a vertical (side-by-
+                // side) split, 1 row tall for a horizontal (stacked) split.
+                // Container extent and cell size must be in the same units;
+                // rects are in points, cell_w/cell_h in physical px, so scale
+                // the container extent by ppp.
+                let (new_ratio, container_px, cell_px, min_cells) = match div.dir {
+                    layout::Direction::Vertical => (
+                        (pointer.x - div.parent_rect.left()) / div.parent_rect.width(),
+                        div.parent_rect.width() * ppp,
+                        cell_w,
+                        3.0,
+                    ),
+                    layout::Direction::Horizontal => (
+                        (pointer.y - div.parent_rect.top()) / div.parent_rect.height(),
+                        div.parent_rect.height() * ppp,
+                        cell_h,
+                        1.0,
+                    ),
                 };
-                tab.layout.set_ratio(&div.path, new_ratio);
+                tab.layout.set_ratio_min_cells(
+                    &div.path,
+                    new_ratio,
+                    container_px,
+                    cell_px,
+                    min_cells,
+                );
             }
         }
     }
@@ -715,21 +756,51 @@ fn paint_pane(
             offset_cells: [0.0, 0.0],
             size_cells: [cols_cover as f32, rows_cover as f32],
         });
-        let mut gl_instances = Vec::with_capacity(frame.cells.len());
         for cell in &frame.cells {
             if cell.bg[..3] != frame.default_bg[..3] {
                 bg.push(BgInstance::full(cell.col, cell.row, cell.bg));
             }
-            if cell.c != ' ' && cell.c != '\0' {
-                if let Some(gi) = renderer.build_glyph_instance(
-                    cell.c, cell.style, cell.col, cell.row, cell.fg, &mut font,
-                ) {
-                    gl_instances.push(gi);
-                }
-            }
         }
 
         let effective_cursor = cursor_override.unwrap_or(frame.cursor);
+
+        // A solid (filled) block cursor is painted below as a cursor-colored
+        // full-cell quad. To keep the glyph under it readable (as alacritty /
+        // iTerm2 do), invert that one cell's glyph: render it in the cell's
+        // BACKGROUND color so it reads against the cursor block. `effective_
+        // cursor` is only a Block here when focused and not blink-off
+        // (unfocused / blink-off were already downgraded to HollowBlock), so
+        // this never affects beam / underline / hollow / unfocused cursors.
+        let invert_cell = match effective_cursor {
+            Some(CursorOverlay::Block { col, row, .. }) => Some((col, row)),
+            _ => None,
+        };
+
+        // Build glyph instances. If the atlas fills mid-build it is reset,
+        // zeroing the UVs of every glyph already recorded this frame. Detect
+        // that via the atlas generation and rebuild against the fresh atlas. A
+        // single pane's glyph set always fits, so this retries at most once.
+        let gl_instances = loop {
+            let atlas_gen = renderer.atlas_generation();
+            let mut gl_instances = Vec::with_capacity(frame.cells.len());
+            for cell in &frame.cells {
+                if cell.c != ' ' && cell.c != '\0' {
+                    let glyph_fg = if invert_cell == Some((cell.col, cell.row)) {
+                        cell.bg
+                    } else {
+                        cell.fg
+                    };
+                    if let Some(gi) = renderer.build_glyph_instance(
+                        cell.c, cell.style, cell.col, cell.row, glyph_fg, &mut font,
+                    ) {
+                        gl_instances.push(gi);
+                    }
+                }
+            }
+            if renderer.atlas_generation() == atlas_gen {
+                break gl_instances;
+            }
+        };
         if let Some(overlay) = effective_cursor {
             let cw = renderer.cell_w;
             let ch = renderer.cell_h;
@@ -800,16 +871,21 @@ fn paint_pane(
     });
 
     if !focused {
+        let dim_alpha = ctx.user_config.active().inactive_dim_alpha;
         ui.painter().rect_filled(
-            inner_rect,
+            rect,
             0.0,
-            egui::Color32::from_black_alpha(50),
+            egui::Color32::from_black_alpha(dim_alpha),
         );
     }
 
     paint_scrollbar(ui, ctx.tab_mgr.active_tab, &ctx.tab_mgr.tabs[ctx.tab_mgr.active_tab], pane_id, inner_rect);
 
-    if focused && std::env::var("RUSTINATOR_NO_FOCUS_BORDER").is_err() {
+    static SHOW_FOCUS_BORDER: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("RUSTINATOR_NO_FOCUS_BORDER").is_err()
+    });
+
+    if focused && *SHOW_FOCUS_BORDER {
         let color = if ctx.tab_mgr.tabs[ctx.tab_mgr.active_tab].broadcast {
             egui::Color32::from_rgb(0xc0, 0x50, 0x50)
         } else {

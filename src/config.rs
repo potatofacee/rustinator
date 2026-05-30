@@ -72,6 +72,11 @@ pub struct Profile {
     pub word_chars: String,
     #[serde(default)]
     pub exit_action: ExitAction,
+    /// Alpha (0-255) of the black overlay drawn over unfocused panes to dim
+    /// them. Higher = darker. Defaults to 50 to match the previous hardcoded
+    /// value. (Analogous to terminator's inactive_color_offset.)
+    #[serde(default = "default_inactive_dim_alpha")]
+    pub inactive_dim_alpha: u8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
@@ -89,6 +94,10 @@ fn default_true() -> bool {
 
 fn default_word_chars() -> String {
     "-A-Za-z0-9,./?%&#:_=+@~".into()
+}
+
+fn default_inactive_dim_alpha() -> u8 {
+    50
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -165,6 +174,7 @@ impl Profile {
             scroll_on_keystroke: true,
             word_chars: default_word_chars(),
             exit_action: ExitAction::Close,
+            inactive_dim_alpha: default_inactive_dim_alpha(),
         }
     }
 
@@ -210,7 +220,7 @@ impl Default for ScrollbackConfig {
 
 impl ScrollbackConfig {
     pub fn effective_history(&self) -> usize {
-        if self.infinite { 100_000_000 } else { self.history }
+        if self.infinite { 1_000_000 } else { self.history }
     }
 }
 
@@ -297,6 +307,7 @@ impl Config {
                 scroll_on_keystroke: true,
                 word_chars: default_word_chars(),
                 exit_action: ExitAction::Close,
+                inactive_dim_alpha: default_inactive_dim_alpha(),
             };
             self.profiles = vec![profile];
             if self.active_profile.is_empty() {
@@ -663,7 +674,7 @@ mod tests {
     #[test]
     fn effective_history_infinite() {
         let sc = ScrollbackConfig { history: 5000, infinite: true };
-        assert_eq!(sc.effective_history(), 100_000_000);
+        assert_eq!(sc.effective_history(), 1_000_000);
     }
 
     // ---- parse_hex edge cases ----

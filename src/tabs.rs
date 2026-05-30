@@ -56,6 +56,13 @@ pub(crate) struct TabManager {
     pub tabs: Vec<Tab>,
     pub active_tab: usize,
     pub next_pane_id: PaneId,
+    /// Latest known cell size in physical pixels, updated each frame by the
+    /// pane view. Used to clamp keyboard split-resize to a minimum pane size.
+    pub cell_w: f32,
+    pub cell_h: f32,
+    /// Latest pixels-per-point, used to convert point-space rects to physical
+    /// pixels when clamping split sizes.
+    pub ppp: f32,
 }
 
 impl TabManager {
@@ -65,6 +72,9 @@ impl TabManager {
             tabs: vec![Tab::new(first_pane)],
             active_tab: 0,
             next_pane_id: id + 1,
+            cell_w: 0.0,
+            cell_h: 0.0,
+            ppp: 1.0,
         }
     }
 
@@ -225,7 +235,7 @@ impl TabManager {
         let new_id = self.next_pane_id;
         self.next_pane_id += 1;
         let Some(pane) = self.spawn_pane(new_id, INITIAL_COLS as usize, INITIAL_LINES as usize, None, factory) else { return };
-        for p in self.tabs[self.active_tab].panes.values() {
+        if let Some(p) = self.tabs[self.active_tab].panes.get(&self.tabs[self.active_tab].focused) {
             p.send_focus_event(false);
         }
         self.tabs.push(Tab::new(pane));
@@ -402,9 +412,20 @@ impl TabManager {
                     (div.rect.center().x - parent.left()) / parent.width()
                 }
             };
-            self.tabs[self.active_tab]
-                .layout
-                .set_ratio(&path, current_ratio + delta);
+            // Mirror the drag-site clamp: keep both children >= 3 cols (vertical
+            // split) / 1 row (horizontal split). parent rect is in points; cell
+            // sizes are physical px, so scale by ppp.
+            let (container_px, cell_px, min_cells) = match target_dir {
+                layout::Direction::Vertical => (parent.width() * self.ppp, self.cell_w, 3.0),
+                layout::Direction::Horizontal => (parent.height() * self.ppp, self.cell_h, 1.0),
+            };
+            self.tabs[self.active_tab].layout.set_ratio_min_cells(
+                &path,
+                current_ratio + delta,
+                container_px,
+                cell_px,
+                min_cells,
+            );
         }
     }
 

@@ -67,6 +67,11 @@ impl DialogState {
                     } else {
                         find_next = true;
                     }
+                } else if edit.changed() {
+                    // Search-as-you-type: re-run the search whenever the query
+                    // text is edited. `changed()` only fires on actual edits, so
+                    // we never re-search when the text is unchanged.
+                    find_next = true;
                 }
                 if ui.button("Prev").clicked() {
                     find_prev = true;

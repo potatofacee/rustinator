@@ -6,10 +6,13 @@ use glow::{self, HasContext};
 
 use crate::font::{FontContext, FontStyle};
 
-const ATLAS_SIZE: i32 = 1024;
+const ATLAS_SIZE: i32 = 2048;
 
 // Unit quad (two triangles as a strip), (x,y) in [0,1].
 const QUAD_VERTS: [f32; 8] = [0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0];
+
+const _: () = assert!(std::mem::size_of::<BgInstance>() == 40);
+const _: () = assert!(std::mem::size_of::<GlyphInstance>() == 56);
 
 /// One cell's bg rect (or a sub-cell rect like a beam/underline cursor).
 #[repr(C)]
@@ -63,7 +66,13 @@ pub struct Renderer {
     shelf_y: i32,
     shelf_cursor_x: i32,
     shelf_h: i32,
+    atlas_generation: u64,
     glyph_cache: HashMap<(char, FontStyle), AtlasEntry>,
+    /// Reusable zeroed RGBA8 buffer the size of the full atlas. Allocated once
+    /// (16MB at ATLAS_SIZE=2048) and reused to clear the atlas on every
+    /// reset_atlas() instead of re-allocating each time. Stays all-zero: it is
+    /// only ever read as the upload source for clearing.
+    atlas_clear_buf: Vec<u8>,
 
     // Uniform locations.
     bg_u_cell_size: glow::UniformLocation,
@@ -130,7 +139,7 @@ impl Renderer {
                 glow::TEXTURE_WRAP_T,
                 glow::CLAMP_TO_EDGE as i32,
             );
-            let zero = vec![0u8; (ATLAS_SIZE * ATLAS_SIZE * 4) as usize];
+            let atlas_clear_buf = vec![0u8; (ATLAS_SIZE * ATLAS_SIZE * 4) as usize];
             gl.tex_image_2d(
                 glow::TEXTURE_2D,
                 0,
@@ -140,7 +149,7 @@ impl Renderer {
                 0,
                 glow::RGBA,
                 glow::UNSIGNED_BYTE,
-                glow::PixelUnpackData::Slice(Some(&zero)),
+                glow::PixelUnpackData::Slice(Some(&atlas_clear_buf)),
             );
             gl.bind_texture(glow::TEXTURE_2D, None);
 
@@ -166,7 +175,9 @@ impl Renderer {
                 shelf_y: 0,
                 shelf_cursor_x: 0,
                 shelf_h: 0,
+                atlas_generation: 0,
                 glyph_cache: HashMap::new(),
+                atlas_clear_buf,
                 bg_u_cell_size,
                 bg_u_viewport,
                 glyph_u_cell_size,
@@ -216,24 +227,11 @@ impl Renderer {
             return empty;
         }
 
-        // Shelf allocator.
+        // Shelf allocator — try once, and if the atlas is full, reset and retry
+        // so the current glyph lands at a valid position in the fresh atlas.
         let w = raster.width;
         let h = raster.height;
-        if self.shelf_cursor_x + w > ATLAS_SIZE {
-            self.shelf_y += self.shelf_h;
-            self.shelf_cursor_x = 0;
-            self.shelf_h = 0;
-        }
-        if self.shelf_y + h > ATLAS_SIZE {
-            // Atlas full — for phase 2, clear it.
-            self.reset_atlas();
-        }
-        if h > self.shelf_h {
-            self.shelf_h = h;
-        }
-        let x = self.shelf_cursor_x;
-        let y = self.shelf_y;
-        self.shelf_cursor_x += w;
+        let (x, y) = self.shelf_alloc(w, h);
 
         // Normalize source buffer to RGBA8 with alpha = average of RGB.
         let rgba = to_rgba(&raster.buffer, w as usize, h as usize);
@@ -280,14 +278,45 @@ impl Renderer {
         self.ascent = font.cell_height() + font.metrics.descent;
     }
 
+    /// Try to allocate a rectangle in the shelf packer. If the atlas is full,
+    /// reset it and retry so the caller always gets valid coordinates.
+    fn shelf_alloc(&mut self, w: i32, h: i32) -> (i32, i32) {
+        if self.shelf_cursor_x + w > ATLAS_SIZE {
+            self.shelf_y += self.shelf_h;
+            self.shelf_cursor_x = 0;
+            self.shelf_h = 0;
+        }
+        if self.shelf_y + h > ATLAS_SIZE {
+            self.reset_atlas();
+            // After reset shelf_y, shelf_cursor_x, shelf_h are all 0,
+            // so the glyph will be placed at (0, 0).
+        }
+        if h > self.shelf_h {
+            self.shelf_h = h;
+        }
+        let x = self.shelf_cursor_x;
+        let y = self.shelf_y;
+        self.shelf_cursor_x += w;
+        (x, y)
+    }
+
+    /// Bumped every time the atlas is cleared. Callers that build a batch of
+    /// glyph instances can compare this before/after to detect a mid-build
+    /// reset that invalidated the UVs they already recorded.
+    pub fn atlas_generation(&self) -> u64 {
+        self.atlas_generation
+    }
+
     pub fn reset_atlas(&mut self) {
+        self.atlas_generation = self.atlas_generation.wrapping_add(1);
         self.glyph_cache.clear();
         self.shelf_y = 0;
         self.shelf_cursor_x = 0;
         self.shelf_h = 0;
         unsafe {
             self.gl.bind_texture(glow::TEXTURE_2D, Some(self.atlas_tex));
-            let zero = vec![0u8; (ATLAS_SIZE * ATLAS_SIZE * 4) as usize];
+            // Reuse the pre-allocated zeroed buffer instead of allocating 16MB
+            // on every reset. The buffer is only ever read here and stays zero.
             self.gl.tex_sub_image_2d(
                 glow::TEXTURE_2D,
                 0,
@@ -297,7 +326,7 @@ impl Renderer {
                 ATLAS_SIZE,
                 glow::RGBA,
                 glow::UNSIGNED_BYTE,
-                glow::PixelUnpackData::Slice(Some(&zero)),
+                glow::PixelUnpackData::Slice(Some(&self.atlas_clear_buf)),
             );
             self.gl.bind_texture(glow::TEXTURE_2D, None);
         }
@@ -331,8 +360,8 @@ impl Renderer {
                     bytemuck_cast_bg(bg_instances),
                     glow::STREAM_DRAW,
                 );
-                // Layout: ivec2 cell(0), vec4 color(8), vec2 offset(24), vec2 size(32). stride=40.
-                let stride: i32 = 40;
+                // Layout: ivec2 cell(0), vec4 color(8), vec2 offset(24), vec2 size(32).
+                let stride: i32 = std::mem::size_of::<BgInstance>() as i32;
                 gl.vertex_attrib_pointer_i32(1, 2, glow::INT, stride, 0);
                 gl.vertex_attrib_pointer_f32(2, 4, glow::FLOAT, false, stride, 8);
                 gl.vertex_attrib_pointer_f32(3, 2, glow::FLOAT, false, stride, 24);
@@ -372,8 +401,8 @@ impl Renderer {
                     glow::STREAM_DRAW,
                 );
                 // Layout: ivec2 cell(0), vec4 color(8), vec4 uv_rect(24),
-                //         vec2 size_px(40), vec2 offset_px(48). stride=56.
-                let stride: i32 = 56;
+                //         vec2 size_px(40), vec2 offset_px(48).
+                let stride: i32 = std::mem::size_of::<GlyphInstance>() as i32;
                 gl.vertex_attrib_pointer_i32(1, 2, glow::INT, stride, 0);
                 gl.vertex_attrib_pointer_f32(2, 4, glow::FLOAT, false, stride, 8);
                 gl.vertex_attrib_pointer_f32(3, 4, glow::FLOAT, false, stride, 24);
@@ -425,6 +454,20 @@ impl Renderer {
             size_px: entry.size_px,
             offset_px: entry.offset_px,
         })
+    }
+}
+
+impl Drop for Renderer {
+    fn drop(&mut self) {
+        unsafe {
+            self.gl.delete_program(self.bg_program);
+            self.gl.delete_program(self.glyph_program);
+            self.gl.delete_vertex_array(self.vao);
+            self.gl.delete_buffer(self._quad_vbo);
+            self.gl.delete_buffer(self.bg_instance_vbo);
+            self.gl.delete_buffer(self.glyph_instance_vbo);
+            self.gl.delete_texture(self.atlas_tex);
+        }
     }
 }
 
