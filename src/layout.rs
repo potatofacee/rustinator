@@ -225,6 +225,43 @@ impl Node {
         }
     }
 
+    /// Set the ratio of the Split at the given path while guaranteeing both
+    /// children keep at least `min_cells` cells along the split axis.
+    ///
+    /// `container_extent_px` is the pixel size of the split's container along
+    /// the split axis (width for a Vertical split, height for a Horizontal
+    /// split). `cell_extent_px` is the cell size along that same axis. The
+    /// allowable ratio range is derived so neither child drops below
+    /// `min_cells`, then we still clamp to the original 0.05–0.95 sanity band.
+    pub fn set_ratio_min_cells(
+        &mut self,
+        path: &[u8],
+        new_ratio: f32,
+        container_extent_px: f32,
+        cell_extent_px: f32,
+        min_cells: f32,
+    ) {
+        let min_ratio;
+        let max_ratio;
+        if container_extent_px > 0.0 && cell_extent_px > 0.0 {
+            // Fraction of the container that `min_cells` occupies.
+            let min_frac = (min_cells * cell_extent_px / container_extent_px).clamp(0.0, 0.5);
+            min_ratio = min_frac.max(0.05);
+            max_ratio = (1.0 - min_frac).min(0.95);
+        } else {
+            min_ratio = 0.05;
+            max_ratio = 0.95;
+        }
+        // If the container is too small to host two min-size children, fall
+        // back to a centred split rather than producing an inverted range.
+        let clamped = if min_ratio > max_ratio {
+            0.5
+        } else {
+            new_ratio.clamp(min_ratio, max_ratio)
+        };
+        self.set_ratio(path, clamped);
+    }
+
     /// Swap two leaf pane IDs in the tree.
     pub fn swap_leaves(&mut self, a: PaneId, b: PaneId) {
         Self::swap_leaves_impl(self, a, b);

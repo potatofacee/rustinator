@@ -462,7 +462,7 @@ impl App {
         if self.user_config.active().scroll_on_output {
             if let Some(tab) = self.tab_mgr.tabs.get(self.tab_mgr.active_tab) {
                 for pane in tab.panes.values() {
-                    if pane.dirty.load(std::sync::atomic::Ordering::Relaxed) {
+                    if pane.has_new_output.swap(false, std::sync::atomic::Ordering::AcqRel) {
                         pane.scroll_to_bottom();
                     }
                 }
@@ -546,9 +546,6 @@ impl App {
                         egui::Sense::click(),
                     );
                     response.surrender_focus();
-                    if response.clicked_by(egui::PointerButton::Primary) {
-                        clicked_tab = Some(i);
-                    }
 
                     let selected = i == self.tab_mgr.active_tab;
                     let bg = if selected {
@@ -575,6 +572,9 @@ impl App {
                     close_resp.surrender_focus();
                     if close_resp.clicked_by(egui::PointerButton::Primary) {
                         closed_tab = Some(i);
+                    }
+                    if response.clicked_by(egui::PointerButton::Primary) && !close_resp.clicked() {
+                        clicked_tab = Some(i);
                     }
                     let x_color = if close_resp.hovered() {
                         egui::Color32::from_gray(255)

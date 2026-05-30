@@ -123,6 +123,7 @@ fn resolve_color(
 #[derive(Clone)]
 pub struct EventProxy {
     pub dirty: Arc<AtomicBool>,
+    pub has_new_output: Arc<AtomicBool>,
     pub exited: Arc<AtomicBool>,
     pub title: Arc<Mutex<Option<String>>>,
     pub winit_proxy: Option<winit::event_loop::EventLoopProxy<crate::window::UserEvent>>,
@@ -134,6 +135,7 @@ impl EventProxy {
     ) -> Self {
         Self {
             dirty: Arc::new(AtomicBool::new(true)),
+            has_new_output: Arc::new(AtomicBool::new(false)),
             exited: Arc::new(AtomicBool::new(false)),
             title: Arc::new(Mutex::new(None)),
             winit_proxy,
@@ -150,7 +152,12 @@ impl EventProxy {
 impl EventListener for EventProxy {
     fn send_event(&self, event: Event) {
         match event {
-            Event::Wakeup | Event::Bell | Event::MouseCursorDirty => {
+            Event::Wakeup => {
+                self.dirty.store(true, Ordering::Release);
+                self.has_new_output.store(true, Ordering::Release);
+                self.wake();
+            }
+            Event::Bell | Event::MouseCursorDirty => {
                 self.dirty.store(true, Ordering::Release);
                 self.wake();
             }
@@ -313,6 +320,7 @@ pub struct Pane {
     pub cols: usize,
     pub lines: usize,
     pub dirty: Arc<AtomicBool>,
+    pub has_new_output: Arc<AtomicBool>,
     pub exited: Arc<AtomicBool>,
     pub title: Arc<Mutex<Option<String>>>,
     pub cached: Option<Arc<Frame>>,
@@ -336,6 +344,7 @@ impl Pane {
     ) -> Result<Self, String> {
         let proxy = EventProxy::new(winit_proxy);
         let dirty = Arc::clone(&proxy.dirty);
+        let has_new_output = Arc::clone(&proxy.has_new_output);
         let exited = Arc::clone(&proxy.exited);
         let title = Arc::clone(&proxy.title);
 
@@ -381,6 +390,7 @@ impl Pane {
             cols,
             lines,
             dirty,
+            has_new_output,
             exited,
             title,
             cached: None,
@@ -398,8 +408,12 @@ impl Pane {
         term_config: Config,
         winit_proxy: Option<winit::event_loop::EventLoopProxy<crate::window::UserEvent>>,
     ) -> Result<(), String> {
+        // Shut down the old PTY event loop thread before replacing the sender.
+        let _ = self.pty_tx.send(Msg::Shutdown);
+
         let proxy = EventProxy::new(winit_proxy);
         let dirty = Arc::clone(&proxy.dirty);
+        let has_new_output = Arc::clone(&proxy.has_new_output);
         let exited = Arc::clone(&proxy.exited);
         let title = Arc::clone(&proxy.title);
 
@@ -438,6 +452,7 @@ impl Pane {
         self.pty_tx = pty_tx;
         self.child_pid = child_pid;
         self.dirty = dirty;
+        self.has_new_output = has_new_output;
         self.exited = exited;
         self.title = title;
         self.cached = None;
@@ -586,12 +601,11 @@ impl Pane {
     }
 
     pub fn selection_text(&self) -> Option<String> {
+        let sel = self.ui_selection.lock().unwrap().clone();
         let mut term = self.terminal.lock();
-        let ui_sel = self.ui_selection.lock().unwrap();
-        if let Some(sel) = ui_sel.as_ref() {
-            term.selection = Some(sel.clone());
+        if let Some(s) = sel {
+            term.selection = Some(s);
         }
-        drop(ui_sel);
         term.selection_to_string()
     }
 
@@ -742,6 +756,13 @@ impl Pane {
             let [r, g, b] = self.defaults.cursor;
             [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0]
         };
+        // The snapshot has no focus / blink state, so it cannot know whether a
+        // SOLID block cursor is actually being shown for this pane (an
+        // unfocused or blink-off block is downgraded to a hollow outline in
+        // pane_ui). Inverting the cell here would also invert it when the
+        // cursor is hollow / hidden, which is wrong. Instead, the cell under a
+        // solid block cursor is inverted at glyph-build time in pane_ui
+        // (paint_pane), where focus / blink are known. Keep this false.
         let cursor_invert_at_cell = false;
         let cursor_overlay = if cursor_visible && cursor_row >= 0 && cursor_row < lines {
             match cursor_shape {
@@ -826,6 +847,12 @@ impl Pane {
             cursor_blink_requested,
             urls,
         }
+    }
+}
+
+impl Drop for Pane {
+    fn drop(&mut self) {
+        let _ = self.pty_tx.send(Msg::Shutdown);
     }
 }
 
