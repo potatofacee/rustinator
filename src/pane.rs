@@ -373,6 +373,10 @@ impl Pane {
         crate::shell_integration::inject_env(&mut pty_opts.env);
         if let Some(dir) = working_dir {
             pty_opts.working_directory = Some(dir.to_path_buf());
+        } else if let Ok(home) = std::env::var("HOME") {
+            // A macOS .app launched from Finder/Dock inherits cwd `/` from launchd.
+            // Default a fresh shell (no inherited pane cwd) to $HOME instead of root.
+            pty_opts.working_directory = Some(std::path::PathBuf::from(home));
         }
         let pty = tty::new(&pty_opts, window_size, id)
             .map_err(|e| format!("failed to open pty: {e}"))?;

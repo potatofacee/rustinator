@@ -232,9 +232,12 @@ impl TabManager {
     }
 
     pub(crate) fn new_tab(&mut self, factory: &PaneFactory) {
+        let focused = self.tabs[self.active_tab].focused;
+        let cwd = self.tabs[self.active_tab].panes.get(&focused)
+            .and_then(|p| p.cwd());
         let new_id = self.next_pane_id;
         self.next_pane_id += 1;
-        let Some(pane) = self.spawn_pane(new_id, INITIAL_COLS as usize, INITIAL_LINES as usize, None, factory) else { return };
+        let Some(pane) = self.spawn_pane(new_id, INITIAL_COLS as usize, INITIAL_LINES as usize, cwd.as_deref(), factory) else { return };
         if let Some(p) = self.tabs[self.active_tab].panes.get(&self.tabs[self.active_tab].focused) {
             p.send_focus_event(false);
         }
