@@ -309,7 +309,11 @@ impl App {
                 Action::ResizeDown => self.tab_mgr.resize_split(0.05, true, self.pane_view.last_root_rect),
                 Action::ResetTerminal => self.tab_mgr.reset_focused_terminal(false),
                 Action::ResetClear => self.tab_mgr.reset_focused_terminal(true),
-                Action::NewWindow => { let _ = std::process::Command::new(std::env::current_exe().unwrap_or_default()).spawn(); }
+                Action::NewWindow => {
+                    if let Ok(exe) = std::env::current_exe() {
+                        let _ = std::process::Command::new(exe).spawn();
+                    }
+                }
                 Action::OpenTerminalHere => self.tab_mgr.split_here(self.pane_view.last_pane_rect, &factory),
                 Action::QuitHotkeyWindow => {
                     self.dialogs.confirmed_close = true;
@@ -419,6 +423,10 @@ impl App {
         for tab in &mut self.tab_mgr.tabs {
             for pane in tab.panes.values_mut() {
                 pane.defaults = self.pane_defaults;
+                // Apply scrollback history + semantic escape chars (and the
+                // rest of the term config) to the live Term, so existing panes
+                // pick up the change immediately rather than only on respawn.
+                pane.apply_term_config(self.term_config.clone());
                 pane.dirty.store(true, std::sync::atomic::Ordering::Release);
                 pane.cached = None;
             }

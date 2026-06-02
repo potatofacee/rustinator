@@ -1,3 +1,4 @@
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
@@ -8,6 +9,33 @@ use crate::window::UserEvent;
 
 pub struct HotkeyHandle {
     _manager: GlobalHotKeyManager,
+}
+
+/// The current event-loop proxy that the single reader thread forwards toggle
+/// events to. Updated by each `spawn` so the latest registration receives
+/// events, while the reader thread itself is started only once per process.
+static CURRENT_PROXY: Mutex<Option<EventLoopProxy<UserEvent>>> = Mutex::new(None);
+
+/// Guards one-time startup of the global reader thread.
+static READER_THREAD: OnceLock<()> = OnceLock::new();
+
+fn ensure_reader_thread() {
+    READER_THREAD.get_or_init(|| {
+        // `GlobalHotKeyEvent::receiver()` is a process-global singleton. Reading
+        // it from more than one thread would split events round-robin and leak
+        // never-terminating threads, so we read it from exactly one thread for
+        // the whole process lifetime and forward to the current proxy.
+        let receiver = GlobalHotKeyEvent::receiver();
+        thread::spawn(move || {
+            while let Ok(event) = receiver.recv() {
+                if event.state() == HotKeyState::Pressed {
+                    if let Some(proxy) = CURRENT_PROXY.lock().unwrap().as_ref() {
+                        let _ = proxy.send_event(UserEvent::HotkeyTogglePressed);
+                    }
+                }
+            }
+        });
+    });
 }
 
 pub fn spawn(combo: &str, proxy: EventLoopProxy<UserEvent>) -> Option<HotkeyHandle> {
@@ -25,14 +53,10 @@ pub fn spawn(combo: &str, proxy: EventLoopProxy<UserEvent>) -> Option<HotkeyHand
         .map_err(|e| log::warn!("hotkey: failed to register '{combo}': {e}"))
         .ok()?;
 
-    let receiver = GlobalHotKeyEvent::receiver();
-    thread::spawn(move || {
-        while let Ok(event) = receiver.recv() {
-            if event.state() == HotKeyState::Pressed {
-                let _ = proxy.send_event(UserEvent::HotkeyTogglePressed);
-            }
-        }
-    });
+    // Point the single reader thread at this registration's proxy, then ensure
+    // that thread exists (started at most once for the process lifetime).
+    *CURRENT_PROXY.lock().unwrap() = Some(proxy);
+    ensure_reader_thread();
 
     log::info!("hotkey: registered global hotkey '{combo}'");
     Some(HotkeyHandle { _manager: manager })

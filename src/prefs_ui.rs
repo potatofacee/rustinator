@@ -26,7 +26,9 @@ impl PrefsState {
     pub(crate) fn new() -> Self {
         Self {
             open: false,
-            draft: Config::load(),
+            // The draft is always overwritten by open() before the panel is
+            // shown, so avoid an unnecessary disk read here.
+            draft: Config::default(),
             status: None,
             section: PrefsSection::Global,
             selected_profile: 0,
@@ -235,12 +237,19 @@ fn draw_prefs_profiles(
             if *selected >= cfg.profiles.len() {
                 *selected = 0;
             }
-            let profile = &mut cfg.profiles[*selected];
-
+            let old_name = cfg.profiles[*selected].name.clone();
             ui.horizontal(|ui| {
                 ui.label("Name");
-                ui.text_edit_singleline(&mut profile.name);
+                ui.text_edit_singleline(&mut cfg.profiles[*selected].name);
             });
+            // Keep active_profile in sync when the active profile is renamed,
+            // otherwise active() would silently fall through to profiles[0].
+            let new_name = cfg.profiles[*selected].name.clone();
+            if new_name != old_name && cfg.active_profile == old_name {
+                cfg.active_profile = new_name;
+            }
+
+            let profile = &mut cfg.profiles[*selected];
 
             ui.add_space(8.0);
             ui.label(egui::RichText::new("Font").strong());
@@ -276,8 +285,9 @@ fn draw_prefs_profiles(
                 egui::ComboBox::from_id_salt(("preset_combo", *selected))
                     .selected_text(current)
                     .show_ui(ui, |ui| {
-                        if ui.selectable_label(current == presets::CUSTOM, presets::CUSTOM).clicked() {
-                        }
+                        // "Custom" is a state indicator, not a selectable
+                        // option: it has no preset colors to apply.
+                        ui.label(presets::CUSTOM);
                         for preset in presets::PRESETS {
                             if ui
                                 .selectable_label(current == preset.name, preset.name)
@@ -400,21 +410,10 @@ fn draw_prefs_keybindings(ui: &mut egui::Ui) {
 fn hex_color_row(ui: &mut egui::Ui, label: &str, hex: &mut String) {
     ui.horizontal(|ui| {
         ui.label(label);
-        let mut rgb = parse_hex_rgb(hex).unwrap_or([0, 0, 0]);
+        let mut rgb = config::parse_hex(hex).unwrap_or([0, 0, 0]);
         if ui.color_edit_button_srgb(&mut rgb).changed() {
             *hex = config::format_hex(rgb);
         }
         ui.add(egui::TextEdit::singleline(hex).desired_width(90.0));
     });
-}
-
-fn parse_hex_rgb(s: &str) -> Option<[u8; 3]> {
-    let s = s.trim().trim_start_matches('#');
-    if s.len() != 6 {
-        return None;
-    }
-    let r = u8::from_str_radix(&s[0..2], 16).ok()?;
-    let g = u8::from_str_radix(&s[2..4], 16).ok()?;
-    let b = u8::from_str_radix(&s[4..6], 16).ok()?;
-    Some([r, g, b])
 }

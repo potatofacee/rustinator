@@ -1,3 +1,4 @@
+use alacritty_terminal::term::TermMode;
 use winit::keyboard::{Key, NamedKey};
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 
@@ -23,10 +24,19 @@ pub(crate) fn process_keys(
         return actions;
     }
 
+    // When the focused pane is in alt-screen, the three default Linux bindings
+    // that collide with TUIs (Ctrl+Tab -> FocusNext, Ctrl+PageUp -> PrevTab,
+    // Ctrl+PageDown -> NextTab) should pass through to the child rather than be
+    // consumed. We only suppress these when bound to their conflicting combos.
+    let alt_screen = targets.iter().any(|p| p.mode().contains(TermMode::ALT_SCREEN));
+
     let consumed: Vec<bool> = raw_keys
         .iter()
         .map(|rk| {
             if let Some(action) = bindings.lookup(rk.key, rk.mods) {
+                if alt_screen && is_alt_screen_passthrough(action, rk.key, rk.mods) {
+                    return false;
+                }
                 actions.push(action);
                 true
             } else {
@@ -94,6 +104,22 @@ pub(crate) fn process_keys(
     actions
 }
 
+/// True when a bound action is one of the three Linux navigation bindings that
+/// collide with TUIs and is bound to its specific conflicting combo, so it
+/// should pass through to the child while the focused pane is in alt-screen.
+fn is_alt_screen_passthrough(action: Action, key: egui::Key, mods: egui::Modifiers) -> bool {
+    let plain_ctrl = mods.ctrl && !mods.shift && !mods.alt && !mods.mac_cmd;
+    if !plain_ctrl {
+        return false;
+    }
+    matches!(
+        (action, key),
+        (Action::FocusNext, egui::Key::Tab)
+            | (Action::PrevTab, egui::Key::PageUp)
+            | (Action::NextTab, egui::Key::PageDown)
+    )
+}
+
 pub(crate) fn encode_raw_key(event: &winit::event::KeyEvent, modifiers: winit::event::Modifiers) -> Option<RawTermKey> {
     if !event.state.is_pressed() {
         return None;
@@ -122,6 +148,27 @@ pub(crate) fn encode_raw_key(event: &winit::event::KeyEvent, modifiers: winit::e
 
     if mods.mac_cmd {
         return egui_key.map(|key| RawTermKey { key, mods, legacy_bytes: Vec::new() });
+    }
+
+    // Deterministic Ctrl+letter -> control byte (Ctrl+A=0x01 ... Ctrl+Z=0x1a).
+    // This must take precedence over the raw `text_with_all_modifiers` path so
+    // that Ctrl+C always sends 0x03 regardless of platform text quirks. Only
+    // applies to plain Ctrl (no Alt, no Cmd) with an unmodified ASCII letter.
+    if ctrl && !alt && !mods.mac_cmd {
+        if let Key::Character(c) = &event.key_without_modifiers() {
+            let s = c.as_ref();
+            let mut chars = s.chars();
+            if let (Some(ch), None) = (chars.next(), chars.next()) {
+                if ch.is_ascii_alphabetic() {
+                    let b = (ch.to_ascii_uppercase() as u8) - 0x40;
+                    return Some(RawTermKey {
+                        key: egui_key.unwrap_or(egui::Key::Space),
+                        mods,
+                        legacy_bytes: vec![b],
+                    });
+                }
+            }
+        }
     }
 
     if let Some(text) = event.text_with_all_modifiers() {

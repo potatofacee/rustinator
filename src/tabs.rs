@@ -158,6 +158,18 @@ impl TabManager {
 
     pub(crate) fn close_focused(&mut self, egui_ctx: &egui::Context, dialogs: &mut DialogState) {
         let target = self.active_tab_mut().focused;
+
+        // Capture the pre-removal leaf order so we can pick the neighbor that
+        // now occupies the closed pane's region. When a leaf is removed its
+        // parent split collapses to the sibling subtree, whose leaves are
+        // contiguous with `target` in in-order traversal; the immediate
+        // in-order neighbor is therefore the pane that takes over the space.
+        // (No sibling-lookup helper exists on the layout, so we approximate
+        // with the nearest in-order neighbor, falling back to the first leaf.)
+        let mut before = Vec::new();
+        self.active_tab_mut().layout.leaves_in_order(&mut before);
+        let target_idx = before.iter().position(|&id| id == target);
+
         let result = self.active_tab_mut().layout.remove_leaf(target);
         self.active_tab_mut().panes.remove(&target);
         if self.active_tab_mut().zoomed == Some(target) {
@@ -174,8 +186,26 @@ impl TabManager {
 
         let mut leaves = Vec::new();
         self.active_tab_mut().layout.leaves_in_order(&mut leaves);
-        if let Some(first) = leaves.first() {
-            self.active_tab_mut().focused = *first;
+
+        // Prefer the neighbor that followed `target` (the sibling that took its
+        // space), then the one that preceded it, then fall back to the first
+        // remaining leaf.
+        let new_focus = target_idx
+            .and_then(|i| before.get(i + 1).copied())
+            .filter(|id| leaves.contains(id))
+            .or_else(|| {
+                target_idx
+                    .and_then(|i| i.checked_sub(1))
+                    .and_then(|i| before.get(i).copied())
+                    .filter(|id| leaves.contains(id))
+            })
+            .or_else(|| leaves.first().copied());
+
+        if let Some(id) = new_focus {
+            self.active_tab_mut().focused = id;
+            if let Some(p) = self.active_tab_mut().panes.get(&id) {
+                p.send_focus_event(true);
+            }
         }
     }
 
@@ -214,6 +244,9 @@ impl TabManager {
         let tab = &mut self.tabs[tab_idx];
         let result = tab.layout.remove_leaf(pane_id);
         tab.panes.remove(&pane_id);
+        if tab.zoomed == Some(pane_id) {
+            tab.zoomed = None;
+        }
         if matches!(result, crate::layout::RemoveResult::NotFound) {
             return;
         }
@@ -224,9 +257,14 @@ impl TabManager {
         let tab = &mut self.tabs[tab_idx];
         let mut leaves = Vec::new();
         tab.layout.leaves_in_order(&mut leaves);
-        if let Some(first) = leaves.first() {
-            if !leaves.contains(&tab.focused) {
-                tab.focused = *first;
+        // Only reassign focus if the current focus died; emit a focus-in to the
+        // pane that takes over so it matches close_focused / tab-switch behavior.
+        if !leaves.contains(&tab.focused) {
+            if let Some(&first) = leaves.first() {
+                tab.focused = first;
+                if let Some(p) = tab.panes.get(&first) {
+                    p.send_focus_event(true);
+                }
             }
         }
     }
@@ -260,7 +298,8 @@ impl TabManager {
         if old == new {
             return;
         }
-        for pane in self.tabs[old].panes.values() {
+        let old_focused = self.tabs[old].focused;
+        if let Some(pane) = self.tabs[old].panes.get(&old_focused) {
             pane.send_focus_event(false);
         }
         self.active_tab = new;
@@ -273,7 +312,8 @@ impl TabManager {
     pub(crate) fn switch_tab_direct(&mut self, tab_number: u8) {
         let idx = (tab_number as usize).saturating_sub(1);
         if idx < self.tabs.len() && idx != self.active_tab {
-            for pane in self.tabs[self.active_tab].panes.values() {
+            let old_focused = self.tabs[self.active_tab].focused;
+            if let Some(pane) = self.tabs[self.active_tab].panes.get(&old_focused) {
                 pane.send_focus_event(false);
             }
             self.active_tab = idx;
@@ -291,6 +331,24 @@ impl TabManager {
         let to = ((from + delta) % n + n) % n;
         self.tabs.swap(from as usize, to as usize);
         self.active_tab = to as usize;
+    }
+
+    /// Move focus to `new_id` within `tab_idx`, emitting paired focus-out/in
+    /// events when focus actually changes. No-op if it is already focused or
+    /// the pane is absent.
+    pub(crate) fn set_focused_pane(&mut self, tab_idx: usize, new_id: PaneId) {
+        let Some(tab) = self.tabs.get_mut(tab_idx) else { return };
+        let old = tab.focused;
+        if old == new_id || !tab.panes.contains_key(&new_id) {
+            return;
+        }
+        if let Some(p) = tab.panes.get(&old) {
+            p.send_focus_event(false);
+        }
+        tab.focused = new_id;
+        if let Some(p) = tab.panes.get(&new_id) {
+            p.send_focus_event(true);
+        }
     }
 
     pub(crate) fn cycle_focus(&mut self, step: i32) {
@@ -522,12 +580,25 @@ impl TabManager {
         let mut existing_ids: Vec<PaneId> = Vec::new();
         tab.layout.leaves_in_order(&mut existing_ids);
 
+        // Track only the panes we spawn here, so a partial failure can be
+        // cleaned up without touching the pre-existing layout/panes.
+        let mut spawned_ids: Vec<PaneId> = Vec::new();
         while existing_ids.len() < needed {
             let new_id = self.next_pane_id;
             self.next_pane_id += 1;
-            let Some(pane) = self.spawn_pane(new_id, 80, 24, None, factory) else { break };
+            let Some(pane) = self.spawn_pane(new_id, 80, 24, None, factory) else {
+                // Couldn't produce enough panes for the template. Abort the
+                // restore rather than building a layout with orphan Leaf(0)
+                // leaves: roll back the panes we spawned and keep the existing
+                // layout, focus, and zoom untouched.
+                for id in spawned_ids {
+                    self.active_tab_mut().panes.remove(&id);
+                }
+                return;
+            };
             self.active_tab_mut().panes.insert(new_id, pane);
             existing_ids.push(new_id);
+            spawned_ids.push(new_id);
         }
         while existing_ids.len() > needed {
             if let Some(extra) = existing_ids.pop() {
@@ -540,7 +611,10 @@ impl TabManager {
         let mut leaves = Vec::new();
         self.active_tab_mut().layout.leaves_in_order(&mut leaves);
         if !leaves.contains(&self.active_tab_mut().focused) {
-            self.active_tab_mut().focused = leaves.first().copied().unwrap_or(1);
+            // Fall back to an actual live leaf only; never a hardcoded id.
+            if let Some(first) = leaves.first().copied() {
+                self.active_tab_mut().focused = first;
+            }
         }
         self.active_tab_mut().zoomed = None;
     }
@@ -571,10 +645,16 @@ impl TabManager {
                         ExitAction::Hold => {
                             if let Some(tab) = self.tabs.get_mut(t) {
                                 if let Some(pane) = tab.panes.get(&id) {
+                                    // Consume the transient Exit event so the
+                                    // reaper loop doesn't re-find this pane, and
+                                    // mark it persistently dead: its PTY channel
+                                    // is closed, so input must be a no-op rather
+                                    // than silently dropped. The pane stays in
+                                    // the layout as a held husk until closed.
                                     pane.exited.store(false, Ordering::Release);
+                                    pane.mark_dead();
                                 }
                             }
-                            break;
                         }
                         ExitAction::Restart => {
                             let tab = match self.tabs.get_mut(t) {

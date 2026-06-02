@@ -184,11 +184,29 @@ fn macos_defaults() -> Vec<(String, Action)> {
     let mut v: Vec<(String, Action)> = linux_defaults()
         .into_iter()
         .filter(|(combo, _)| !combo.starts_with("Super+"))
-        .map(|(combo, action)| (ctrl_to_cmd(&combo), action))
+        .map(|(combo, action)| {
+            // macOS reserves Cmd+Tab / Cmd+Shift+Tab for the system app
+            // switcher and intercepts them before the window sees the keys, so
+            // a Cmd+Tab binding is dead. Keep Tab-key navigation on Ctrl.
+            if combo_key_is(&combo, "Tab") {
+                (combo, action)
+            } else {
+                (ctrl_to_cmd(&combo), action)
+            }
+        })
         .collect();
     v.push(("Cmd+C".into(), Action::Copy));
     v.push(("Cmd+V".into(), Action::Paste));
     v
+}
+
+/// True if the combo's final (key) token equals `key`, case-insensitively.
+fn combo_key_is(combo: &str, key: &str) -> bool {
+    combo
+        .rsplit('+')
+        .map(str::trim)
+        .find(|p| !p.is_empty())
+        .is_some_and(|k| k.eq_ignore_ascii_case(key))
 }
 
 /// Convert a Linux/Windows-style combo to its macOS equivalent by mapping the
@@ -686,9 +704,24 @@ mod tests {
         assert_eq!(mac_cmd(egui::Key::Num0), Some(Action::ZoomReset));
     }
 
+    fn mac_ctrl(key: egui::Key) -> Option<Action> {
+        let mods = egui::Modifiers { ctrl: true, ..Default::default() };
+        mac_table().lookup(key, mods)
+    }
+
+    fn mac_ctrl_shift(key: egui::Key) -> Option<Action> {
+        let mods = egui::Modifiers { ctrl: true, shift: true, ..Default::default() };
+        mac_table().lookup(key, mods)
+    }
+
     #[test]
-    fn mac_cmd_tab_focus_next() {
-        assert_eq!(mac_cmd(egui::Key::Tab), Some(Action::FocusNext));
+    fn mac_tab_navigation_stays_on_ctrl() {
+        // macOS reserves Cmd+Tab / Cmd+Shift+Tab for the app switcher, so Tab
+        // navigation must remain on Ctrl rather than being remapped to Cmd.
+        assert_eq!(mac_ctrl(egui::Key::Tab), Some(Action::FocusNext));
+        assert_eq!(mac_ctrl_shift(egui::Key::Tab), Some(Action::FocusPrev));
+        assert_eq!(mac_cmd(egui::Key::Tab), None);
+        assert_eq!(mac_cmd_shift(egui::Key::Tab), None);
     }
 
     // ── Ctrl→Cmd structured conversion ───────────────────────────────
