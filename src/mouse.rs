@@ -84,8 +84,11 @@ pub fn encode(
         // Legacy X10 / normal tracking. Release uses button code 3.
         let cb_out = if matches!(kind, MouseKind::Release) { 3 } else { cb };
         let cb_byte = (cb_out + 32).min(255) as u8;
-        let col_byte = (col1 + 32).min(255) as u8;
-        let row_byte = (row1 + 32).min(255) as u8;
+        // Clamp the 1-based coordinate to 223 (223 + 32 = 255) before adding the
+        // 32 offset, so positions beyond 223 saturate at the max cell rather than
+        // wrapping/decoding to a wrong cell.
+        let col_byte = (col1.min(223) + 32) as u8;
+        let row_byte = (row1.min(223) + 32) as u8;
         Some(vec![0x1b, b'[', b'M', cb_byte, col_byte, row_byte])
     }
 }

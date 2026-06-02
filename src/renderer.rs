@@ -185,6 +185,9 @@ impl Renderer {
                 glyph_u_atlas,
                 cell_w: font.cell_width(),
                 cell_h: font.cell_height(),
+                // crossfont exposes no `ascent` field. descent is negative
+                // (below baseline) and line_height == ascent - descent, so
+                // cell_height() + descent recovers the true ascent. Left as-is.
                 ascent: font.cell_height() + font.metrics.descent,
             })
         }
@@ -217,6 +220,20 @@ impl Renderer {
         };
 
         if raster.width <= 0 || raster.height <= 0 {
+            let empty = AtlasEntry {
+                uv_rect: [0.0; 4],
+                size_px: [0.0; 2],
+                offset_px: [0.0; 2],
+                empty: true,
+            };
+            self.glyph_cache.insert(key, empty);
+            return empty;
+        }
+
+        // A glyph larger than the atlas in either dimension can never be packed:
+        // shelf_alloc would still hand back coords and the tex_sub_image_2d below
+        // would draw out of bounds. Treat it as an empty glyph (no upload).
+        if raster.width > ATLAS_SIZE || raster.height > ATLAS_SIZE {
             let empty = AtlasEntry {
                 uv_rect: [0.0; 4],
                 size_px: [0.0; 2],
@@ -275,6 +292,8 @@ impl Renderer {
         self.reset_atlas();
         self.cell_w = font.cell_width();
         self.cell_h = font.cell_height();
+        // See Renderer::new: descent is negative, so cell_height() + descent
+        // yields the true ascent. Left as-is.
         self.ascent = font.cell_height() + font.metrics.descent;
     }
 
@@ -475,7 +494,11 @@ fn to_rgba(buf: &BitmapBuffer, w: usize, h: usize) -> Vec<u8> {
     let mut out = vec![0u8; w * h * 4];
     match buf {
         BitmapBuffer::Rgb(src) => {
-            for i in 0..(w * h) {
+            // The rasterizer's buffer may not match w*h exactly (color glyphs,
+            // rounding); clamp the pixel count to what `src` actually holds so
+            // per-pixel indexing can never go out of bounds.
+            let pixels = (w * h).min(src.len() / 3);
+            for i in 0..pixels {
                 out[i * 4] = src[i * 3];
                 out[i * 4 + 1] = src[i * 3 + 1];
                 out[i * 4 + 2] = src[i * 3 + 2];
@@ -483,7 +506,10 @@ fn to_rgba(buf: &BitmapBuffer, w: usize, h: usize) -> Vec<u8> {
             }
         }
         BitmapBuffer::Rgba(src) => {
-            out.copy_from_slice(src);
+            // copy_from_slice panics on a length mismatch; copy only the bytes
+            // both buffers can hold (color/emoji glyphs can differ from w*h*4).
+            let n = out.len().min(src.len());
+            out[..n].copy_from_slice(&src[..n]);
         }
     }
     out
@@ -516,9 +542,13 @@ unsafe fn compile_program(
             gl.delete_shader(vert);
             return Err(format!("vertex shader compile: {log}"));
         }
-        let frag = gl
-            .create_shader(glow::FRAGMENT_SHADER)
-            .map_err(|e| format!("create frag shader: {e}"))?;
+        let frag = match gl.create_shader(glow::FRAGMENT_SHADER) {
+            Ok(frag) => frag,
+            Err(e) => {
+                gl.delete_shader(vert);
+                return Err(format!("create frag shader: {e}"));
+            }
+        };
         gl.shader_source(frag, frag_src);
         gl.compile_shader(frag);
         if !gl.get_shader_compile_status(frag) {

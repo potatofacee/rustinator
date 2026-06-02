@@ -188,7 +188,8 @@ pub(crate) fn draw_panes(
             || response.double_clicked()
             || response.triple_clicked()
         {
-            ctx.tab_mgr.active_tab_mut().focused = id;
+            let active = ctx.tab_mgr.active_tab;
+            ctx.tab_mgr.set_focused_pane(active, id);
         }
 
         if response.middle_clicked() {
@@ -377,7 +378,11 @@ fn handle_pane_mouse(
         .unwrap_or(false)
         && !shift_held;
 
-    let primary_down = response.is_pointer_button_down_on();
+    // `is_pointer_button_down_on()` is true for ANY button, so a right/middle
+    // press would otherwise be treated as a selection gesture and clear it.
+    // Gate on the primary (left) button actually being held.
+    let primary_down = response.is_pointer_button_down_on()
+        && ui.input(|i| i.pointer.primary_down());
 
     let mem_id = egui::Id::new(("pane_sel_down", tab_idx, pane_id));
     let was_down: bool = ui.ctx().data(|d| d.get_temp(mem_id).unwrap_or(false));
@@ -724,6 +729,20 @@ fn paint_pane(
         let [r, g, b] = pane.defaults.fg;
         [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0]
     };
+    // The GL viewport is inset by FOCUS_BORDER; for a focused pane that ring is
+    // covered by the focus stroke, but for an unfocused pane nothing painted it
+    // and the window background showed through as a 1px gap. Fill the pane with
+    // the terminal's own default bg (same color+opacity the GL quad uses) so
+    // the ring matches the terminal regardless of focus.
+    let bg_fill = {
+        let [r, g, b, a] = frame.default_bg;
+        egui::Color32::from_rgba_unmultiplied(
+            (r * 255.0).round() as u8,
+            (g * 255.0).round() as u8,
+            (b * 255.0).round() as u8,
+            (a * 255.0).round() as u8,
+        )
+    };
     let cb = egui_glow::CallbackFn::new(move |info, painter| {
         let vp = info.viewport_in_pixels();
         let viewport_px = (vp.width_px as f32, vp.height_px as f32);
@@ -780,26 +799,34 @@ fn paint_pane(
         // zeroing the UVs of every glyph already recorded this frame. Detect
         // that via the atlas generation and rebuild against the fresh atlas. A
         // single pane's glyph set always fits, so this retries at most once.
-        let gl_instances = loop {
-            let atlas_gen = renderer.atlas_generation();
-            let mut gl_instances = Vec::with_capacity(frame.cells.len());
-            for cell in &frame.cells {
-                if cell.c != ' ' && cell.c != '\0' {
-                    let glyph_fg = if invert_cell == Some((cell.col, cell.row)) {
-                        cell.bg
-                    } else {
-                        cell.fg
-                    };
-                    if let Some(gi) = renderer.build_glyph_instance(
-                        cell.c, cell.style, cell.col, cell.row, glyph_fg, &mut font,
-                    ) {
-                        gl_instances.push(gi);
+        // Bound the loop regardless so a pathological case can never spin
+        // forever; on exhaustion proceed with whatever was built last.
+        const MAX_ATLAS_RETRIES: u32 = 4;
+        let gl_instances = {
+            let mut built = Vec::new();
+            for _ in 0..MAX_ATLAS_RETRIES {
+                let atlas_gen = renderer.atlas_generation();
+                let mut gl_instances = Vec::with_capacity(frame.cells.len());
+                for cell in &frame.cells {
+                    if cell.c != ' ' && cell.c != '\0' {
+                        let glyph_fg = if invert_cell == Some((cell.col, cell.row)) {
+                            cell.bg
+                        } else {
+                            cell.fg
+                        };
+                        if let Some(gi) = renderer.build_glyph_instance(
+                            cell.c, cell.style, cell.col, cell.row, glyph_fg, &mut font,
+                        ) {
+                            gl_instances.push(gi);
+                        }
                     }
                 }
+                built = gl_instances;
+                if renderer.atlas_generation() == atlas_gen {
+                    break;
+                }
             }
-            if renderer.atlas_generation() == atlas_gen {
-                break gl_instances;
-            }
+            built
         };
         if let Some(overlay) = effective_cursor {
             let cw = renderer.cell_w;
@@ -865,6 +892,9 @@ fn paint_pane(
         renderer.paint(viewport_px, &bg, &gl_instances);
     });
 
+    // Paint the bg behind the GL viewport so the FOCUS_BORDER inset ring is
+    // filled with the terminal bg (the GL callback covers inner_rect on top).
+    ui.painter().rect_filled(rect, 0.0, bg_fill);
     ui.painter().add(egui::PaintCallback {
         rect: inner_rect,
         callback: Arc::new(cb),

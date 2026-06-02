@@ -1,8 +1,10 @@
+use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
-use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg};
+use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg, State as EventLoopState};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Boundary, Column, Direction as GridDir, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
@@ -20,6 +22,11 @@ use crate::keyboard;
 use crate::mouse::{self, MouseButton, MouseKind, MouseMods};
 
 pub type PaneId = u64;
+
+/// JoinHandle for the alacritty PTY EventLoop thread. `EventLoop::spawn`
+/// returns `JoinHandle<(EventLoop, State)>`; we keep it so the old thread can
+/// be reaped deterministically on respawn.
+type PtyLoopHandle = JoinHandle<(EventLoop<tty::Pty, EventProxy>, EventLoopState)>;
 
 // Xterm-ish ANSI palette (NamedColor::Black..BrightWhite = 0..15).
 const ANSI: [[u8; 3]; 16] = [
@@ -327,7 +334,16 @@ pub struct Pane {
     pub defaults: PaneDefaults,
     pub read_only: bool,
     pub scrollbar_visible: bool,
+    /// True once the child process has exited and the pane is being held open
+    /// (ExitAction::Hold). Distinct from the transient `exited` event flag:
+    /// `exited` fires the Exit *event* once and is consumed by the reaper,
+    /// while `dead` is a persistent status. A dead pane's PTY channel is
+    /// closed, so input must be a no-op rather than silently dropped.
+    dead: Cell<bool>,
     ui_selection: Mutex<Option<Selection>>,
+    /// JoinHandle for the live PTY EventLoop thread, kept so the old thread can
+    /// be joined (child reaped) before being replaced in `respawn`.
+    pty_handle: Option<PtyLoopHandle>,
 }
 
 impl Pane {
@@ -384,7 +400,7 @@ impl Pane {
         let event_loop = EventLoop::new(Arc::clone(&terminal), proxy, pty, false, false)
             .map_err(|e| format!("failed to create pty event loop: {e}"))?;
         let pty_tx = event_loop.channel();
-        let _handle = event_loop.spawn();
+        let pty_handle = Some(event_loop.spawn());
 
         Ok(Self {
             id,
@@ -401,7 +417,9 @@ impl Pane {
             defaults,
             read_only: false,
             scrollbar_visible: true,
+            dead: Cell::new(false),
             ui_selection: Mutex::new(None),
+            pty_handle,
         })
     }
 
@@ -412,8 +430,14 @@ impl Pane {
         term_config: Config,
         winit_proxy: Option<winit::event_loop::EventLoopProxy<crate::window::UserEvent>>,
     ) -> Result<(), String> {
-        // Shut down the old PTY event loop thread before replacing the sender.
+        // Shut down the old PTY event loop thread before replacing the sender,
+        // then join it so the old child is reaped deterministically before we
+        // overwrite the pty/terminal (otherwise the thread is detached and the
+        // child may linger).
         let _ = self.pty_tx.send(Msg::Shutdown);
+        if let Some(handle) = self.pty_handle.take() {
+            let _ = handle.join();
+        }
 
         let proxy = EventProxy::new(winit_proxy);
         let dirty = Arc::clone(&proxy.dirty);
@@ -450,19 +474,45 @@ impl Pane {
         let event_loop = EventLoop::new(Arc::clone(&terminal), proxy, pty, false, false)
             .map_err(|e| format!("failed to create pty event loop: {e}"))?;
         let pty_tx = event_loop.channel();
-        let _handle = event_loop.spawn();
+        let pty_handle = Some(event_loop.spawn());
 
         self.terminal = terminal;
         self.pty_tx = pty_tx;
+        self.pty_handle = pty_handle;
         self.child_pid = child_pid;
         self.dirty = dirty;
         self.has_new_output = has_new_output;
         self.exited = exited;
         self.title = title;
         self.cached = None;
+        self.dead.set(false);
         *self.ui_selection.lock().unwrap() = None;
 
         Ok(())
+    }
+
+    /// Whether the pane's child has exited and the pane is being held open.
+    /// A dead pane's PTY channel is closed; input is a no-op.
+    #[allow(dead_code)]
+    pub fn is_dead(&self) -> bool {
+        self.dead.get()
+    }
+
+    /// Mark the pane dead (child exited, held open). Idempotent.
+    pub fn mark_dead(&self) {
+        self.dead.set(true);
+    }
+
+    /// Apply updated terminal options (scrollback history, semantic escape
+    /// chars, etc.) to the live `Term`. `Term::set_options` replaces the config
+    /// and calls `grid.update_history`, so scrollback changes take effect on
+    /// the existing grid (the inactive/alt grid updates on its next screen
+    /// switch). Marks the pane dirty so the change is reflected on next frame.
+    pub fn apply_term_config(&self, term_config: Config) {
+        let mut term = self.terminal.lock();
+        term.set_options(term_config);
+        drop(term);
+        self.dirty.store(true, Ordering::Release);
     }
 
     pub fn title(&self) -> Option<String> {
@@ -514,7 +564,7 @@ impl Pane {
     }
 
     pub fn send_bytes(&self, bytes: Vec<u8>) {
-        if bytes.is_empty() {
+        if bytes.is_empty() || self.dead.get() {
             return;
         }
         let _ = self.pty_tx.send(Msg::Input(bytes.into()));
@@ -596,8 +646,10 @@ impl Pane {
     }
 
     pub fn clear_selection(&self) {
-        *self.ui_selection.lock().unwrap() = None;
+        // Lock order: terminal first, then ui_selection (matches begin/update/
+        // snapshot) to avoid a deadlock with the PTY thread.
         let mut term = self.terminal.lock();
+        *self.ui_selection.lock().unwrap() = None;
         if term.selection.is_some() {
             term.selection = None;
             self.dirty.store(true, Ordering::Release);
@@ -605,8 +657,10 @@ impl Pane {
     }
 
     pub fn selection_text(&self) -> Option<String> {
-        let sel = self.ui_selection.lock().unwrap().clone();
+        // Lock order: terminal first, then ui_selection (matches begin/update/
+        // snapshot) to avoid a deadlock with the PTY thread.
         let mut term = self.terminal.lock();
+        let sel = self.ui_selection.lock().unwrap().clone();
         if let Some(s) = sel {
             term.selection = Some(s);
         }
@@ -857,6 +911,9 @@ impl Pane {
 impl Drop for Pane {
     fn drop(&mut self) {
         let _ = self.pty_tx.send(Msg::Shutdown);
+        if let Some(handle) = self.pty_handle.take() {
+            let _ = handle.join();
+        }
     }
 }
 

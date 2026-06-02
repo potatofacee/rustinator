@@ -353,7 +353,15 @@ impl Config {
                 .map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
         }
         let text = toml::to_string_pretty(self).map_err(|e| format!("serialize: {e}"))?;
-        std::fs::write(&path, text).map_err(|e| format!("write {}: {e}", path.display()))?;
+        // Atomic write: write to a temp file in the same directory (same
+        // filesystem so rename is atomic), then rename over the target. This
+        // avoids leaving a truncated/corrupt config if we crash mid-write.
+        let tmp = path.with_extension(format!("toml.tmp.{}", std::process::id()));
+        std::fs::write(&tmp, text).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+        std::fs::rename(&tmp, &path).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            format!("rename {} -> {}: {e}", tmp.display(), path.display())
+        })?;
         Ok(path)
     }
 }
@@ -363,11 +371,16 @@ pub fn format_hex(rgb: [u8; 3]) -> String {
 }
 
 fn config_path() -> Option<PathBuf> {
+    // Honor XDG_CONFIG_HOME first on all platforms (including macOS) so shared
+    // dotfiles work; fall back to the per-platform default otherwise.
+    if let Ok(x) = std::env::var("XDG_CONFIG_HOME") {
+        if !x.is_empty() {
+            return Some(PathBuf::from(x).join("rustinator/config.toml"));
+        }
+    }
     let home = std::env::var("HOME").ok()?;
     if cfg!(target_os = "macos") {
         Some(PathBuf::from(&home).join("Library/Application Support/rustinator/config.toml"))
-    } else if let Ok(x) = std::env::var("XDG_CONFIG_HOME") {
-        Some(PathBuf::from(x).join("rustinator/config.toml"))
     } else {
         Some(PathBuf::from(&home).join(".config/rustinator/config.toml"))
     }
@@ -394,7 +407,7 @@ pub fn word_chars_to_semantic_escape(word_chars: &str) -> String {
     candidates.chars().filter(|c| !word_set.contains(c)).collect()
 }
 
-fn parse_hex(s: &str) -> Option<[u8; 3]> {
+pub(crate) fn parse_hex(s: &str) -> Option<[u8; 3]> {
     let s = s.trim().trim_start_matches('#');
     if s.len() != 6 {
         return None;

@@ -1,20 +1,41 @@
 use std::io::Write;
 use std::path::PathBuf;
 
+// We hijack ZDOTDIR to inject a title hook without touching the user's
+// dotfiles. The critical rule: point ZDOTDIR back at the user's real config
+// dir *while sourcing each of their files*, so any nested zsh started during
+// startup (version managers, compinit, instant-prompt subshells, etc.) sees
+// the real ZDOTDIR and does NOT re-enter this integration — re-entry caused
+// infinite recursion ("recursion limit exceeded / job table full"). After
+// sourcing, restore ZDOTDIR to the integration dir so zsh keeps reading our
+// remaining startup files. __RUSTINATOR_ORIG_ZDOTDIR holds the user's real
+// dir (set by inject_env); it falls back to $HOME when unset.
+
+// $ZDOTDIR on entry to each file is this integration dir (that's how zsh found
+// the file). __rustinator_user resolves the user's real config dir; if a stale
+// or inherited value points it back at the integration dir, fall back to $HOME
+// so we can never source ourselves (which caused infinite recursion).
+
 const ZSH_ZSHENV: &str = r#"
-if [ -n "$__RUSTINATOR_ORIG_ZDOTDIR" ]; then
-    [ -f "$__RUSTINATOR_ORIG_ZDOTDIR/.zshenv" ] && . "$__RUSTINATOR_ORIG_ZDOTDIR/.zshenv"
-elif [ -f "$HOME/.zshenv" ]; then
-    . "$HOME/.zshenv"
-fi
+__rustinator_int="$ZDOTDIR"
+__rustinator_user="${__RUSTINATOR_ORIG_ZDOTDIR:-$HOME}"
+[ "$__rustinator_user" = "$__rustinator_int" ] && __rustinator_user="$HOME"
+ZDOTDIR="$__rustinator_user"
+[ -f "$ZDOTDIR/.zshenv" ] && . "$ZDOTDIR/.zshenv"
+__RUSTINATOR_ORIG_ZDOTDIR="$ZDOTDIR"
+ZDOTDIR="$__rustinator_int"
+unset __rustinator_int __rustinator_user
 "#;
 
 const ZSH_ZPROFILE: &str = r#"
-if [ -n "$__RUSTINATOR_ORIG_ZDOTDIR" ]; then
-    [ -f "$__RUSTINATOR_ORIG_ZDOTDIR/.zprofile" ] && . "$__RUSTINATOR_ORIG_ZDOTDIR/.zprofile"
-elif [ -f "$HOME/.zprofile" ]; then
-    . "$HOME/.zprofile"
-fi
+__rustinator_int="$ZDOTDIR"
+__rustinator_user="${__RUSTINATOR_ORIG_ZDOTDIR:-$HOME}"
+[ "$__rustinator_user" = "$__rustinator_int" ] && __rustinator_user="$HOME"
+ZDOTDIR="$__rustinator_user"
+[ -f "$ZDOTDIR/.zprofile" ] && . "$ZDOTDIR/.zprofile"
+__RUSTINATOR_ORIG_ZDOTDIR="$ZDOTDIR"
+ZDOTDIR="$__rustinator_int"
+unset __rustinator_int __rustinator_user
 "#;
 
 const ZSH_ZSHRC: &str = r#"
@@ -24,28 +45,37 @@ __rustinator_precmd() {
 }
 autoload -Uz add-zsh-hook
 add-zsh-hook precmd __rustinator_precmd
-# Source the user's real zshrc.
-if [ -n "$__RUSTINATOR_ORIG_ZDOTDIR" ]; then
-    ZDOTDIR="$__RUSTINATOR_ORIG_ZDOTDIR"
-    unset __RUSTINATOR_ORIG_ZDOTDIR
-    [ -f "$ZDOTDIR/.zshrc" ] && . "$ZDOTDIR/.zshrc"
-elif [ -f "$HOME/.zshrc" ]; then
-    . "$HOME/.zshrc"
-fi
+# Source the user's real zshrc with their ZDOTDIR, then hand the session back
+# to their config dir (so $ZDOTDIR is clean and any later .zlogin is read from
+# the user's dir directly).
+__rustinator_int="$ZDOTDIR"
+__rustinator_user="${__RUSTINATOR_ORIG_ZDOTDIR:-$HOME}"
+[ "$__rustinator_user" = "$__rustinator_int" ] && __rustinator_user="$HOME"
+ZDOTDIR="$__rustinator_user"
+[ -f "$ZDOTDIR/.zshrc" ] && . "$ZDOTDIR/.zshrc"
+unset __rustinator_int __rustinator_user __RUSTINATOR_ORIG_ZDOTDIR
 "#;
 
 const ZSH_ZLOGIN: &str = r#"
-if [ -n "$__RUSTINATOR_ORIG_ZDOTDIR" ]; then
-    [ -f "$__RUSTINATOR_ORIG_ZDOTDIR/.zlogin" ] && . "$__RUSTINATOR_ORIG_ZDOTDIR/.zlogin"
-elif [ -f "$HOME/.zlogin" ]; then
-    . "$HOME/.zlogin"
-fi
+__rustinator_int="$ZDOTDIR"
+__rustinator_user="${__RUSTINATOR_ORIG_ZDOTDIR:-$HOME}"
+[ "$__rustinator_user" = "$__rustinator_int" ] && __rustinator_user="$HOME"
+ZDOTDIR="$__rustinator_user"
+[ -f "$ZDOTDIR/.zlogin" ] && . "$ZDOTDIR/.zlogin"
+unset __rustinator_int __rustinator_user __RUSTINATOR_ORIG_ZDOTDIR
 "#;
 
 const BASH_INTEGRATION: &str = r#"
-# rustinator shell integration — sets window title via OSC 0
+# rustinator shell integration — sets window title via OSC 0.
+# BASH_ENV is inherited by nested non-interactive bash, which re-sources this
+# file; guard against re-entry so sourcing the user's rc (and anything it
+# spawns) can't recurse.
+if [ -n "$__RUSTINATOR_BASH_ACTIVE" ]; then
+    return 2>/dev/null
+fi
+export __RUSTINATOR_BASH_ACTIVE=1
 __rustinator_prompt_command() {
-    printf '\e]0;%s@%s: %s\a' "$USER" "${HOSTNAME%%.*}" "${PWD/#$HOME/\~}"
+    printf '\e]0;%s@%s: %s\a' "$USER" "${HOSTNAME%%.*}" "${PWD/#$HOME/~}"
 }
 PROMPT_COMMAND="__rustinator_prompt_command${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
 # Source the user's profile and rc files.
@@ -61,6 +91,7 @@ if shopt -q login_shell 2>/dev/null; then
 else
     [ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc"
 fi
+unset __RUSTINATOR_BASH_ACTIVE
 "#;
 
 fn integration_dir() -> PathBuf {
@@ -90,11 +121,18 @@ pub fn write_scripts() -> PathBuf {
 
 pub fn inject_env(env: &mut std::collections::HashMap<String, String>) {
     let dir = write_scripts();
+    let dir_str = dir.to_string_lossy().into_owned();
 
+    // Capture the user's real ZDOTDIR so the scripts can source their dotfiles.
+    // But if we inherited our own integration dir (e.g. launched from a shell
+    // whose session still has ZDOTDIR pointed here), do NOT record it as the
+    // original — that would make the scripts source themselves and recurse.
     if let Ok(existing) = std::env::var("ZDOTDIR") {
-        env.insert("__RUSTINATOR_ORIG_ZDOTDIR".into(), existing);
+        if existing != dir_str {
+            env.insert("__RUSTINATOR_ORIG_ZDOTDIR".into(), existing);
+        }
     }
-    env.insert("ZDOTDIR".into(), dir.to_string_lossy().into_owned());
+    env.insert("ZDOTDIR".into(), dir_str);
     env.insert(
         "BASH_ENV".into(),
         dir.join("bashrc").to_string_lossy().into_owned(),

@@ -25,7 +25,7 @@ fn macos_screen_insets(window: &Window) -> Option<(f64, f64, f64, f64)> {
         result
     }
     .or_else(|| {
-        let mtm = MainThreadMarker::new().expect("must be called from main thread");
+        let mtm = MainThreadMarker::new()?;
         let screen = NSScreen::mainScreen(mtm)?;
         Some((screen.frame(), screen.visibleFrame()))
     })?;
