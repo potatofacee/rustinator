@@ -435,6 +435,7 @@ impl ApplicationHandler<UserEvent> for WinitApp {
                             }
                         }
                     }
+                    hk.gl_window.window.request_redraw();
                     self.hotkey_window = Some(hk);
                     return;
                 }
@@ -531,6 +532,7 @@ impl ApplicationHandler<UserEvent> for WinitApp {
                         }
                     }
                 }
+                gl_state.window.request_redraw();
                 return;
             }
         }
@@ -555,6 +557,10 @@ impl ApplicationHandler<UserEvent> for WinitApp {
             }
             WindowEvent::Resized(size) => {
                 gl_state.resize(size.width, size.height);
+                gl_state.window.request_redraw();
+            }
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                app.set_scale_factor(scale_factor as f32);
                 gl_state.window.request_redraw();
             }
             WindowEvent::Focused(focused) => {
@@ -623,7 +629,16 @@ impl WinitApp {
 
         gl_state.make_current();
 
-        let raw_input = egui_winit.take_egui_input(&gl_state.window);
+        let mut raw_input = egui_winit.take_egui_input(&gl_state.window);
+        // Keep egui's focus traversal from eating Tab/Shift+Tab. egui decides
+        // focus movement in begin_pass from these events, before app.logic can
+        // strip them, so it grabs keyboard focus on a widget — after which
+        // `egui_wants_keyboard_input()` makes app.logic drop all terminal keys
+        // until the window is refocused. The terminal gets Tab via the separate
+        // winit pending_raw_keys path, so removing it here costs nothing.
+        raw_input.events.retain(|ev| {
+            !matches!(ev, egui::Event::Key { key: egui::Key::Tab, pressed: true, .. })
+        });
         let clear_color = app.clear_color();
 
         {

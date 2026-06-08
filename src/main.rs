@@ -96,6 +96,29 @@ impl FontState {
         }
     }
 
+    fn set_scale_factor(&mut self, scale_factor: f32, renderer: &Arc<Mutex<Renderer>>, font_family: &str, tab_mgr: &mut TabManager) {
+        if (scale_factor - self.scale_factor).abs() < f32::EPSILON {
+            return;
+        }
+        self.scale_factor = scale_factor;
+        let size = self.size_override.unwrap_or(self.base_size);
+        if let Ok(fc) = FontContext::new(font_family, size * self.scale_factor) {
+            self.cell_w = fc.cell_width();
+            self.cell_h = fc.cell_height();
+            {
+                let mut renderer = renderer.lock().unwrap();
+                renderer.reload_font(&fc);
+            }
+            *self.ctx.lock().unwrap() = fc;
+            for tab in &mut tab_mgr.tabs {
+                for pane in tab.panes.values_mut() {
+                    pane.dirty.store(true, std::sync::atomic::Ordering::Release);
+                    pane.cached = None;
+                }
+            }
+        }
+    }
+
     fn reload_font(&mut self, family: &str, size: f32, renderer: &Arc<Mutex<Renderer>>) -> Result<(), crossfont::Error> {
         let new_font = FontContext::new(family, size * self.scale_factor)?;
         let cell_w = new_font.cell_width();
@@ -461,6 +484,11 @@ impl App {
                 pane.send_focus_event(focused);
             }
         }
+    }
+
+    pub(crate) fn set_scale_factor(&mut self, scale_factor: f32) {
+        let family = self.user_config.active().font.family.clone();
+        self.font.set_scale_factor(scale_factor, &self.render.renderer, &family, &mut self.tab_mgr);
     }
 
     pub(crate) fn logic(&mut self, ctx: &egui::Context) {
