@@ -1,11 +1,11 @@
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use egui_glow::ShaderVersion;
 use winit::application::ApplicationHandler;
-use winit::event::{StartCause, WindowEvent};
+use winit::event::WindowEvent;
 use winit::keyboard::{Key, NamedKey};
-use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::window::{WindowAttributes, WindowId, WindowLevel};
 
 use crate::App;
@@ -198,6 +198,15 @@ struct WinitApp {
     #[cfg(target_os = "macos")]
     hotkey_previous_app_pid: Option<i32>,
     terminal_repaint_pending: bool,
+    // Frame governor: cap terminal-driven repaints to a fixed rate so a high
+    // PTY output rate can't drive an unbounded redraw loop. vsync is unreliable
+    // on some Linux drivers (software GL ignores swap interval), so this is the
+    // real throttle, not a fallback.
+    last_frame: Option<Instant>,
+    frame_interval: Duration,
+    // Deadline egui asked for via repaint_delay (cursor blink etc). Folded
+    // into the control flow in about_to_wait; never set on the loop directly.
+    egui_repaint_at: Option<Instant>,
 }
 
 impl WinitApp {
@@ -221,6 +230,9 @@ impl WinitApp {
             #[cfg(target_os = "macos")]
             hotkey_previous_app_pid: None,
             terminal_repaint_pending: false,
+            last_frame: None,
+            frame_interval: Duration::from_micros(16_667), // ~60 fps
+            egui_repaint_at: None,
         }
     }
 }
@@ -573,28 +585,56 @@ impl ApplicationHandler<UserEvent> for WinitApp {
         }
     }
 
-    fn new_events(&mut self, _event_loop: &ActiveEventLoop, cause: StartCause) {
-        if matches!(cause, StartCause::ResumeTimeReached { .. }) {
-            if let Some(gl_state) = &self.gl_state {
-                gl_state.window.request_redraw();
-            }
-        }
-    }
-
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         if self.shutting_down {
             return;
         }
-        if std::mem::take(&mut self.terminal_repaint_pending) {
+        let now = Instant::now();
+        let mut next_wake: Option<Instant> = None;
+
+        // Frame governor. A pending terminal repaint only triggers a redraw once
+        // at least frame_interval has elapsed since the last frame; otherwise we
+        // wake when the frame is due. This caps repaints at ~60 fps no matter how
+        // fast the PTY produces output, and costs nothing when idle.
+        if self.terminal_repaint_pending {
             if let Some(gl_state) = &self.gl_state {
-                gl_state.window.request_redraw();
+                match self.last_frame {
+                    Some(last) if now < last + self.frame_interval => {
+                        next_wake = Some(last + self.frame_interval);
+                    }
+                    _ => {
+                        self.terminal_repaint_pending = false;
+                        gl_state.window.request_redraw();
+                    }
+                }
             }
         }
+
+        // egui-requested repaint (cursor blink etc).
+        if let Some(at) = self.egui_repaint_at {
+            if at <= now {
+                self.egui_repaint_at = None;
+                if let Some(gl_state) = &self.gl_state {
+                    gl_state.window.request_redraw();
+                }
+            } else {
+                next_wake = Some(next_wake.map_or(at, |w| w.min(at)));
+            }
+        }
+
         if let Some(hk) = &self.hotkey_window {
             if hk.shown_at.is_some() {
                 hk.gl_window.window.request_redraw();
             }
         }
+
+        // ControlFlow is sticky in winit: a stale WaitUntil in the past makes
+        // the loop fire ResumeTimeReached on every iteration (busy loop).
+        // Recompute it from scratch on every pass.
+        event_loop.set_control_flow(match next_wake {
+            Some(at) => ControlFlow::WaitUntil(at),
+            None => ControlFlow::Wait,
+        });
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
@@ -626,6 +666,11 @@ impl WinitApp {
         let painter = self.painter.as_mut().unwrap();
         let egui_winit = self.egui_winit.as_mut().unwrap();
         let app = self.app.as_mut().unwrap();
+
+        // This frame satisfies any pending terminal repaint. Clearing here (not
+        // before) lets PTY output that arrives mid-paint re-arm the flag so the
+        // governor schedules the next frame.
+        self.terminal_repaint_pending = false;
 
         gl_state.make_current();
 
@@ -723,9 +768,9 @@ impl WinitApp {
             if vp_out.repaint_delay.is_zero() {
                 gl_state.window.request_redraw();
             } else if vp_out.repaint_delay < std::time::Duration::from_secs(86400) {
-                event_loop.set_control_flow(
-                    winit::event_loop::ControlFlow::wait_duration(vp_out.repaint_delay),
-                );
+                self.egui_repaint_at = Some(Instant::now() + vp_out.repaint_delay);
+            } else {
+                self.egui_repaint_at = None;
             }
         }
 
@@ -744,6 +789,7 @@ impl WinitApp {
         );
 
         gl_state.swap_buffers();
+        self.last_frame = Some(Instant::now());
 
         // Manage prefs pop-out window lifecycle.
         if app.prefs.open && self.prefs.is_none() {

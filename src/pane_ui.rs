@@ -340,19 +340,16 @@ fn handle_pane_mouse(
         .or_else(|| response.hover_pos());
     let inner_rect = terminal_rect.shrink(FOCUS_BORDER);
     let pointer_cell = pointer.map(|p| cell_at(p, inner_rect, ppp, cell_w, cell_h));
-    let url_at_pointer = pointer_cell.and_then(|(col, row)| {
-        let frame = tab
-            .panes
-            .get(&pane_id)?
-            .cached
-            .as_ref()?
-            .clone();
-        frame
-            .urls
-            .iter()
-            .find(|u| u.row == row && col >= u.start_col && col < u.end_col)
-            .cloned()
-    });
+    // URL hit-testing only matters while Ctrl is held (hover highlight + click).
+    // Scan on demand for the pointer's row instead of every frame snapshot.
+    let url_at_pointer = if ctrl_held {
+        pointer_cell.and_then(|(col, row)| {
+            let frame = tab.panes.get(&pane_id)?.cached.as_ref()?;
+            crate::pane::scan_url_at(&frame.cells, row, col)
+        })
+    } else {
+        None
+    };
     let url_highlight = if ctrl_held && response.hovered() {
         url_at_pointer.clone()
     } else {
