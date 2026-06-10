@@ -84,7 +84,7 @@ impl PrefsWindowState {
             bg.a() as f32 / 255.0,
         ];
 
-        self.gl_window.end_frame(main_context, full_output, clear_color);
+        let _ = self.gl_window.end_frame(main_context, full_output, clear_color);
     }
 }
 
@@ -93,6 +93,12 @@ struct HotkeyWindowState {
     current_modifiers: winit::event::Modifiers,
     zoom_pixel_accumulator: f64,
     shown_at: Option<Instant>,
+    // Deadline this window's egui asked for via repaint_delay (cursor blink
+    // etc). Folded into the control flow in about_to_wait.
+    repaint_at: Option<Instant>,
+    // When this window last painted; used by about_to_wait to cap its repaint
+    // cadence to frame_interval.
+    last_paint: Option<Instant>,
 }
 
 impl HotkeyWindowState {
@@ -132,6 +138,8 @@ impl HotkeyWindowState {
             current_modifiers: winit::event::Modifiers::default(),
             zoom_pixel_accumulator: 0.0,
             shown_at: None,
+            repaint_at: None,
+            last_paint: None,
         }
     }
 
@@ -173,7 +181,8 @@ impl HotkeyWindowState {
             opacity,
         ];
 
-        self.gl_window.end_frame(main_context, full_output, clear_color);
+        self.repaint_at = self.gl_window.end_frame(main_context, full_output, clear_color);
+        self.last_paint = Some(Instant::now());
     }
 }
 
@@ -197,11 +206,10 @@ struct WinitApp {
     hotkey_hide_on_focus_loss: bool,
     #[cfg(target_os = "macos")]
     hotkey_previous_app_pid: Option<i32>,
-    terminal_repaint_pending: bool,
-    // Frame governor: cap terminal-driven repaints to a fixed rate so a high
-    // PTY output rate can't drive an unbounded redraw loop. vsync is unreliable
-    // on some Linux drivers (software GL ignores swap interval), so this is the
-    // real throttle, not a fallback.
+    // Any pending main-window repaint (PTY output, input events, egui
+    // animations, due deadlines). The frame governor in about_to_wait turns it
+    // into an actual redraw at most once per frame_interval.
+    repaint_pending: bool,
     last_frame: Option<Instant>,
     frame_interval: Duration,
     // Deadline egui asked for via repaint_delay (cursor blink etc). Folded
@@ -229,7 +237,7 @@ impl WinitApp {
             hotkey_hide_on_focus_loss: true,
             #[cfg(target_os = "macos")]
             hotkey_previous_app_pid: None,
-            terminal_repaint_pending: false,
+            repaint_pending: false,
             last_frame: None,
             frame_interval: Duration::from_micros(16_667), // ~60 fps
             egui_repaint_at: None,
@@ -306,7 +314,7 @@ impl ApplicationHandler<UserEvent> for WinitApp {
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::Repaint => {
-                self.terminal_repaint_pending = true;
+                self.repaint_pending = true;
             }
             UserEvent::HotkeyTogglePressed => {
                 if let Some(hk) = &mut self.hotkey_window {
@@ -332,6 +340,8 @@ impl ApplicationHandler<UserEvent> for WinitApp {
                         hk.shown_at = Some(Instant::now());
                         hk.gl_window.window.set_visible(true);
                         hk.gl_window.window.focus_window();
+                        hk.repaint_at = None;
+                        hk.gl_window.window.request_redraw();
                         #[cfg(target_os = "macos")]
                         if self.hotkey_previous_app_pid.is_some() {
                             if let Some(gl_state) = &self.gl_state {
@@ -447,7 +457,7 @@ impl ApplicationHandler<UserEvent> for WinitApp {
                             }
                         }
                     }
-                    hk.gl_window.window.request_redraw();
+                    hk.repaint_at = Some(Instant::now());
                     self.hotkey_window = Some(hk);
                     return;
                 }
@@ -455,7 +465,7 @@ impl ApplicationHandler<UserEvent> for WinitApp {
 
             let response = hk.gl_window.egui_winit.on_window_event(&hk.gl_window.window, &event);
             if response.repaint {
-                hk.gl_window.window.request_redraw();
+                hk.repaint_at = Some(Instant::now());
             }
             let consumed = response.consumed;
             if !consumed {
@@ -468,7 +478,7 @@ impl ApplicationHandler<UserEvent> for WinitApp {
                         if let Some(gl_state) = &self.gl_state {
                             hk.resize(&gl_state.gl_context, size.width, size.height);
                         }
-                        hk.gl_window.window.request_redraw();
+                        hk.repaint_at = Some(Instant::now());
                     }
                     WindowEvent::Focused(focused) => {
                         app.notify_focus(focused);
@@ -544,7 +554,7 @@ impl ApplicationHandler<UserEvent> for WinitApp {
                         }
                     }
                 }
-                gl_state.window.request_redraw();
+                self.repaint_pending = true;
                 return;
             }
         }
@@ -552,7 +562,7 @@ impl ApplicationHandler<UserEvent> for WinitApp {
         let response = egui_winit.on_window_event(&gl_state.window, &event);
 
         if response.repaint {
-            gl_state.window.request_redraw();
+            self.repaint_pending = true;
         }
         if response.consumed {
             return;
@@ -564,16 +574,16 @@ impl ApplicationHandler<UserEvent> for WinitApp {
                     event_loop.exit();
                 } else {
                     app.dialogs.close_dialog_open = true;
-                    gl_state.window.request_redraw();
+                    self.repaint_pending = true;
                 }
             }
             WindowEvent::Resized(size) => {
                 gl_state.resize(size.width, size.height);
-                gl_state.window.request_redraw();
+                self.repaint_pending = true;
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 app.set_scale_factor(scale_factor as f32);
-                gl_state.window.request_redraw();
+                self.repaint_pending = true;
             }
             WindowEvent::Focused(focused) => {
                 app.notify_focus(focused);
@@ -592,39 +602,62 @@ impl ApplicationHandler<UserEvent> for WinitApp {
         let now = Instant::now();
         let mut next_wake: Option<Instant> = None;
 
-        // Frame governor. A pending terminal repaint only triggers a redraw once
-        // at least frame_interval has elapsed since the last frame; otherwise we
-        // wake when the frame is due. This caps repaints at ~60 fps no matter how
-        // fast the PTY produces output, and costs nothing when idle.
-        if self.terminal_repaint_pending {
-            if let Some(gl_state) = &self.gl_state {
-                match self.last_frame {
-                    Some(last) if now < last + self.frame_interval => {
-                        next_wake = Some(last + self.frame_interval);
-                    }
-                    _ => {
-                        self.terminal_repaint_pending = false;
-                        gl_state.window.request_redraw();
-                    }
-                }
-            }
-        }
-
-        // egui-requested repaint (cursor blink etc).
+        // An egui-requested repaint deadline (cursor blink etc) that has come
+        // due becomes a pending repaint, handled by the governor below.
         if let Some(at) = self.egui_repaint_at {
             if at <= now {
                 self.egui_repaint_at = None;
-                if let Some(gl_state) = &self.gl_state {
-                    gl_state.window.request_redraw();
-                }
+                self.repaint_pending = true;
             } else {
-                next_wake = Some(next_wake.map_or(at, |w| w.min(at)));
+                next_wake = Some(at);
             }
         }
 
-        if let Some(hk) = &self.hotkey_window {
+        // Frame governor: sole authority for main-window redraws. Every
+        // repaint source (PTY output, input events, egui animations, due
+        // deadlines) sets repaint_pending; a redraw is issued only once at
+        // least frame_interval has elapsed since the last frame, otherwise we
+        // wake when the frame is due. vsync is unreliable on some Linux
+        // drivers (software GL ignores swap interval), so this cap is the
+        // real throttle, not a fallback.
+        if self.repaint_pending {
+            if let Some(gl_state) = &self.gl_state {
+                match self.last_frame {
+                    Some(last) if now < last + self.frame_interval => {
+                        let due = last + self.frame_interval;
+                        next_wake = Some(next_wake.map_or(due, |w| w.min(due)));
+                    }
+                    _ => {
+                        self.repaint_pending = false;
+                        gl_state.window.request_redraw();
+                        // The hotkey dropdown shows the same terminal content,
+                        // so governed frames must reach it too.
+                        if let Some(hk) = &self.hotkey_window {
+                            if hk.shown_at.is_some() {
+                                hk.gl_window.window.request_redraw();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Hotkey window: its egui deadline, capped to the same cadence as the
+        // main window so a continuous animation can't repaint at swap rate.
+        if let Some(hk) = &mut self.hotkey_window {
             if hk.shown_at.is_some() {
-                hk.gl_window.window.request_redraw();
+                if let Some(at) = hk.repaint_at {
+                    let due = match hk.last_paint {
+                        Some(last) => at.max(last + self.frame_interval),
+                        None => at,
+                    };
+                    if due <= now {
+                        hk.repaint_at = None;
+                        hk.gl_window.window.request_redraw();
+                    } else {
+                        next_wake = Some(next_wake.map_or(due, |w| w.min(due)));
+                    }
+                }
             }
         }
 
@@ -667,10 +700,10 @@ impl WinitApp {
         let egui_winit = self.egui_winit.as_mut().unwrap();
         let app = self.app.as_mut().unwrap();
 
-        // This frame satisfies any pending terminal repaint. Clearing here (not
-        // before) lets PTY output that arrives mid-paint re-arm the flag so the
-        // governor schedules the next frame.
-        self.terminal_repaint_pending = false;
+        // This frame satisfies any pending repaint. Clearing here (not before)
+        // lets work that arrives mid-paint re-arm the flag so the governor
+        // schedules the next frame.
+        self.repaint_pending = false;
 
         gl_state.make_current();
 
@@ -766,7 +799,10 @@ impl WinitApp {
                 }
             }
             if vp_out.repaint_delay.is_zero() {
-                gl_state.window.request_redraw();
+                // Continuous animation: pend the repaint through the frame
+                // governor so it runs at the capped rate, not swap rate.
+                self.repaint_pending = true;
+                self.egui_repaint_at = None;
             } else if vp_out.repaint_delay < std::time::Duration::from_secs(86400) {
                 self.egui_repaint_at = Some(Instant::now() + vp_out.repaint_delay);
             } else {
