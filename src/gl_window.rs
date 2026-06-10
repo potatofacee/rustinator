@@ -58,6 +58,14 @@ impl GlWindow {
         .expect("failed to create painter");
 
         let egui_ctx = egui::Context::default();
+        // Software GL: disable egui animations. Hover fades and dialog
+        // transitions repaint several frames for pure decoration; on a CPU
+        // rasterizer instant transitions are cheaper and feel better over VNC.
+        if crate::gl_setup::is_software_renderer(gl) {
+            let mut style = (*egui_ctx.global_style()).clone();
+            style.animation_time = 0.0;
+            egui_ctx.set_global_style(style);
+        }
 
         let egui_winit = egui_winit::State::new(
             egui_ctx.clone(),

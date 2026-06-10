@@ -62,6 +62,8 @@ impl GlState {
             gl.get_error();
         }
 
+        log::info!("GL renderer: {}", unsafe { gl.get_parameter_string(glow::RENDERER) });
+
         let alpha_bits = gl_config.alpha_size();
         log::info!("GL config alpha_size: {alpha_bits}");
         if alpha_bits == 0 {
@@ -101,6 +103,16 @@ impl GlState {
     pub(crate) fn make_current(&self) {
         self.gl_context.make_current(&self.gl_surface).ok();
     }
+}
+
+/// True when the GL context rasterizes in software (llvmpipe over VNC etc),
+/// where every painted pixel costs CPU instead of GPU.
+pub(crate) fn is_software_renderer(gl: &glow::Context) -> bool {
+    let renderer = unsafe { gl.get_parameter_string(glow::RENDERER) }.to_lowercase();
+    renderer.contains("llvmpipe")
+        || renderer.contains("softpipe")
+        || renderer.contains("swrast")
+        || renderer.contains("software")
 }
 
 fn create_context_and_surface(
