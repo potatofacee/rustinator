@@ -130,6 +130,11 @@ fn resolve_color(
 #[derive(Clone)]
 pub struct EventProxy {
     pub dirty: Arc<AtomicBool>,
+    // True while a Repaint user event sent for PTY output is still unconsumed
+    // (cleared when the pane next snapshots for a frame). Coalesces sustained
+    // output into at most one winit wake per pane per painted frame. Separate
+    // from `dirty`, which the main thread also sets for non-PTY reasons.
+    pub wake_pending: Arc<AtomicBool>,
     pub has_new_output: Arc<AtomicBool>,
     pub exited: Arc<AtomicBool>,
     pub title: Arc<Mutex<Option<String>>>,
@@ -147,6 +152,7 @@ impl EventProxy {
     ) -> Self {
         Self {
             dirty: Arc::new(AtomicBool::new(true)),
+            wake_pending: Arc::new(AtomicBool::new(false)),
             has_new_output: Arc::new(AtomicBool::new(false)),
             exited: Arc::new(AtomicBool::new(false)),
             title: Arc::new(Mutex::new(None)),
@@ -168,9 +174,13 @@ impl EventListener for EventProxy {
             Event::Wakeup => {
                 self.dirty.store(true, Ordering::Release);
                 self.has_new_output.store(true, Ordering::Release);
-                // Only wake the loop for visible panes. Background panes stay
-                // dirty and repaint when their tab is next shown.
-                if self.visible.load(Ordering::Acquire) {
+                // Coalesce wakes: skip the winit user event if one is already
+                // in flight for this pane. Only wake the loop for visible
+                // panes — background panes stay dirty and repaint when their
+                // tab is next shown.
+                if !self.wake_pending.swap(true, Ordering::AcqRel)
+                    && self.visible.load(Ordering::Acquire)
+                {
                     self.wake();
                 }
             }
@@ -356,6 +366,7 @@ pub struct Pane {
     pub cols: usize,
     pub lines: usize,
     pub dirty: Arc<AtomicBool>,
+    pub wake_pending: Arc<AtomicBool>,
     pub has_new_output: Arc<AtomicBool>,
     pub exited: Arc<AtomicBool>,
     pub title: Arc<Mutex<Option<String>>>,
@@ -390,6 +401,7 @@ impl Pane {
     ) -> Result<Self, String> {
         let proxy = EventProxy::new(winit_proxy);
         let dirty = Arc::clone(&proxy.dirty);
+        let wake_pending = Arc::clone(&proxy.wake_pending);
         let has_new_output = Arc::clone(&proxy.has_new_output);
         let exited = Arc::clone(&proxy.exited);
         let title = Arc::clone(&proxy.title);
@@ -441,6 +453,7 @@ impl Pane {
             cols,
             lines,
             dirty,
+            wake_pending,
             has_new_output,
             exited,
             title,
@@ -473,6 +486,7 @@ impl Pane {
 
         let proxy = EventProxy::new(winit_proxy);
         let dirty = Arc::clone(&proxy.dirty);
+        let wake_pending = Arc::clone(&proxy.wake_pending);
         let has_new_output = Arc::clone(&proxy.has_new_output);
         let exited = Arc::clone(&proxy.exited);
         let title = Arc::clone(&proxy.title);
@@ -514,6 +528,7 @@ impl Pane {
         self.pty_handle = pty_handle;
         self.child_pid = child_pid;
         self.dirty = dirty;
+        self.wake_pending = wake_pending;
         self.has_new_output = has_new_output;
         self.exited = exited;
         self.title = title;
@@ -590,6 +605,10 @@ impl Pane {
     }
 
     pub fn frame(&mut self) -> Arc<Frame> {
+        // Re-arm the PTY wake before reading the terminal: output that lands
+        // mid-snapshot must send a fresh Repaint event or it would be lost
+        // until the next unrelated wake.
+        self.wake_pending.store(false, Ordering::Release);
         let was_dirty = self.dirty.swap(false, Ordering::AcqRel);
         if was_dirty || self.cached.is_none() {
             self.cached = Some(Arc::new(self.snapshot()));
