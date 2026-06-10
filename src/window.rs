@@ -215,6 +215,13 @@ struct WinitApp {
     // Deadline egui asked for via repaint_delay (cursor blink etc). Folded
     // into the control flow in about_to_wait; never set on the loop directly.
     egui_repaint_at: Option<Instant>,
+    // Wall-clock cost of the last main-window paint. Stretches the governed
+    // interval so a software rasterizer (llvmpipe over VNC) can't saturate a
+    // core no matter how slow frames are.
+    last_paint_cost: Option<Duration>,
+    // Main window focus. Unfocused (and no hotkey dropdown shown) repaints
+    // run at a reduced rate.
+    main_focused: bool,
 }
 
 impl WinitApp {
@@ -241,6 +248,8 @@ impl WinitApp {
             last_frame: None,
             frame_interval: Duration::from_micros(16_667), // ~60 fps
             egui_repaint_at: None,
+            last_paint_cost: None,
+            main_focused: true,
         }
     }
 }
@@ -252,6 +261,15 @@ impl ApplicationHandler<UserEvent> for WinitApp {
         }
 
         let gl_state = GlState::new(event_loop);
+        // Software GL: disable egui animations on the main context too (the
+        // popup windows get the same treatment in GlWindow::new). Hover fades
+        // repaint several frames for pure decoration; on a CPU rasterizer
+        // instant transitions are cheaper and feel better over VNC.
+        if crate::gl_setup::is_software_renderer(&gl_state.gl) {
+            let mut style = (*self.egui_ctx.global_style()).clone();
+            style.animation_time = 0.0;
+            self.egui_ctx.set_global_style(style);
+        }
         let painter = egui_glow::Painter::new(
             Arc::clone(&gl_state.gl),
             "",
@@ -586,6 +604,7 @@ impl ApplicationHandler<UserEvent> for WinitApp {
                 self.repaint_pending = true;
             }
             WindowEvent::Focused(focused) => {
+                self.main_focused = focused;
                 app.notify_focus(focused);
             }
             WindowEvent::RedrawRequested => {
@@ -600,6 +619,7 @@ impl ApplicationHandler<UserEvent> for WinitApp {
             return;
         }
         let now = Instant::now();
+        let interval = self.effective_frame_interval();
         let mut next_wake: Option<Instant> = None;
 
         // An egui-requested repaint deadline (cursor blink etc) that has come
@@ -623,8 +643,8 @@ impl ApplicationHandler<UserEvent> for WinitApp {
         if self.repaint_pending {
             if let Some(gl_state) = &self.gl_state {
                 match self.last_frame {
-                    Some(last) if now < last + self.frame_interval => {
-                        let due = last + self.frame_interval;
+                    Some(last) if now < last + interval => {
+                        let due = last + interval;
                         next_wake = Some(next_wake.map_or(due, |w| w.min(due)));
                     }
                     _ => {
@@ -648,7 +668,7 @@ impl ApplicationHandler<UserEvent> for WinitApp {
             if hk.shown_at.is_some() {
                 if let Some(at) = hk.repaint_at {
                     let due = match hk.last_paint {
-                        Some(last) => at.max(last + self.frame_interval),
+                        Some(last) => at.max(last + interval),
                         None => at,
                     };
                     if due <= now {
@@ -694,11 +714,30 @@ impl ApplicationHandler<UserEvent> for WinitApp {
 }
 
 impl WinitApp {
+    // Governed frame interval for this moment: base cadence, slowed when the
+    // app is unfocused (nobody is watching closely), stretched by the last
+    // paint's cost so rendering is capped at roughly a third of a core when
+    // the GL stack rasterizes in software. On a real GPU a frame costs ~1ms
+    // and the base interval always wins.
+    fn effective_frame_interval(&self) -> Duration {
+        const UNFOCUSED_INTERVAL: Duration = Duration::from_millis(100);
+        const PAINT_DUTY_FACTOR: u32 = 3;
+        let active = self.main_focused
+            || self.hotkey_window.as_ref().is_some_and(|hk| hk.shown_at.is_some());
+        let base = if active { self.frame_interval } else { UNFOCUSED_INTERVAL };
+        match self.last_paint_cost {
+            Some(cost) => base.max(cost * PAINT_DUTY_FACTOR),
+            None => base,
+        }
+    }
+
     fn paint(&mut self, event_loop: &ActiveEventLoop) {
         let gl_state = self.gl_state.as_ref().unwrap();
         let painter = self.painter.as_mut().unwrap();
         let egui_winit = self.egui_winit.as_mut().unwrap();
         let app = self.app.as_mut().unwrap();
+
+        let paint_started = Instant::now();
 
         // This frame satisfies any pending repaint. Clearing here (not before)
         // lets work that arrives mid-paint re-arm the flag so the governor
@@ -825,7 +864,9 @@ impl WinitApp {
         );
 
         gl_state.swap_buffers();
-        self.last_frame = Some(Instant::now());
+        let paint_ended = Instant::now();
+        self.last_frame = Some(paint_ended);
+        self.last_paint_cost = Some(paint_ended - paint_started);
 
         // Manage prefs pop-out window lifecycle.
         if app.prefs.open && self.prefs.is_none() {
