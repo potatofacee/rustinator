@@ -1,5 +1,6 @@
 use std::num::NonZeroU32;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use egui_glow::ShaderVersion;
 use glutin::config::Config as GlConfig;
@@ -112,13 +113,18 @@ impl GlWindow {
         main_context: &PossiblyCurrentContext,
         full_output: egui::FullOutput,
         clear_color: [f32; 4],
-    ) {
+    ) -> Option<Instant> {
         self.egui_winit
             .handle_platform_output(&self.window, full_output.platform_output);
 
+        let mut repaint_at = None;
         if let Some(vp_out) = full_output.viewport_output.get(&self.egui_ctx.viewport_id()) {
-            if vp_out.repaint_delay.is_zero() {
-                self.window.request_redraw();
+            // Zero delay (continuous animation) becomes a deadline of "now";
+            // the caller's scheduler decides the actual cadence. Requesting a
+            // redraw here directly would repaint at swap rate, which is
+            // unbounded on drivers without a vsync brake (software GL on VNC).
+            if vp_out.repaint_delay < Duration::from_secs(86400) {
+                repaint_at = Some(Instant::now() + vp_out.repaint_delay);
             }
         }
 
@@ -136,5 +142,7 @@ impl GlWindow {
         );
 
         self.swap_buffers(main_context);
+
+        repaint_at
     }
 }
