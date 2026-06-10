@@ -133,6 +133,11 @@ pub struct EventProxy {
     pub has_new_output: Arc<AtomicBool>,
     pub exited: Arc<AtomicBool>,
     pub title: Arc<Mutex<Option<String>>>,
+    // True when this pane is in the active tab. PTY output (Wakeup) on a
+    // background pane sets dirty but skips waking the winit loop — a background
+    // process (build log, tail -f) shouldn't keep the event loop hot when its
+    // output isn't visible. Rare events (bell/title/exit) always wake.
+    pub visible: Arc<AtomicBool>,
     pub winit_proxy: Option<winit::event_loop::EventLoopProxy<crate::window::UserEvent>>,
 }
 
@@ -145,6 +150,7 @@ impl EventProxy {
             has_new_output: Arc::new(AtomicBool::new(false)),
             exited: Arc::new(AtomicBool::new(false)),
             title: Arc::new(Mutex::new(None)),
+            visible: Arc::new(AtomicBool::new(true)),
             winit_proxy,
         }
     }
@@ -162,7 +168,11 @@ impl EventListener for EventProxy {
             Event::Wakeup => {
                 self.dirty.store(true, Ordering::Release);
                 self.has_new_output.store(true, Ordering::Release);
-                self.wake();
+                // Only wake the loop for visible panes. Background panes stay
+                // dirty and repaint when their tab is next shown.
+                if self.visible.load(Ordering::Acquire) {
+                    self.wake();
+                }
             }
             Event::Bell | Event::MouseCursorDirty => {
                 self.dirty.store(true, Ordering::Release);
@@ -212,7 +222,6 @@ pub struct Frame {
     pub default_bg: [f32; 4],
     pub cursor: Option<CursorOverlay>,
     pub cursor_blink_requested: bool,
-    pub urls: Vec<UrlMatch>,
 }
 
 #[derive(Debug, Clone)]
@@ -268,6 +277,44 @@ fn is_url_boundary(c: char) -> bool {
         )
 }
 
+// Match URLs within a single row's cells, already sorted by column.
+// `chars`/`col_lookup` are parallel arrays (char and its source column).
+fn match_urls_in_row(row: i32, chars: &[char], col_lookup: &[i32], out: &mut Vec<UrlMatch>) {
+    let http = ['h', 't', 't', 'p', ':', '/', '/'];
+    let https = ['h', 't', 't', 'p', 's', ':', '/', '/'];
+
+    let mut i = 0;
+    while i < chars.len() {
+        let rest = &chars[i..];
+        let matched = if rest.starts_with(&https) {
+            Some(https.len())
+        } else if rest.starts_with(&http) {
+            Some(http.len())
+        } else {
+            None
+        };
+        if let Some(prefix_len) = matched {
+            let mut j = i;
+            while j < chars.len() && !is_url_boundary(chars[j]) {
+                j += 1;
+            }
+            if j > i + prefix_len {
+                let url: String = chars[i..j].iter().collect();
+                out.push(UrlMatch {
+                    row,
+                    start_col: col_lookup[i],
+                    end_col: col_lookup[j - 1] + 1,
+                    url,
+                });
+                i = j;
+                continue;
+            }
+        }
+        i += 1;
+    }
+}
+
+#[cfg(test)]
 fn scan_urls(cells: &[CellSnapshot]) -> Vec<UrlMatch> {
     // Group cells by row in their emitted order.
     let mut by_row: std::collections::BTreeMap<i32, Vec<(i32, char)>> =
@@ -281,42 +328,24 @@ fn scan_urls(cells: &[CellSnapshot]) -> Vec<UrlMatch> {
         cols.sort_by_key(|&(c, _)| c);
         let chars: Vec<char> = cols.iter().map(|&(_, c)| c).collect();
         let col_lookup: Vec<i32> = cols.iter().map(|&(c, _)| c).collect();
-
-        let http = ['h', 't', 't', 'p', ':', '/', '/'];
-        let https = ['h', 't', 't', 'p', 's', ':', '/', '/'];
-
-        let mut i = 0;
-        while i < chars.len() {
-            let rest = &chars[i..];
-            let matched = if rest.starts_with(&https) {
-                Some(https.len())
-            } else if rest.starts_with(&http) {
-                Some(http.len())
-            } else {
-                None
-            };
-            if matched.is_some() {
-                let mut j = i;
-                while j < chars.len() && !is_url_boundary(chars[j]) {
-                    j += 1;
-                }
-                let prefix_end = i + matched.unwrap();
-                if j > prefix_end {
-                    let url: String = chars[i..j].iter().collect();
-                    out.push(UrlMatch {
-                        row,
-                        start_col: col_lookup[i],
-                        end_col: col_lookup[j - 1] + 1,
-                        url,
-                    });
-                    i = j;
-                    continue;
-                }
-            }
-            i += 1;
-        }
+        match_urls_in_row(row, &chars, &col_lookup, &mut out);
     }
     out
+}
+
+// On-demand URL hit-test for a single cell. Scans only the pointer's row, so it
+// runs on hover/Ctrl-click instead of on every frame snapshot.
+pub(crate) fn scan_url_at(cells: &[CellSnapshot], row: i32, col: i32) -> Option<UrlMatch> {
+    let mut cols: Vec<(i32, char)> =
+        cells.iter().filter(|c| c.row == row).map(|c| (c.col, c.c)).collect();
+    cols.sort_by_key(|&(c, _)| c);
+    let chars: Vec<char> = cols.iter().map(|&(_, c)| c).collect();
+    let col_lookup: Vec<i32> = cols.iter().map(|&(c, _)| c).collect();
+
+    let mut out = Vec::new();
+    match_urls_in_row(row, &chars, &col_lookup, &mut out);
+    out.into_iter()
+        .find(|u| col >= u.start_col && col < u.end_col)
 }
 
 pub struct Pane {
@@ -330,6 +359,7 @@ pub struct Pane {
     pub has_new_output: Arc<AtomicBool>,
     pub exited: Arc<AtomicBool>,
     pub title: Arc<Mutex<Option<String>>>,
+    pub visible: Arc<AtomicBool>,
     pub cached: Option<Arc<Frame>>,
     pub defaults: PaneDefaults,
     pub read_only: bool,
@@ -363,6 +393,7 @@ impl Pane {
         let has_new_output = Arc::clone(&proxy.has_new_output);
         let exited = Arc::clone(&proxy.exited);
         let title = Arc::clone(&proxy.title);
+        let visible = Arc::clone(&proxy.visible);
 
         let dims = TermDims { cols, lines };
         let term = Term::new(term_config, &dims, proxy.clone());
@@ -413,6 +444,7 @@ impl Pane {
             has_new_output,
             exited,
             title,
+            visible,
             cached: None,
             defaults,
             read_only: false,
@@ -444,6 +476,7 @@ impl Pane {
         let has_new_output = Arc::clone(&proxy.has_new_output);
         let exited = Arc::clone(&proxy.exited);
         let title = Arc::clone(&proxy.title);
+        let visible = Arc::clone(&proxy.visible);
 
         let dims = TermDims { cols: self.cols, lines: self.lines };
         let term = Term::new(term_config, &dims, proxy.clone());
@@ -484,6 +517,7 @@ impl Pane {
         self.has_new_output = has_new_output;
         self.exited = exited;
         self.title = title;
+        self.visible = visible;
         self.cached = None;
         self.dead.set(false);
         *self.ui_selection.lock().unwrap() = None;
@@ -896,14 +930,11 @@ impl Pane {
             });
         }
 
-        let urls = scan_urls(&cells);
-
         Frame {
             cells,
             default_bg,
             cursor: cursor_overlay,
             cursor_blink_requested,
-            urls,
         }
     }
 }

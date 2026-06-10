@@ -495,6 +495,16 @@ impl App {
         let factory = self.pane_factory();
         let exit_action = self.user_config.active().exit_action;
         self.tab_mgr.reap_exited(exit_action, &self.egui_ctx, &mut self.dialogs, &factory);
+        // Mark which panes are visible (active tab) so their PTY threads know
+        // whether to wake the event loop on output. Background panes stay dirty
+        // but don't keep the loop hot.
+        let active_tab = self.tab_mgr.active_tab;
+        for (idx, tab) in self.tab_mgr.tabs.iter().enumerate() {
+            let visible = idx == active_tab;
+            for pane in tab.panes.values() {
+                pane.visible.store(visible, std::sync::atomic::Ordering::Release);
+            }
+        }
         if self.user_config.active().scroll_on_output {
             if let Some(tab) = self.tab_mgr.tabs.get(self.tab_mgr.active_tab) {
                 for pane in tab.panes.values() {
