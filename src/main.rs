@@ -158,6 +158,23 @@ pub(crate) struct App {
     pub(crate) fullscreen_pending: bool,
     pub(crate) hotkey_changed: bool,
     pub(crate) pending_zoom_steps: i32,
+    /// Last pane defaults pushed as a live preview of the prefs draft.
+    /// Some(..) while the prefs panel has previewed unapplied colors; logic()
+    /// restores the saved profile's colors when prefs closes without Apply.
+    preview_defaults: Option<PaneDefaults>,
+}
+
+/// Build the per-pane render defaults from a profile's color settings.
+fn defaults_from_profile(profile: &config::Profile) -> PaneDefaults {
+    PaneDefaults {
+        fg: profile.foreground_rgb(),
+        bg: profile.background_rgb(),
+        cursor: profile.cursor_rgb(),
+        bg_opacity: profile.transparency.opacity,
+        palette: profile.palette_rgb(),
+        selection_bg: profile.selection_bg_rgb(),
+        selection_fg: profile.selection_fg_rgb(),
+    }
 }
 
 impl App {
@@ -208,12 +225,7 @@ impl App {
         term_config.kitty_keyboard = true;
         term_config.semantic_escape_chars = config::word_chars_to_semantic_escape(&profile.word_chars);
 
-        let pane_defaults = PaneDefaults {
-            fg: profile.foreground_rgb(),
-            bg: profile.background_rgb(),
-            cursor: profile.cursor_rgb(),
-            bg_opacity: profile.transparency.opacity,
-        };
+        let pane_defaults = defaults_from_profile(profile);
 
         let mut bindings = BindingTable::new(user_config.global.use_linux_keybindings);
         bindings.apply_user(
@@ -267,6 +279,7 @@ impl App {
             fullscreen_pending: false,
             hotkey_changed: false,
             pending_zoom_steps: 0,
+            preview_defaults: None,
         })
     }
 
@@ -415,12 +428,7 @@ impl App {
                 .collect::<Vec<_>>(),
         );
 
-        self.pane_defaults = PaneDefaults {
-            fg: profile.foreground_rgb(),
-            bg: profile.background_rgb(),
-            cursor: profile.cursor_rgb(),
-            bg_opacity: profile.transparency.opacity,
-        };
+        self.pane_defaults = defaults_from_profile(&profile);
         self.term_config.scrolling_history = profile.scrollback.effective_history();
         self.term_config.semantic_escape_chars = config::word_chars_to_semantic_escape(&profile.word_chars);
 
@@ -469,6 +477,45 @@ impl App {
             PrefsResult::Cancelled => {}
             PrefsResult::None => {}
         }
+        self.preview_draft_colors();
+    }
+
+    /// Live preview: while the prefs panel is open, panes render the draft
+    /// profile's colors so tweaks are visible in the real terminal before
+    /// Apply. Runs during the prefs window's paint; pushes only on change and
+    /// wakes the main window so it repaints with the new values. logic()
+    /// reverts to the saved profile when prefs closes without Apply.
+    fn preview_draft_colors(&mut self) {
+        if !self.prefs.open {
+            // Prefs just closed via Cancel during this paint: restore now.
+            if self.preview_defaults.take().is_some() {
+                let pd = defaults_from_profile(self.user_config.active());
+                self.push_pane_defaults(pd);
+                self.wake_main();
+            }
+            return;
+        }
+        let pd = defaults_from_profile(self.prefs.draft.active());
+        if self.preview_defaults != Some(pd) {
+            self.preview_defaults = Some(pd);
+            self.push_pane_defaults(pd);
+            self.wake_main();
+        }
+    }
+
+    /// Wake the main event loop so the main window repaints (governed).
+    pub(crate) fn wake_main(&self) {
+        let _ = self.event_loop_proxy.send_event(window::UserEvent::Repaint);
+    }
+
+    fn push_pane_defaults(&mut self, pd: PaneDefaults) {
+        for tab in &mut self.tab_mgr.tabs {
+            for pane in tab.panes.values_mut() {
+                pane.defaults = pd;
+                pane.dirty.store(true, std::sync::atomic::Ordering::Release);
+                pane.cached = None;
+            }
+        }
     }
 
 }
@@ -492,6 +539,13 @@ impl App {
     }
 
     pub(crate) fn logic(&mut self, ctx: &egui::Context) {
+        // Prefs closed (Cancel or window close) with a color preview pushed:
+        // restore the saved profile's colors. After Apply the saved config
+        // equals the previewed draft, so this push is a visual no-op.
+        if !self.prefs.open && self.preview_defaults.take().is_some() {
+            let pd = defaults_from_profile(self.user_config.active());
+            self.push_pane_defaults(pd);
+        }
         let factory = self.pane_factory();
         let exit_action = self.user_config.active().exit_action;
         self.tab_mgr.reap_exited(exit_action, &self.egui_ctx, &mut self.dialogs, &factory);
@@ -679,6 +733,14 @@ impl App {
             }
 
             let egui_ctx = self.egui_ctx.clone();
+            // While prefs is open, panes render from the draft config so
+            // non-PaneDefaults colors (focus/broadcast border) preview live
+            // alongside the palette. Reverts implicitly when prefs closes.
+            let view_config = if self.prefs.open {
+                &self.prefs.draft
+            } else {
+                &self.user_config
+            };
             let mut pv_ctx = PaneViewCtx {
                 tab_mgr: &mut self.tab_mgr,
                 cell_w: self.font.cell_w,
@@ -686,7 +748,7 @@ impl App {
                 font: &self.font.ctx,
                 renderer: &self.render.renderer,
                 cursor_blink_epoch: self.input.cursor_blink_epoch,
-                user_config: &self.user_config,
+                user_config: view_config,
                 egui_ctx: &egui_ctx,
                 dialogs: &mut self.dialogs,
             };

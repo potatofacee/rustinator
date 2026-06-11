@@ -29,7 +29,7 @@ pub type PaneId = u64;
 type PtyLoopHandle = JoinHandle<(EventLoop<tty::Pty, EventProxy>, EventLoopState)>;
 
 // Xterm-ish ANSI palette (NamedColor::Black..BrightWhite = 0..15).
-const ANSI: [[u8; 3]; 16] = [
+pub(crate) const ANSI: [[u8; 3]; 16] = [
     [0x00, 0x00, 0x00],
     [0xcd, 0x00, 0x00],
     [0x00, 0xcd, 0x00],
@@ -48,11 +48,16 @@ const ANSI: [[u8; 3]; 16] = [
     [0xff, 0xff, 0xff],
 ];
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PaneDefaults {
     pub fg: [u8; 3],
     pub bg: [u8; 3],
     pub cursor: [u8; 3],
+    /// ANSI palette colors 0-15 (normal 0-7, bright 8-15) from the profile.
+    pub palette: [[u8; 3]; 16],
+    /// Selection override colors. None = invert the cell's fg/bg.
+    pub selection_bg: Option<[u8; 3]>,
+    pub selection_fg: Option<[u8; 3]>,
     /// 0.0..=1.0; alpha to apply to the *default* bg only. Non-default cell
     /// backgrounds stay fully opaque.
     pub bg_opacity: f32,
@@ -64,6 +69,9 @@ impl Default for PaneDefaults {
             fg: [0xe5, 0xe5, 0xe5],
             bg: [0x1a, 0x1a, 0x1a],
             cursor: [0xe5, 0xe5, 0xe5],
+            palette: ANSI,
+            selection_bg: None,
+            selection_fg: None,
             bg_opacity: 1.0,
         }
     }
@@ -82,15 +90,15 @@ fn named_default(n: NamedColor, defaults: &PaneDefaults) -> [u8; 3] {
         NamedColor::Cursor => defaults.cursor,
         _ => {
             let idx = n as usize;
-            if idx < 16 { ANSI[idx] } else { defaults.fg }
+            if idx < 16 { defaults.palette[idx] } else { defaults.fg }
         }
     }
 }
 
-fn indexed_default(i: u8) -> [u8; 3] {
+fn indexed_default(i: u8, defaults: &PaneDefaults) -> [u8; 3] {
     let i = i as usize;
     if i < 16 {
-        ANSI[i]
+        defaults.palette[i]
     } else if i < 232 {
         let n = i - 16;
         let steps = [0, 0x5f, 0x87, 0xaf, 0xd7, 0xff];
@@ -120,7 +128,7 @@ fn resolve_color(
             Rgb { r, g, b }
         }),
         Color::Indexed(i) => palette[i as usize].unwrap_or_else(|| {
-            let [r, g, b] = indexed_default(i);
+            let [r, g, b] = indexed_default(i, defaults);
             Rgb { r, g, b }
         }),
     };
@@ -930,7 +938,18 @@ impl Pane {
             let is_selected = selection
                 .map(|s| s.contains(indexed.point))
                 .unwrap_or(false);
-            if is_cursor || is_selected {
+            if is_selected && !is_cursor {
+                // Profile selection colors when set; classic invert otherwise.
+                match self.defaults.selection_bg {
+                    Some([r, g, b]) => {
+                        bg = rgb_to_f32(r, g, b);
+                        if let Some([r, g, b]) = self.defaults.selection_fg {
+                            fg = rgb_to_f32(r, g, b);
+                        }
+                    }
+                    None => std::mem::swap(&mut fg, &mut bg),
+                }
+            } else if is_cursor {
                 std::mem::swap(&mut fg, &mut bg);
             }
             let style = match (flags.contains(Flags::BOLD), flags.contains(Flags::ITALIC)) {
@@ -1325,39 +1344,39 @@ mod tests {
 
     #[test]
     fn indexed_default_ansi_range() {
-        assert_eq!(indexed_default(0), [0x00, 0x00, 0x00]);
-        assert_eq!(indexed_default(1), [0xcd, 0x00, 0x00]);
-        assert_eq!(indexed_default(15), ANSI[15]);
+        assert_eq!(indexed_default(0, &PaneDefaults::default()), [0x00, 0x00, 0x00]);
+        assert_eq!(indexed_default(1, &PaneDefaults::default()), [0xcd, 0x00, 0x00]);
+        assert_eq!(indexed_default(15, &PaneDefaults::default()), ANSI[15]);
     }
 
     #[test]
     fn indexed_default_cube_start() {
         // Index 16 = rgb(0,0,0) in the 6x6x6 cube.
-        assert_eq!(indexed_default(16), [0, 0, 0]);
+        assert_eq!(indexed_default(16, &PaneDefaults::default()), [0, 0, 0]);
     }
 
     #[test]
     fn indexed_default_cube_white() {
         // Index 231 = rgb(5,5,5) = (0xff, 0xff, 0xff).
-        assert_eq!(indexed_default(231), [0xff, 0xff, 0xff]);
+        assert_eq!(indexed_default(231, &PaneDefaults::default()), [0xff, 0xff, 0xff]);
     }
 
     #[test]
     fn indexed_default_cube_mid() {
         // Index 196 = n=180, r=180/36=5 -> 0xff, g=(180/6)%6=0 -> 0, b=180%6=0 -> 0.
-        assert_eq!(indexed_default(196), [0xff, 0x00, 0x00]);
+        assert_eq!(indexed_default(196, &PaneDefaults::default()), [0xff, 0x00, 0x00]);
     }
 
     #[test]
     fn indexed_default_grayscale_start() {
         // Index 232 = 8 + 0*10 = 8.
-        assert_eq!(indexed_default(232), [8, 8, 8]);
+        assert_eq!(indexed_default(232, &PaneDefaults::default()), [8, 8, 8]);
     }
 
     #[test]
     fn indexed_default_grayscale_end() {
         // Index 255 = 8 + 23*10 = 238.
-        assert_eq!(indexed_default(255), [238, 238, 238]);
+        assert_eq!(indexed_default(255, &PaneDefaults::default()), [238, 238, 238]);
     }
 
     // ---- point_from_grid ----

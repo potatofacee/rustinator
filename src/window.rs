@@ -74,6 +74,8 @@ impl PrefsWindowState {
 
         if close_requested {
             app.prefs.open = false;
+            // Main window must repaint to restore un-previewed colors.
+            app.wake_main();
         }
 
         let bg = self.gl_window.egui_ctx.global_style().visuals.panel_fill;
@@ -395,6 +397,9 @@ impl ApplicationHandler<UserEvent> for WinitApp {
                     WindowEvent::CloseRequested => {
                         if let Some(app) = &mut self.app {
                             app.prefs.open = false;
+                            // Main window must repaint to restore un-previewed
+                            // colors (logic() does the actual restore).
+                            app.wake_main();
                         }
                     }
                     WindowEvent::Resized(size) => {

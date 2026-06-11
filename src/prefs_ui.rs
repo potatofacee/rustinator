@@ -20,6 +20,8 @@ pub(crate) struct PrefsState {
     pub status: Option<String>,
     section: PrefsSection,
     selected_profile: usize,
+    /// Palette slot selected for inline editing (0-7 normal, 8-15 bright).
+    pub palette_sel: Option<usize>,
 }
 
 impl PrefsState {
@@ -32,6 +34,7 @@ impl PrefsState {
             status: None,
             section: PrefsSection::Global,
             selected_profile: 0,
+            palette_sel: None,
         }
     }
 
@@ -39,6 +42,7 @@ impl PrefsState {
         self.draft = current_config.clone();
         self.status = None;
         self.open = true;
+        self.palette_sel = None;
         self.selected_profile = self
             .draft
             .profiles
@@ -69,6 +73,7 @@ impl PrefsState {
         let section = &mut self.section;
         let draft = &mut self.draft;
         let selected_profile = &mut self.selected_profile;
+        let palette_sel = &mut self.palette_sel;
         egui::ScrollArea::vertical().show(&mut top_ui, |ui| {
             ui.horizontal_top(|ui| {
                 ui.vertical(|ui| {
@@ -95,6 +100,7 @@ impl PrefsState {
                         ui,
                         draft,
                         selected_profile,
+                        palette_sel,
                     ),
                     PrefsSection::Keybindings => draw_prefs_keybindings(ui),
                 });
@@ -189,6 +195,7 @@ fn draw_prefs_profiles(
     ui: &mut egui::Ui,
     cfg: &mut Config,
     selected: &mut usize,
+    palette_sel: &mut Option<usize>,
 ) {
     ui.heading("Profiles");
     ui.add_space(6.0);
@@ -304,6 +311,35 @@ fn draw_prefs_profiles(
             hex_color_row(ui, "Background", &mut profile.colors.background);
             hex_color_row(ui, "Cursor", &mut profile.colors.cursor);
 
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new("ANSI palette").strong());
+            ansi_palette_grid(ui, &mut profile.colors.normal, &mut profile.colors.bright, palette_sel);
+            ansi_palette_inline_picker(ui, &mut profile.colors.normal, &mut profile.colors.bright, palette_sel);
+            ansi_palette_preview(ui, profile);
+            if ui.small_button("Reset palette").clicked() {
+                profile.colors.normal = config::AnsiColors::default_normal();
+                profile.colors.bright = config::AnsiColors::default_bright();
+            }
+
+            ui.add_space(4.0);
+            hex_color_row(ui, "Focus border", &mut profile.colors.focus_border);
+            hex_color_row(ui, "Broadcast border", &mut profile.colors.broadcast_border);
+
+            let mut custom_selection = !profile.colors.selection_background.is_empty();
+            if ui.checkbox(&mut custom_selection, "Custom selection colors").changed() {
+                if custom_selection {
+                    profile.colors.selection_background = "#4060c0".into();
+                    profile.colors.selection_foreground = "#ffffff".into();
+                } else {
+                    profile.colors.selection_background = String::new();
+                    profile.colors.selection_foreground = String::new();
+                }
+            }
+            if custom_selection {
+                hex_color_row(ui, "Selection background", &mut profile.colors.selection_background);
+                hex_color_row(ui, "Selection foreground", &mut profile.colors.selection_foreground);
+            }
+
             ui.add_space(8.0);
             ui.label(egui::RichText::new("Scrolling").strong());
             ui.checkbox(&mut profile.scrollback.infinite, "Infinite scrollback");
@@ -416,4 +452,124 @@ fn hex_color_row(ui: &mut egui::Ui, label: &str, hex: &mut String) {
         }
         ui.add(egui::TextEdit::singleline(hex).desired_width(90.0));
     });
+}
+
+const ANSI_NAMES: [&str; 8] = [
+    "black", "red", "green", "yellow", "blue", "magenta", "cyan", "white",
+];
+
+fn ansi_palette_grid(
+    ui: &mut egui::Ui,
+    normal: &mut config::AnsiColors,
+    bright: &mut config::AnsiColors,
+    sel: &mut Option<usize>,
+) {
+    egui::Grid::new("ansi_palette_grid").spacing([6.0, 4.0]).show(ui, |ui| {
+        ui.label("");
+        for name in ANSI_NAMES {
+            ui.label(egui::RichText::new(name).small());
+        }
+        ui.end_row();
+        for (row, (row_label, colors)) in [("Normal", normal), ("Bright", bright)].into_iter().enumerate() {
+            ui.label(egui::RichText::new(row_label).small());
+            for col in 0..8 {
+                let idx = row * 8 + col;
+                let hex = palette_slot(colors, col);
+                let [r, g, b] = config::parse_hex(hex).unwrap_or([0, 0, 0]);
+                let selected = *sel == Some(idx);
+                let stroke = if selected {
+                    egui::Stroke::new(2.0, egui::Color32::WHITE)
+                } else {
+                    egui::Stroke::new(1.0, egui::Color32::from_gray(90))
+                };
+                let btn = egui::Button::new("")
+                    .fill(egui::Color32::from_rgb(r, g, b))
+                    .stroke(stroke)
+                    .min_size(egui::vec2(22.0, 18.0));
+                if ui.add(btn).on_hover_text(ANSI_NAMES[col]).clicked() {
+                    *sel = if selected { None } else { Some(idx) };
+                }
+            }
+            ui.end_row();
+        }
+    });
+}
+
+// One row's slot by column index (0 = black .. 7 = white).
+fn palette_slot(colors: &mut config::AnsiColors, col: usize) -> &mut String {
+    match col {
+        0 => &mut colors.black,
+        1 => &mut colors.red,
+        2 => &mut colors.green,
+        3 => &mut colors.yellow,
+        4 => &mut colors.blue,
+        5 => &mut colors.magenta,
+        6 => &mut colors.cyan,
+        7 => &mut colors.white,
+        _ => unreachable!(),
+    }
+}
+
+// Inline picker for the selected slot: rendered in the panel flow (inside the
+// ScrollArea), so it never overlaps the grid or the preview strip — the whole
+// point, vs color_edit_button's popup which covered both.
+fn ansi_palette_inline_picker(
+    ui: &mut egui::Ui,
+    normal: &mut config::AnsiColors,
+    bright: &mut config::AnsiColors,
+    sel: &mut Option<usize>,
+) {
+    let Some(idx) = *sel else { return };
+    let (row_label, colors) = if idx < 8 { ("Normal", normal) } else { ("Bright", bright) };
+    let hex = palette_slot(colors, idx % 8);
+    ui.horizontal(|ui| {
+        ui.label(format!("{} {}", row_label, ANSI_NAMES[idx % 8]));
+        ui.add(egui::TextEdit::singleline(hex).desired_width(90.0));
+        if ui.small_button("Done").clicked() {
+            *sel = None;
+        }
+    });
+    let [r, g, b] = config::parse_hex(hex).unwrap_or([0, 0, 0]);
+    let mut c32 = egui::Color32::from_rgb(r, g, b);
+    if egui::color_picker::color_picker_color32(ui, &mut c32, egui::color_picker::Alpha::Opaque) {
+        *hex = config::format_hex([c32.r(), c32.g(), c32.b()]);
+    }
+}
+
+// What the palette means in practice: a sample line rendered with the draft
+// colors on the profile background, using GNU ls's default color assignments.
+// The real mapping comes from $LS_COLORS, but these are the out-of-the-box
+// defaults virtually everyone sees.
+fn ansi_palette_preview(ui: &mut egui::Ui, profile: &config::Profile) {
+    let pal = profile.palette_rgb();
+    let [br, bg_, bb] = profile.background_rgb();
+    let [fr, fg_, fb] = profile.foreground_rgb();
+    let chip = |idx: usize, text: &str| {
+        let [r, g, b] = pal[idx];
+        egui::RichText::new(text)
+            .monospace()
+            .color(egui::Color32::from_rgb(r, g, b))
+    };
+    egui::Frame::new()
+        .fill(egui::Color32::from_rgb(br, bg_, bb))
+        .inner_margin(egui::Margin::symmetric(6, 4))
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    egui::RichText::new("file.txt")
+                        .monospace()
+                        .color(egui::Color32::from_rgb(fr, fg_, fb)),
+                );
+                ui.label(chip(4, "directory/"));
+                ui.label(chip(6, "symlink@"));
+                ui.label(chip(2, "executable*"));
+                ui.label(chip(1, "archive.tar"));
+                ui.label(chip(5, "image.png"));
+            });
+        });
+    ui.label(
+        egui::RichText::new("Preview uses ls's default color assignments; actual mapping comes from LS_COLORS.")
+            .small()
+            .weak(),
+    );
 }
