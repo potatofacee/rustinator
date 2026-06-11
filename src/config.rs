@@ -113,6 +113,28 @@ pub struct ColorsConfig {
     pub foreground: String,
     pub background: String,
     pub cursor: String,
+    pub normal: AnsiColors,
+    pub bright: AnsiColors,
+    /// Stroke color of the focused pane's border.
+    pub focus_border: String,
+    /// Border color when broadcast input is on.
+    pub broadcast_border: String,
+    /// Selection colors. Empty string = invert the cell's fg/bg (default).
+    pub selection_background: String,
+    pub selection_foreground: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct AnsiColors {
+    pub black: String,
+    pub red: String,
+    pub green: String,
+    pub yellow: String,
+    pub blue: String,
+    pub magenta: String,
+    pub cyan: String,
+    pub white: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -189,6 +211,39 @@ impl Profile {
     pub fn cursor_rgb(&self) -> [u8; 3] {
         parse_hex(&self.colors.cursor).unwrap_or(self.foreground_rgb())
     }
+
+    /// The 16 ANSI palette colors (normal 0-7, bright 8-15) as RGB, falling
+    /// back per entry to the built-in table when a hex value fails to parse.
+    pub fn palette_rgb(&self) -> [[u8; 3]; 16] {
+        let n = &self.colors.normal;
+        let b = &self.colors.bright;
+        let hexes = [
+            &n.black, &n.red, &n.green, &n.yellow, &n.blue, &n.magenta, &n.cyan, &n.white,
+            &b.black, &b.red, &b.green, &b.yellow, &b.blue, &b.magenta, &b.cyan, &b.white,
+        ];
+        let mut out = [[0u8; 3]; 16];
+        for (i, hex) in hexes.iter().enumerate() {
+            out[i] = parse_hex(hex).unwrap_or(crate::pane::ANSI[i]);
+        }
+        out
+    }
+
+    pub fn focus_border_rgb(&self) -> [u8; 3] {
+        parse_hex(&self.colors.focus_border).unwrap_or([0x70, 0x70, 0xc0])
+    }
+
+    pub fn broadcast_border_rgb(&self) -> [u8; 3] {
+        parse_hex(&self.colors.broadcast_border).unwrap_or([0xc0, 0x50, 0x50])
+    }
+
+    /// None = invert the cell's fg/bg (default behavior).
+    pub fn selection_bg_rgb(&self) -> Option<[u8; 3]> {
+        parse_hex(&self.colors.selection_background)
+    }
+
+    pub fn selection_fg_rgb(&self) -> Option<[u8; 3]> {
+        parse_hex(&self.colors.selection_foreground)
+    }
 }
 
 impl Default for FontConfig {
@@ -208,7 +263,50 @@ impl Default for ColorsConfig {
             foreground: "#e5e5e5".into(),
             background: "#1a1a1a".into(),
             cursor: "#e5e5e5".into(),
+            normal: AnsiColors::default_normal(),
+            bright: AnsiColors::default_bright(),
+            focus_border: "#7070c0".into(),
+            broadcast_border: "#c05050".into(),
+            selection_background: String::new(),
+            selection_foreground: String::new(),
         }
+    }
+}
+
+impl AnsiColors {
+    pub fn default_normal() -> Self {
+        Self {
+            black: "#000000".into(),
+            red: "#cd0000".into(),
+            green: "#00cd00".into(),
+            yellow: "#cdcd00".into(),
+            // Deliberately brighter than xterm's #0000ee: ANSI blue is the
+            // default directory color in ls and must stay readable on a black
+            // background (Tango blue, same as terminator).
+            blue: "#3465a4".into(),
+            magenta: "#cd00cd".into(),
+            cyan: "#00cdcd".into(),
+            white: "#e5e5e5".into(),
+        }
+    }
+
+    pub fn default_bright() -> Self {
+        Self {
+            black: "#7f7f7f".into(),
+            red: "#ff0000".into(),
+            green: "#00ff00".into(),
+            yellow: "#ffff00".into(),
+            blue: "#5c5cff".into(),
+            magenta: "#ff00ff".into(),
+            cyan: "#00ffff".into(),
+            white: "#ffffff".into(),
+        }
+    }
+}
+
+impl Default for AnsiColors {
+    fn default() -> Self {
+        Self::default_normal()
     }
 }
 
@@ -641,6 +739,41 @@ mod tests {
         assert_eq!(parsed.active().colors.background, "#002b36");
         assert_eq!(parsed.active().scrollback.history, 25_000);
         assert!((parsed.active().transparency.opacity - 0.9).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn palette_round_trips() {
+        let mut cfg = Config::default();
+        cfg.active_mut().colors.normal.blue = "#1122aa".into();
+        cfg.active_mut().colors.bright.red = "#aa2211".into();
+        cfg.active_mut().colors.focus_border = "#123456".into();
+        cfg.active_mut().colors.selection_background = "#222233".into();
+
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        let parsed: Config = toml::from_str(&text).unwrap();
+        assert_eq!(parsed.active().colors.normal.blue, "#1122aa");
+        assert_eq!(parsed.active().colors.bright.red, "#aa2211");
+        assert_eq!(parsed.active().colors.focus_border, "#123456");
+        assert_eq!(parsed.active().colors.selection_background, "#222233");
+        assert_eq!(parsed.active().palette_rgb()[4], [0x11, 0x22, 0xaa]);
+        assert_eq!(parsed.active().focus_border_rgb(), [0x12, 0x34, 0x56]);
+        assert_eq!(parsed.active().selection_bg_rgb(), Some([0x22, 0x22, 0x33]));
+    }
+
+    #[test]
+    fn palette_missing_keys_take_defaults() {
+        let toml_text = r##"
+            [[profiles]]
+            name = "Test"
+
+            [profiles.colors]
+            background = "#002b36"
+        "##;
+        let cfg: Config = toml::from_str(toml_text).unwrap();
+        assert_eq!(cfg.profiles[0].colors.background, "#002b36");
+        assert_eq!(cfg.profiles[0].palette_rgb()[4], [0x34, 0x65, 0xa4]);
+        assert_eq!(cfg.profiles[0].selection_bg_rgb(), None);
+        assert_eq!(cfg.profiles[0].focus_border_rgb(), [0x70, 0x70, 0xc0]);
     }
 
     // ---- word_chars_to_semantic_escape ----

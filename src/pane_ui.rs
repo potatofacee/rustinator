@@ -913,11 +913,13 @@ fn paint_pane(
     });
 
     if focused && *SHOW_FOCUS_BORDER {
-        let color = if ctx.tab_mgr.tabs[ctx.tab_mgr.active_tab].broadcast {
-            egui::Color32::from_rgb(0xc0, 0x50, 0x50)
+        let profile = ctx.user_config.active();
+        let [r, g, b] = if ctx.tab_mgr.tabs[ctx.tab_mgr.active_tab].broadcast {
+            profile.broadcast_border_rgb()
         } else {
-            egui::Color32::from_rgb(0x70, 0x70, 0xc0)
+            profile.focus_border_rgb()
         };
+        let color = egui::Color32::from_rgb(r, g, b);
         let stroke = egui::Stroke::new(FOCUS_BORDER, color);
         ui.painter()
             .rect_stroke(rect, 0.0, stroke, egui::StrokeKind::Inside);
