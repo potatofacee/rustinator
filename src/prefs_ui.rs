@@ -314,7 +314,7 @@ fn draw_prefs_profiles(
             ui.add_space(4.0);
             ui.label(egui::RichText::new("ANSI palette").strong());
             ansi_palette_grid(ui, &mut profile.colors.normal, &mut profile.colors.bright, palette_sel);
-            ansi_palette_inline_picker(ui, &mut profile.colors.normal, &mut profile.colors.bright, palette_sel);
+            ansi_palette_picker_window(ui, &mut profile.colors.normal, &mut profile.colors.bright, palette_sel);
             ansi_palette_preview(ui, profile);
             if ui.small_button("Reset palette").clicked() {
                 profile.colors.normal = config::AnsiColors::default_normal();
@@ -510,10 +510,11 @@ fn palette_slot(colors: &mut config::AnsiColors, col: usize) -> &mut String {
     }
 }
 
-// Inline picker for the selected slot: rendered in the panel flow (inside the
-// ScrollArea), so it never overlaps the grid or the preview strip — the whole
-// point, vs color_edit_button's popup which covered both.
-fn ansi_palette_inline_picker(
+// Picker for the selected slot in a draggable egui window (title bar + close
+// button), so it can be moved off the grid and the preview strip instead of
+// covering them like color_edit_button's anchored popup did. Stable id keeps
+// the dragged position when switching slots.
+fn ansi_palette_picker_window(
     ui: &mut egui::Ui,
     normal: &mut config::AnsiColors,
     bright: &mut config::AnsiColors,
@@ -522,17 +523,25 @@ fn ansi_palette_inline_picker(
     let Some(idx) = *sel else { return };
     let (row_label, colors) = if idx < 8 { ("Normal", normal) } else { ("Bright", bright) };
     let hex = palette_slot(colors, idx % 8);
-    ui.horizontal(|ui| {
-        ui.label(format!("{} {}", row_label, ANSI_NAMES[idx % 8]));
-        ui.add(egui::TextEdit::singleline(hex).desired_width(90.0));
-        if ui.small_button("Done").clicked() {
-            *sel = None;
-        }
-    });
-    let [r, g, b] = config::parse_hex(hex).unwrap_or([0, 0, 0]);
-    let mut c32 = egui::Color32::from_rgb(r, g, b);
-    if egui::color_picker::color_picker_color32(ui, &mut c32, egui::color_picker::Alpha::Opaque) {
-        *hex = config::format_hex([c32.r(), c32.g(), c32.b()]);
+    let mut open = true;
+    egui::Window::new(format!("{} {}", row_label, ANSI_NAMES[idx % 8]))
+        .id(egui::Id::new("palette_picker_window"))
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(false)
+        .show(ui.ctx(), |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Hex");
+                ui.add(egui::TextEdit::singleline(hex).desired_width(90.0));
+            });
+            let [r, g, b] = config::parse_hex(hex).unwrap_or([0, 0, 0]);
+            let mut c32 = egui::Color32::from_rgb(r, g, b);
+            if egui::color_picker::color_picker_color32(ui, &mut c32, egui::color_picker::Alpha::Opaque) {
+                *hex = config::format_hex([c32.r(), c32.g(), c32.b()]);
+            }
+        });
+    if !open {
+        *sel = None;
     }
 }
 
