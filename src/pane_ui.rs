@@ -10,7 +10,7 @@ use crate::layout::{self, Direction, LayoutTemplate};
 use crate::mouse::{MouseButton, MouseKind, MouseMods};
 use crate::pane::{CursorOverlay, PaneId, UrlMatch};
 use crate::renderer::{BgInstance, Renderer};
-use crate::keybindings::Action;
+use crate::keybindings::{Action, BindingTable};
 use crate::tabs::{TabManager, PANE_GAP};
 
 const FOCUS_BORDER: f32 = 1.0;
@@ -43,6 +43,7 @@ pub(crate) struct PaneViewCtx<'a> {
     pub renderer: &'a Arc<Mutex<Renderer>>,
     pub cursor_blink_epoch: Instant,
     pub user_config: &'a Config,
+    pub bindings: &'a BindingTable,
     pub egui_ctx: &'a egui::Context,
     pub dialogs: &'a mut crate::dialogs::DialogState,
 }
@@ -242,6 +243,7 @@ pub(crate) fn draw_panes(
                 &ctx.tab_mgr.tabs[ctx.tab_mgr.active_tab],
                 zoomed,
                 ctx.user_config,
+                ctx.bindings,
                 ctx.dialogs,
                 state,
                 &mut deferred,
@@ -473,76 +475,63 @@ fn handle_pane_mouse(
     (handled_by_url, url_highlight)
 }
 
+/// Menu entry that fires an action, showing the bound key combo (if any)
+/// right-aligned the way native menus do.
+fn action_menu_item(
+    ui: &mut egui::Ui,
+    bindings: &BindingTable,
+    label: &str,
+    action: Action,
+    deferred: &mut Vec<Action>,
+) {
+    let mut btn = egui::Button::new(label);
+    if let Some(combo) = bindings.combo_for(action) {
+        btn = btn.shortcut_text(combo);
+    }
+    if ui.add(btn).clicked() {
+        deferred.push(action);
+        ui.close();
+    }
+}
+
 fn build_context_menu(
     ui: &mut egui::Ui,
     pane_id: PaneId,
     tab: &crate::tabs::Tab,
     zoomed: Option<PaneId>,
     user_config: &Config,
+    bindings: &BindingTable,
     dialogs: &mut crate::dialogs::DialogState,
     state: &mut PaneViewState,
     deferred: &mut Vec<Action>,
 ) {
-    if ui.button("Copy").clicked() {
-        deferred.push(Action::Copy);
-        ui.close();
-    }
-    if ui.button("Paste").clicked() {
-        deferred.push(Action::Paste);
-        ui.close();
-    }
+    action_menu_item(ui, bindings, "Copy", Action::Copy, deferred);
+    action_menu_item(ui, bindings, "Paste", Action::Paste, deferred);
     ui.separator();
-    if ui.button("Split Horizontally").clicked() {
-        deferred.push(Action::SplitHorizontal);
-        ui.close();
-    }
-    if ui.button("Split Vertically").clicked() {
-        deferred.push(Action::SplitVertical);
-        ui.close();
-    }
-    if ui.button("Split Auto").clicked() {
-        deferred.push(Action::SplitAuto);
-        ui.close();
-    }
+    action_menu_item(ui, bindings, "Split Horizontally", Action::SplitHorizontal, deferred);
+    action_menu_item(ui, bindings, "Split Vertically", Action::SplitVertical, deferred);
+    action_menu_item(ui, bindings, "Split Auto", Action::SplitAuto, deferred);
     ui.separator();
     let zoom_label = if zoomed.is_some() {
         "Restore all terminals"
     } else {
         "Maximize terminal"
     };
-    if ui.button(zoom_label).clicked() {
-        deferred.push(Action::ToggleZoom);
-        ui.close();
-    }
+    action_menu_item(ui, bindings, zoom_label, Action::ToggleZoom, deferred);
     let read_only = tab
         .panes.get(&pane_id).map_or(false, |p| p.read_only);
     let ro_label = if read_only { "Disable read-only" } else { "Read-only" };
-    if ui.button(ro_label).clicked() {
-        deferred.push(Action::ToggleReadOnly);
-        ui.close();
-    }
+    action_menu_item(ui, bindings, ro_label, Action::ToggleReadOnly, deferred);
     let broadcast_label = if tab.broadcast {
         "Stop broadcasting"
     } else {
         "Broadcast input to all panes"
     };
-    if ui.button(broadcast_label).clicked() {
-        deferred.push(Action::ToggleBroadcast);
-        ui.close();
-    }
+    action_menu_item(ui, bindings, broadcast_label, Action::ToggleBroadcast, deferred);
     ui.separator();
-    if ui.button("Set title\u{2026}").clicked() {
-        deferred.push(Action::SetTitle);
-        ui.close();
-    }
-    if ui.button("Open Terminal Here").clicked() {
-        deferred.push(Action::OpenTerminalHere);
-        ui.close();
-    }
-    if ui.button("Close Pane").clicked() {
-        deferred.push(Action::ClosePane);
-        ui.close();
-    }
+    action_menu_item(ui, bindings, "Set title\u{2026}", Action::SetTitle, deferred);
+    action_menu_item(ui, bindings, "Open Terminal Here", Action::OpenTerminalHere, deferred);
+    action_menu_item(ui, bindings, "Close Pane", Action::ClosePane, deferred);
     ui.separator();
     ui.menu_button("Layouts", |ui| {
         if ui.button("Save current layout\u{2026}").clicked() {
@@ -562,15 +551,9 @@ fn build_context_menu(
         }
     });
     ui.separator();
-    if ui.button("New Tab").clicked() {
-        deferred.push(Action::NewTab);
-        ui.close();
-    }
+    action_menu_item(ui, bindings, "New Tab", Action::NewTab, deferred);
     ui.separator();
-    if ui.button("Preferences\u{2026}").clicked() {
-        deferred.push(Action::OpenPrefs);
-        ui.close();
-    }
+    action_menu_item(ui, bindings, "Preferences\u{2026}", Action::OpenPrefs, deferred);
 }
 
 fn handle_drag_drop(
