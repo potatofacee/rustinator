@@ -4,10 +4,12 @@
 //! offers no way to interpose a `vte::ansi::Handler` between the parser and
 //! `Term`, so we carry our own copy that advances the parser into
 //! `TermHandlerProxy` instead of `Term` directly. Differences from upstream:
-//! `EventLoop::new` takes a `clear_wipes_scrollback: Arc<AtomicBool>` and both
-//! parser dispatch sites (`advance`, `stop_sync`) go through the proxy; the
-//! PTY poll token constants are replicated locally because upstream keeps
-//! them pub(crate). Re-sync this file when bumping alacritty_terminal.
+//! `EventLoop::new` takes a `PaneHooks` (clear_wipes_scrollback flag + shared
+//! pane defaults for answering color queries), the loop keeps a clone of its
+//! own `EventLoopSender` so the proxy can write query replies back to the PTY,
+//! and both parser dispatch sites (`advance`, `stop_sync`) go through the
+//! proxy; the PTY poll token constants are replicated locally because upstream
+//! keeps them pub(crate). Re-sync this file when bumping alacritty_terminal.
 
 use std::borrow::Cow;
 use std::collections::VecDeque;
@@ -15,9 +17,9 @@ use std::fmt::{self, Display, Formatter};
 use std::fs::File;
 use std::io::{self, ErrorKind, Read, Write};
 use std::num::NonZeroUsize;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
@@ -29,7 +31,19 @@ use alacritty_terminal::{thread, tty};
 use log::error;
 use polling::{Event as PollingEvent, Events, PollMode, Poller};
 
+use crate::pane::PaneDefaults;
 use crate::term_handler::TermHandlerProxy;
+
+/// Per-pane state shared between the main thread and this loop's parse-time
+/// handler proxy. Bundled so `EventLoop::new` stays close to upstream's
+/// signature as more hooks are added.
+pub struct PaneHooks {
+    /// When true, ED 2 on the primary screen also wipes scrollback.
+    pub clear_wipes_scrollback: Arc<AtomicBool>,
+    /// Pane default colors, used to answer OSC 10/11/12 and OSC 4 queries when
+    /// the program has not overridden the color. Written by the main thread.
+    pub defaults: Arc<Mutex<PaneDefaults>>,
+}
 
 // Replicated from alacritty_terminal's tty module, where they are pub(crate).
 // Values must match the keys the Pty implementations register with.
@@ -74,7 +88,11 @@ pub struct EventLoop<T: tty::EventedPty, U: EventListener> {
     event_proxy: U,
     drain_on_exit: bool,
     ref_test: bool,
-    clear_wipes_scrollback: Arc<AtomicBool>,
+    hooks: PaneHooks,
+    /// Clone of this loop's own sender, handed to the parse-time proxy so
+    /// query replies can be queued for the PTY (the send wakes the poller;
+    /// the next loop iteration drains and writes).
+    sender: EventLoopSender,
 }
 
 impl<T, U> EventLoop<T, U>
@@ -89,10 +107,11 @@ where
         pty: T,
         drain_on_exit: bool,
         ref_test: bool,
-        clear_wipes_scrollback: Arc<AtomicBool>,
+        hooks: PaneHooks,
     ) -> io::Result<EventLoop<T, U>> {
         let (tx, rx) = mpsc::channel();
-        let poll = Poller::new()?.into();
+        let poll: Arc<Poller> = Poller::new()?.into();
+        let sender = EventLoopSender { sender: tx.clone(), poller: Arc::clone(&poll) };
         Ok(EventLoop {
             poll,
             pty,
@@ -102,7 +121,8 @@ where
             event_proxy,
             drain_on_exit,
             ref_test,
-            clear_wipes_scrollback,
+            hooks,
+            sender,
         })
     }
 
@@ -178,7 +198,9 @@ where
             // Parse the incoming bytes.
             let mut handler = TermHandlerProxy {
                 term: &mut **terminal,
-                clear_wipes_scrollback: self.clear_wipes_scrollback.load(Ordering::Relaxed),
+                clear_wipes_scrollback: self.hooks.clear_wipes_scrollback.load(Ordering::Relaxed),
+                writer: &self.sender,
+                defaults: *self.hooks.defaults.lock().unwrap(),
             };
             state.parser.advance(&mut handler, &buf[..unprocessed]);
 
@@ -276,8 +298,11 @@ where
                     let mut handler = TermHandlerProxy {
                         term: &mut *terminal,
                         clear_wipes_scrollback: self
+                            .hooks
                             .clear_wipes_scrollback
                             .load(Ordering::Relaxed),
+                        writer: &self.sender,
+                        defaults: *self.hooks.defaults.lock().unwrap(),
                     };
                     state.parser.stop_sync(&mut handler);
                     drop(terminal);
