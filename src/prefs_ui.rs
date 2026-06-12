@@ -429,6 +429,15 @@ fn profile_tab_behavior(ui: &mut egui::Ui, profile: &mut config::Profile) {
             );
         });
     }
+    ui.checkbox(&mut profile.clear_wipes_scrollback, "Clearing the screen wipes scrollback");
+    ui.label(
+        egui::RichText::new(
+            "When enabled, Ctrl+L and the clear command discard scrollback \
+             history instead of keeping it scrollable.",
+        )
+        .small()
+        .weak(),
+    );
 
     ui.add_space(8.0);
     ui.label(egui::RichText::new("Transparency").strong());

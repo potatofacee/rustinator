@@ -68,6 +68,8 @@ pub struct Profile {
     pub scroll_on_output: bool,
     #[serde(default = "default_true")]
     pub scroll_on_keystroke: bool,
+    #[serde(default)]
+    pub clear_wipes_scrollback: bool,
     #[serde(default = "default_word_chars")]
     pub word_chars: String,
     #[serde(default)]
@@ -194,6 +196,7 @@ impl Profile {
             cursor_blink: true,
             scroll_on_output: false,
             scroll_on_keystroke: true,
+            clear_wipes_scrollback: false,
             word_chars: default_word_chars(),
             exit_action: ExitAction::Close,
             inactive_dim_alpha: default_inactive_dim_alpha(),
@@ -403,6 +406,7 @@ impl Config {
                 cursor_blink: true,
                 scroll_on_output: false,
                 scroll_on_keystroke: true,
+                clear_wipes_scrollback: false,
                 word_chars: default_word_chars(),
                 exit_action: ExitAction::Close,
                 inactive_dim_alpha: default_inactive_dim_alpha(),
@@ -758,6 +762,27 @@ mod tests {
         assert_eq!(parsed.active().palette_rgb()[4], [0x11, 0x22, 0xaa]);
         assert_eq!(parsed.active().focus_border_rgb(), [0x12, 0x34, 0x56]);
         assert_eq!(parsed.active().selection_bg_rgb(), Some([0x22, 0x22, 0x33]));
+    }
+
+    #[test]
+    fn clear_wipes_scrollback_round_trips_and_defaults_false() {
+        assert!(!Profile::default().clear_wipes_scrollback);
+
+        let mut cfg = Config::default();
+        cfg.active_mut().clear_wipes_scrollback = true;
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        let parsed: Config = toml::from_str(&text).unwrap();
+        assert!(parsed.active().clear_wipes_scrollback);
+
+        let toml_text = r##"
+            [[profiles]]
+            name = "Test"
+
+            [profiles.colors]
+            background = "#002b36"
+        "##;
+        let cfg: Config = toml::from_str(toml_text).unwrap();
+        assert!(!cfg.profiles[0].clear_wipes_scrollback);
     }
 
     #[test]
