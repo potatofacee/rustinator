@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
-use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg, State as EventLoopState};
+use crate::pty_event_loop::{EventLoop, EventLoopSender, Msg, State as EventLoopState};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Boundary, Column, Direction as GridDir, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
@@ -61,6 +61,9 @@ pub struct PaneDefaults {
     /// 0.0..=1.0; alpha to apply to the *default* bg only. Non-default cell
     /// backgrounds stay fully opaque.
     pub bg_opacity: f32,
+    /// Whether clearing the screen (ED 2 on the primary screen) also wipes
+    /// scrollback history. Mirrored into the pane's atomic for the PTY thread.
+    pub clear_wipes_scrollback: bool,
 }
 
 impl Default for PaneDefaults {
@@ -73,6 +76,7 @@ impl Default for PaneDefaults {
             selection_bg: None,
             selection_fg: None,
             bg_opacity: 1.0,
+            clear_wipes_scrollback: false,
         }
     }
 }
@@ -380,6 +384,10 @@ pub struct Pane {
     pub title: Arc<Mutex<Option<String>>>,
     pub visible: Arc<AtomicBool>,
     pub cached: Option<Arc<Frame>>,
+    /// Read by the PTY event loop on every parse: when true, ED 2 (clear all)
+    /// on the primary screen also wipes scrollback. Nothing sets it yet; the
+    /// preference UI will. Shared with the loop, so it survives respawn.
+    pub clear_wipes_scrollback: Arc<AtomicBool>,
     pub defaults: PaneDefaults,
     pub read_only: bool,
     pub scrollbar_visible: bool,
@@ -448,8 +456,16 @@ impl Pane {
         let pty = tty::new(&pty_opts, window_size, id)
             .map_err(|e| format!("failed to open pty: {e}"))?;
         let child_pid = pty.child().id();
-        let event_loop = EventLoop::new(Arc::clone(&terminal), proxy, pty, false, false)
-            .map_err(|e| format!("failed to create pty event loop: {e}"))?;
+        let clear_wipes_scrollback = Arc::new(AtomicBool::new(defaults.clear_wipes_scrollback));
+        let event_loop = EventLoop::new(
+            Arc::clone(&terminal),
+            proxy,
+            pty,
+            false,
+            false,
+            Arc::clone(&clear_wipes_scrollback),
+        )
+        .map_err(|e| format!("failed to create pty event loop: {e}"))?;
         let pty_tx = event_loop.channel();
         let pty_handle = Some(event_loop.spawn());
 
@@ -467,6 +483,7 @@ impl Pane {
             title,
             visible,
             cached: None,
+            clear_wipes_scrollback,
             defaults,
             read_only: false,
             scrollbar_visible: true,
@@ -526,8 +543,15 @@ impl Pane {
         let pty = tty::new(&pty_opts, window_size, self.id)
             .map_err(|e| format!("failed to open pty: {e}"))?;
         let child_pid = pty.child().id();
-        let event_loop = EventLoop::new(Arc::clone(&terminal), proxy, pty, false, false)
-            .map_err(|e| format!("failed to create pty event loop: {e}"))?;
+        let event_loop = EventLoop::new(
+            Arc::clone(&terminal),
+            proxy,
+            pty,
+            false,
+            false,
+            Arc::clone(&self.clear_wipes_scrollback),
+        )
+        .map_err(|e| format!("failed to create pty event loop: {e}"))?;
         let pty_tx = event_loop.channel();
         let pty_handle = Some(event_loop.spawn());
 

@@ -14,9 +14,11 @@ mod pane_ui;
 mod platform;
 mod prefs_ui;
 mod presets;
+mod pty_event_loop;
 mod renderer;
 mod shell_integration;
 mod tabs;
+mod term_handler;
 pub mod window;
 
 use crate::dialogs::{DialogAction, DialogState};
@@ -174,6 +176,7 @@ fn defaults_from_profile(profile: &config::Profile) -> PaneDefaults {
         palette: profile.palette_rgb(),
         selection_bg: profile.selection_bg_rgb(),
         selection_fg: profile.selection_fg_rgb(),
+        clear_wipes_scrollback: profile.clear_wipes_scrollback,
     }
 }
 
@@ -512,6 +515,8 @@ impl App {
         for tab in &mut self.tab_mgr.tabs {
             for pane in tab.panes.values_mut() {
                 pane.defaults = pd;
+                pane.clear_wipes_scrollback
+                    .store(pd.clear_wipes_scrollback, std::sync::atomic::Ordering::Relaxed);
                 pane.dirty.store(true, std::sync::atomic::Ordering::Release);
                 pane.cached = None;
             }

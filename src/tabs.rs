@@ -490,13 +490,23 @@ impl TabManager {
         }
     }
 
-    pub(crate) fn reset_focused_terminal(&self, clear: bool) {
-        let tab = &self.tabs[self.active_tab];
-        if let Some(pane) = tab.panes.get(&tab.focused) {
-            pane.send_bytes(b"\x1bc".to_vec());
-            if clear {
-                pane.send_bytes(b"\x1b[2J\x1b[H".to_vec());
+    pub(crate) fn reset_focused_terminal(&mut self, clear: bool) {
+        use alacritty_terminal::vte::ansi::{ClearMode, Handler};
+        let tab = &mut self.tabs[self.active_tab];
+        if let Some(pane) = tab.panes.get_mut(&tab.focused) {
+            {
+                let mut term = pane.terminal.lock();
+                // reset_state already blanks both grids and wipes scrollback
+                // (Grid::reset calls clear_history), so the clear variant's
+                // extra calls are belt-and-braces against semantics changes.
+                Handler::reset_state(&mut *term);
+                if clear {
+                    Handler::clear_screen(&mut *term, ClearMode::All);
+                    Handler::clear_screen(&mut *term, ClearMode::Saved);
+                }
             }
+            pane.dirty.store(true, std::sync::atomic::Ordering::Release);
+            pane.cached = None;
         }
     }
 
