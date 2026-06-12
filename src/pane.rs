@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
-use crate::pty_event_loop::{EventLoop, EventLoopSender, Msg, State as EventLoopState};
+use crate::pty_event_loop::{EventLoop, EventLoopSender, Msg, PaneHooks, State as EventLoopState};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Boundary, Column, Direction as GridDir, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
@@ -99,7 +99,7 @@ fn named_default(n: NamedColor, defaults: &PaneDefaults) -> [u8; 3] {
     }
 }
 
-fn indexed_default(i: u8, defaults: &PaneDefaults) -> [u8; 3] {
+pub(crate) fn indexed_default(i: u8, defaults: &PaneDefaults) -> [u8; 3] {
     let i = i as usize;
     if i < 16 {
         defaults.palette[i]
@@ -156,11 +156,26 @@ pub struct EventProxy {
     // output isn't visible. Rare events (bell/title/exit) always wake.
     pub visible: Arc<AtomicBool>,
     pub winit_proxy: Option<winit::event_loop::EventLoopProxy<crate::window::UserEvent>>,
+    // The fields below are read in send_event, which Term calls WHILE the PTY
+    // thread holds the terminal FairMutex. Locking pane.terminal from any of
+    // these paths would deadlock; only these mirrored Arcs and channel sends
+    // may be touched.
+    /// Sender into the pane's PTY event loop, for answering terminal queries
+    /// (DA, DSR, text-area size). None only between proxy creation and
+    /// EventLoop::new during (re)spawn, before the loop can emit events.
+    pub pty_writer: Arc<Mutex<Option<EventLoopSender>>>,
+    /// Mirror of the pane's current size, kept fresh by Pane::resize, so
+    /// TextAreaSizeRequest can be answered without touching the terminal.
+    pub window_size: Arc<Mutex<WindowSize>>,
+    /// OSC 52 store waiting for the main thread, which owns clipboard access
+    /// (egui_ctx.copy_text). Drained once per frame in App::logic.
+    pub pending_clipboard_store: Arc<Mutex<Option<String>>>,
 }
 
 impl EventProxy {
     pub fn new(
         winit_proxy: Option<winit::event_loop::EventLoopProxy<crate::window::UserEvent>>,
+        window_size: WindowSize,
     ) -> Self {
         Self {
             dirty: Arc::new(AtomicBool::new(true)),
@@ -170,6 +185,17 @@ impl EventProxy {
             title: Arc::new(Mutex::new(None)),
             visible: Arc::new(AtomicBool::new(true)),
             winit_proxy,
+            pty_writer: Arc::new(Mutex::new(None)),
+            window_size: Arc::new(Mutex::new(window_size)),
+            pending_clipboard_store: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Queue reply bytes for the PTY. No-op if the event loop's sender is not
+    /// installed yet (it is filled right after EventLoop::new in (re)spawn).
+    fn reply(&self, text: String) {
+        if let Some(tx) = self.pty_writer.lock().unwrap().as_ref() {
+            let _ = tx.send(Msg::Input(text.into_bytes().into()));
         }
     }
 
@@ -217,7 +243,40 @@ impl EventListener for EventProxy {
             Event::ChildExit(_) => {
                 self.wake();
             }
-            _ => {}
+            // Reply paths for terminal queries (DA, DSR, XTWINOPS 14/18).
+            // Without these, programs that query and wait (e.g. glow) hang.
+            Event::PtyWrite(text) => {
+                self.reply(text);
+            }
+            Event::TextAreaSizeRequest(fmt) => {
+                let window_size = *self.window_size.lock().unwrap();
+                self.reply(fmt(window_size));
+            }
+            // OSC 52 store: only the main thread can write the system
+            // clipboard, so stash the text for App::logic to drain. The
+            // ClipboardType distinction is dropped — the app's only clipboard
+            // write path (egui_ctx.copy_text) targets the system clipboard.
+            Event::ClipboardStore(_ty, text) => {
+                *self.pending_clipboard_store.lock().unwrap() = Some(text);
+                self.dirty.store(true, Ordering::Release);
+                self.wake();
+            }
+            // OSC 52 load: always answer with an empty paste. A real read
+            // would expose the clipboard to any program writing to the tty
+            // (our Term config keeps the crate default Osc52::OnlyCopy, which
+            // already denies loads), but if a load ever gets through, a reply
+            // must still be sent so the requesting app does not block.
+            Event::ClipboardLoad(_ty, fmt) => {
+                self.reply(fmt(""));
+            }
+            Event::CursorBlinkingChange => {
+                self.dirty.store(true, Ordering::Release);
+                self.wake();
+            }
+            // Never emitted: TermHandlerProxy::dynamic_color_sequence answers
+            // color queries in place instead of forwarding to Term (the only
+            // emitter of this event).
+            Event::ColorRequest(_, _) => {}
         }
     }
 }
@@ -389,6 +448,16 @@ pub struct Pane {
     /// preference UI will. Shared with the loop, so it survives respawn.
     pub clear_wipes_scrollback: Arc<AtomicBool>,
     pub defaults: PaneDefaults,
+    /// Copy of `defaults` shared with the PTY loop, read at parse time to
+    /// answer OSC 4/10/11/12 color queries. Kept in sync wherever `defaults`
+    /// is pushed; survives respawn.
+    pub shared_defaults: Arc<Mutex<PaneDefaults>>,
+    /// Mirror of the pane's size shared with the EventProxy so XTWINOPS size
+    /// queries are answered without locking the terminal. Updated on resize.
+    window_size: Arc<Mutex<WindowSize>>,
+    /// OSC 52 store waiting for the main thread's clipboard write (drained in
+    /// App::logic each frame).
+    pub pending_clipboard_store: Arc<Mutex<Option<String>>>,
     pub read_only: bool,
     pub scrollbar_visible: bool,
     /// True once the child process has exited and the pane is being held open
@@ -415,24 +484,27 @@ impl Pane {
         winit_proxy: Option<winit::event_loop::EventLoopProxy<crate::window::UserEvent>>,
         working_dir: Option<&std::path::Path>,
     ) -> Result<Self, String> {
-        let proxy = EventProxy::new(winit_proxy);
-        let dirty = Arc::clone(&proxy.dirty);
-        let wake_pending = Arc::clone(&proxy.wake_pending);
-        let has_new_output = Arc::clone(&proxy.has_new_output);
-        let exited = Arc::clone(&proxy.exited);
-        let title = Arc::clone(&proxy.title);
-        let visible = Arc::clone(&proxy.visible);
-
-        let dims = TermDims { cols, lines };
-        let term = Term::new(term_config, &dims, proxy.clone());
-        let terminal = Arc::new(FairMutex::new(term));
-
         let window_size = WindowSize {
             num_lines: lines as u16,
             num_cols: cols as u16,
             cell_width: cell_w.round() as u16,
             cell_height: cell_h.round() as u16,
         };
+
+        let proxy = EventProxy::new(winit_proxy, window_size);
+        let dirty = Arc::clone(&proxy.dirty);
+        let wake_pending = Arc::clone(&proxy.wake_pending);
+        let has_new_output = Arc::clone(&proxy.has_new_output);
+        let exited = Arc::clone(&proxy.exited);
+        let title = Arc::clone(&proxy.title);
+        let visible = Arc::clone(&proxy.visible);
+        let pty_writer = Arc::clone(&proxy.pty_writer);
+        let shared_window_size = Arc::clone(&proxy.window_size);
+        let pending_clipboard_store = Arc::clone(&proxy.pending_clipboard_store);
+
+        let dims = TermDims { cols, lines };
+        let term = Term::new(term_config, &dims, proxy.clone());
+        let terminal = Arc::new(FairMutex::new(term));
 
         let mut pty_opts = tty::Options::default();
         #[cfg(not(target_os = "macos"))]
@@ -457,16 +529,21 @@ impl Pane {
             .map_err(|e| format!("failed to open pty: {e}"))?;
         let child_pid = pty.child().id();
         let clear_wipes_scrollback = Arc::new(AtomicBool::new(defaults.clear_wipes_scrollback));
+        let shared_defaults = Arc::new(Mutex::new(defaults));
         let event_loop = EventLoop::new(
             Arc::clone(&terminal),
             proxy,
             pty,
             false,
             false,
-            Arc::clone(&clear_wipes_scrollback),
+            PaneHooks {
+                clear_wipes_scrollback: Arc::clone(&clear_wipes_scrollback),
+                defaults: Arc::clone(&shared_defaults),
+            },
         )
         .map_err(|e| format!("failed to create pty event loop: {e}"))?;
         let pty_tx = event_loop.channel();
+        *pty_writer.lock().unwrap() = Some(pty_tx.clone());
         let pty_handle = Some(event_loop.spawn());
 
         Ok(Self {
@@ -485,6 +562,9 @@ impl Pane {
             cached: None,
             clear_wipes_scrollback,
             defaults,
+            shared_defaults,
+            window_size: shared_window_size,
+            pending_clipboard_store,
             read_only: false,
             scrollbar_visible: true,
             dead: Cell::new(false),
@@ -509,24 +589,27 @@ impl Pane {
             let _ = handle.join();
         }
 
-        let proxy = EventProxy::new(winit_proxy);
-        let dirty = Arc::clone(&proxy.dirty);
-        let wake_pending = Arc::clone(&proxy.wake_pending);
-        let has_new_output = Arc::clone(&proxy.has_new_output);
-        let exited = Arc::clone(&proxy.exited);
-        let title = Arc::clone(&proxy.title);
-        let visible = Arc::clone(&proxy.visible);
-
-        let dims = TermDims { cols: self.cols, lines: self.lines };
-        let term = Term::new(term_config, &dims, proxy.clone());
-        let terminal = Arc::new(FairMutex::new(term));
-
         let window_size = WindowSize {
             num_lines: self.lines as u16,
             num_cols: self.cols as u16,
             cell_width: cell_w.round() as u16,
             cell_height: cell_h.round() as u16,
         };
+
+        let proxy = EventProxy::new(winit_proxy, window_size);
+        let dirty = Arc::clone(&proxy.dirty);
+        let wake_pending = Arc::clone(&proxy.wake_pending);
+        let has_new_output = Arc::clone(&proxy.has_new_output);
+        let exited = Arc::clone(&proxy.exited);
+        let title = Arc::clone(&proxy.title);
+        let visible = Arc::clone(&proxy.visible);
+        let pty_writer = Arc::clone(&proxy.pty_writer);
+        let shared_window_size = Arc::clone(&proxy.window_size);
+        let pending_clipboard_store = Arc::clone(&proxy.pending_clipboard_store);
+
+        let dims = TermDims { cols: self.cols, lines: self.lines };
+        let term = Term::new(term_config, &dims, proxy.clone());
+        let terminal = Arc::new(FairMutex::new(term));
 
         let mut pty_opts = tty::Options::default();
         #[cfg(not(target_os = "macos"))]
@@ -549,10 +632,14 @@ impl Pane {
             pty,
             false,
             false,
-            Arc::clone(&self.clear_wipes_scrollback),
+            PaneHooks {
+                clear_wipes_scrollback: Arc::clone(&self.clear_wipes_scrollback),
+                defaults: Arc::clone(&self.shared_defaults),
+            },
         )
         .map_err(|e| format!("failed to create pty event loop: {e}"))?;
         let pty_tx = event_loop.channel();
+        *pty_writer.lock().unwrap() = Some(pty_tx.clone());
         let pty_handle = Some(event_loop.spawn());
 
         self.terminal = terminal;
@@ -565,6 +652,8 @@ impl Pane {
         self.exited = exited;
         self.title = title;
         self.visible = visible;
+        self.window_size = shared_window_size;
+        self.pending_clipboard_store = pending_clipboard_store;
         self.cached = None;
         self.dead.set(false);
         *self.ui_selection.lock().unwrap() = None;
@@ -623,6 +712,7 @@ impl Pane {
             cell_width: cell_w.round() as u16,
             cell_height: cell_h.round() as u16,
         };
+        *self.window_size.lock().unwrap() = ws;
         let _ = self.pty_tx.send(Msg::Resize(ws));
     }
 
@@ -633,6 +723,7 @@ impl Pane {
             cell_width: cell_w.round() as u16,
             cell_height: cell_h.round() as u16,
         };
+        *self.window_size.lock().unwrap() = ws;
         let _ = self.pty_tx.send(Msg::Resize(ws));
     }
 

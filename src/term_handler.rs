@@ -8,6 +8,9 @@
 
 use alacritty_terminal::event::EventListener;
 use alacritty_terminal::term::{Term, TermMode};
+
+use crate::pane::{indexed_default, PaneDefaults};
+use crate::pty_event_loop::{EventLoopSender, Msg};
 use alacritty_terminal::vte::ansi::cursor_icon::CursorIcon;
 use alacritty_terminal::vte::ansi::{
     Attr, CharsetIndex, ClearMode, CursorShape, CursorStyle, Handler, Hyperlink, KeyboardModes,
@@ -18,6 +21,37 @@ use alacritty_terminal::vte::ansi::{
 pub(crate) struct TermHandlerProxy<'a, T: EventListener> {
     pub term: &'a mut Term<T>,
     pub clear_wipes_scrollback: bool,
+    /// Sender into the owning PTY event loop, used to queue query replies
+    /// (color queries) for write-back to the PTY.
+    pub writer: &'a EventLoopSender,
+    /// Snapshot of the pane's default colors, the fallback when the program
+    /// has not overridden a queried color via OSC 4/10/11/12.
+    pub defaults: PaneDefaults,
+}
+
+/// Widen an 8-bit channel to X11's 16-bit-per-channel form (0xab -> 0xabab),
+/// the same scaling the alacritty GUI applies when answering color queries.
+fn c16(x: u8) -> u16 {
+    (x as u16) << 8 | x as u16
+}
+
+/// OSC color-query reply: `ESC ] {prefix} ; rgb:rrrr/gggg/bbbb {terminator}`.
+pub(crate) fn color_reply(prefix: &str, [r, g, b]: [u8; 3], terminator: &str) -> String {
+    format!("\x1b]{};rgb:{:04x}/{:04x}/{:04x}{}", prefix, c16(r), c16(g), c16(b), terminator)
+}
+
+/// Default color for a query index when the program has not set an override.
+/// Indices follow vte's NamedColor layout: 0-255 are the indexed palette,
+/// 256/257/258 are Foreground/Background/Cursor. Anything else (Dim* and
+/// out-of-range) falls back to the foreground.
+pub(crate) fn default_color_for_index(index: usize, defaults: &PaneDefaults) -> [u8; 3] {
+    match index {
+        0..=255 => indexed_default(index as u8, defaults),
+        256 => defaults.fg,
+        257 => defaults.bg,
+        258 => defaults.cursor,
+        _ => defaults.fg,
+    }
 }
 
 // Forwards use explicit `Handler::method(...)` syntax: `Term` has private
@@ -250,8 +284,17 @@ impl<T: EventListener> Handler for TermHandlerProxy<'_, T> {
         Handler::set_color(self.term, index, color);
     }
 
+    // Answered here instead of forwarding: Term's version only emits
+    // Event::ColorRequest, but the exact answer needs the runtime override
+    // table (term.colors()), which only this proxy can read — it already
+    // holds &mut Term during the parse. The reply is queued on the loop's own
+    // channel; the poller wakes and writes it to the PTY next iteration.
     fn dynamic_color_sequence(&mut self, prefix: String, index: usize, terminator: &str) {
-        Handler::dynamic_color_sequence(self.term, prefix, index, terminator);
+        let rgb = self.term.colors()[index]
+            .map(|c| [c.r, c.g, c.b])
+            .unwrap_or_else(|| default_color_for_index(index, &self.defaults));
+        let reply = color_reply(&prefix, rgb, terminator);
+        let _ = self.writer.send(Msg::Input(reply.into_bytes().into()));
     }
 
     fn reset_color(&mut self, index: usize) {
@@ -328,6 +371,59 @@ mod tests {
     use std::collections::BTreeSet;
     use std::fs;
     use std::path::PathBuf;
+
+    use super::{color_reply, default_color_for_index};
+    use crate::pane::PaneDefaults;
+
+    // ---- OSC color-query replies ----
+
+    #[test]
+    fn color_reply_widens_channels_to_16_bit() {
+        // 0xab -> 0xabab, per X11 rgb spec (matches alacritty GUI replies).
+        assert_eq!(
+            color_reply("10", [0xff, 0x80, 0x00], "\x1b\\"),
+            "\x1b]10;rgb:ffff/8080/0000\x1b\\"
+        );
+    }
+
+    #[test]
+    fn color_reply_osc4_prefix_and_bel_terminator() {
+        assert_eq!(color_reply("4;1", [0xcd, 0x00, 0x00], "\x07"), "\x1b]4;1;rgb:cdcd/0000/0000\x07");
+    }
+
+    #[test]
+    fn color_reply_black_and_white() {
+        assert_eq!(color_reply("11", [0x00, 0x00, 0x00], "\x07"), "\x1b]11;rgb:0000/0000/0000\x07");
+        assert_eq!(color_reply("11", [0xff, 0xff, 0xff], "\x07"), "\x1b]11;rgb:ffff/ffff/ffff\x07");
+    }
+
+    #[test]
+    fn default_color_index_named_special() {
+        let d = PaneDefaults::default();
+        // vte NamedColor: Foreground = 256, Background = 257, Cursor = 258.
+        assert_eq!(default_color_for_index(256, &d), d.fg);
+        assert_eq!(default_color_for_index(257, &d), d.bg);
+        assert_eq!(default_color_for_index(258, &d), d.cursor);
+    }
+
+    #[test]
+    fn default_color_index_palette_range() {
+        let d = PaneDefaults::default();
+        // 0-15 come from the profile palette.
+        assert_eq!(default_color_for_index(1, &d), d.palette[1]);
+        assert_eq!(default_color_for_index(15, &d), d.palette[15]);
+        // 16-255 are the computed cube/grayscale ramps.
+        assert_eq!(default_color_for_index(196, &d), [0xff, 0x00, 0x00]);
+        assert_eq!(default_color_for_index(255, &d), [238, 238, 238]);
+    }
+
+    #[test]
+    fn default_color_index_out_of_range_falls_back_to_fg() {
+        let d = PaneDefaults::default();
+        // Dim* names (259+) and anything unknown answer as foreground.
+        assert_eq!(default_color_for_index(259, &d), d.fg);
+        assert_eq!(default_color_for_index(usize::MAX, &d), d.fg);
+    }
 
     /// Exact vte version this build compiled against, from Cargo.lock.
     fn locked_vte_version() -> String {

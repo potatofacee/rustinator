@@ -457,6 +457,7 @@ impl App {
         for tab in &mut self.tab_mgr.tabs {
             for pane in tab.panes.values_mut() {
                 pane.defaults = self.pane_defaults;
+                *pane.shared_defaults.lock().unwrap() = self.pane_defaults;
                 // Apply scrollback history + semantic escape chars (and the
                 // rest of the term config) to the live Term, so existing panes
                 // pick up the change immediately rather than only on respawn.
@@ -515,6 +516,7 @@ impl App {
         for tab in &mut self.tab_mgr.tabs {
             for pane in tab.panes.values_mut() {
                 pane.defaults = pd;
+                *pane.shared_defaults.lock().unwrap() = pd;
                 pane.clear_wipes_scrollback
                     .store(pd.clear_wipes_scrollback, std::sync::atomic::Ordering::Relaxed);
                 pane.dirty.store(true, std::sync::atomic::Ordering::Release);
@@ -554,6 +556,15 @@ impl App {
         let factory = self.pane_factory();
         let exit_action = self.user_config.active().exit_action;
         self.tab_mgr.reap_exited(exit_action, &self.egui_ctx, &mut self.dialogs, &factory);
+        // Drain OSC 52 clipboard stores stashed by PTY threads; the system
+        // clipboard is only written from here on the main thread.
+        for tab in &self.tab_mgr.tabs {
+            for pane in tab.panes.values() {
+                if let Some(text) = pane.pending_clipboard_store.lock().unwrap().take() {
+                    ctx.copy_text(text);
+                }
+            }
+        }
         // Mark which panes are visible (active tab) so their PTY threads know
         // whether to wake the event loop on output. Background panes stay dirty
         // but don't keep the loop hot.
