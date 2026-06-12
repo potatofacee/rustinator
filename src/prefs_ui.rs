@@ -1,4 +1,5 @@
 use crate::config::{self, Config};
+use crate::keybindings::{Action, BindingTable};
 use crate::presets;
 
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -6,6 +7,13 @@ pub(crate) enum PrefsSection {
     Global,
     Profiles,
     Keybindings,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProfileTab {
+    General,
+    Colors,
+    Behavior,
 }
 
 pub(crate) enum PrefsResult {
@@ -20,6 +28,7 @@ pub(crate) struct PrefsState {
     pub status: Option<String>,
     section: PrefsSection,
     selected_profile: usize,
+    profile_tab: ProfileTab,
     /// Palette slot selected for inline editing (0-7 normal, 8-15 bright).
     pub palette_sel: Option<usize>,
 }
@@ -34,6 +43,7 @@ impl PrefsState {
             status: None,
             section: PrefsSection::Global,
             selected_profile: 0,
+            profile_tab: ProfileTab::General,
             palette_sel: None,
         }
     }
@@ -51,7 +61,11 @@ impl PrefsState {
             .unwrap_or(0);
     }
 
-    pub(crate) fn draw(&mut self, ui: &mut egui::Ui) -> PrefsResult {
+    pub(crate) fn draw(
+        &mut self,
+        ui: &mut egui::Ui,
+        bindings: &BindingTable,
+    ) -> PrefsResult {
         let bottom_h = 40.0;
         let (top_rect, bottom_rect) = {
             let full = ui.available_rect_before_wrap();
@@ -74,6 +88,7 @@ impl PrefsState {
         let draft = &mut self.draft;
         let selected_profile = &mut self.selected_profile;
         let palette_sel = &mut self.palette_sel;
+        let profile_tab = &mut self.profile_tab;
         egui::ScrollArea::vertical().show(&mut top_ui, |ui| {
             ui.horizontal_top(|ui| {
                 ui.vertical(|ui| {
@@ -101,8 +116,9 @@ impl PrefsState {
                         draft,
                         selected_profile,
                         palette_sel,
+                        profile_tab,
                     ),
-                    PrefsSection::Keybindings => draw_prefs_keybindings(ui),
+                    PrefsSection::Keybindings => draw_prefs_keybindings(ui, bindings),
                 });
             });
         });
@@ -196,6 +212,7 @@ fn draw_prefs_profiles(
     cfg: &mut Config,
     selected: &mut usize,
     palette_sel: &mut Option<usize>,
+    profile_tab: &mut ProfileTab,
 ) {
     ui.heading("Profiles");
     ui.add_space(6.0);
@@ -256,190 +273,266 @@ fn draw_prefs_profiles(
                 cfg.active_profile = new_name;
             }
 
-            let profile = &mut cfg.profiles[*selected];
-
             ui.add_space(8.0);
-            ui.label(egui::RichText::new("Font").strong());
             ui.horizontal(|ui| {
-                ui.label("Family");
-                ui.text_edit_singleline(&mut profile.font.family);
-            });
-            ui.horizontal(|ui| {
-                ui.label("Size");
-                ui.add(
-                    egui::DragValue::new(&mut profile.font.size)
-                        .range(6.0..=48.0)
-                        .speed(0.1)
-                        .suffix(" pt"),
-                );
-            });
-            ui.label(
-                egui::RichText::new("Font changes apply on Save.")
-                    .small()
-                    .weak(),
-            );
-
-            ui.add_space(8.0);
-            ui.label(egui::RichText::new("Colors").strong());
-            let current = presets::match_preset(
-                &profile.colors.foreground,
-                &profile.colors.background,
-                &profile.colors.cursor,
-            )
-            .unwrap_or(presets::CUSTOM);
-            ui.horizontal(|ui| {
-                ui.label("Preset");
-                egui::ComboBox::from_id_salt(("preset_combo", *selected))
-                    .selected_text(current)
-                    .show_ui(ui, |ui| {
-                        // "Custom" is a state indicator, not a selectable
-                        // option: it has no preset colors to apply.
-                        ui.label(presets::CUSTOM);
-                        for preset in presets::PRESETS {
-                            if ui
-                                .selectable_label(current == preset.name, preset.name)
-                                .clicked()
-                            {
-                                profile.colors.foreground = preset.foreground.to_string();
-                                profile.colors.background = preset.background.to_string();
-                                profile.colors.cursor = preset.cursor.to_string();
-                            }
-                        }
-                    });
-            });
-            hex_color_row(ui, "Foreground", &mut profile.colors.foreground);
-            hex_color_row(ui, "Background", &mut profile.colors.background);
-            hex_color_row(ui, "Cursor", &mut profile.colors.cursor);
-
-            ui.add_space(4.0);
-            ui.label(egui::RichText::new("ANSI palette").strong());
-            ansi_palette_grid(ui, &mut profile.colors.normal, &mut profile.colors.bright, palette_sel);
-            ansi_palette_picker_window(ui, &mut profile.colors.normal, &mut profile.colors.bright, palette_sel);
-            ansi_palette_preview(ui, profile);
-            if ui.small_button("Reset palette").clicked() {
-                profile.colors.normal = config::AnsiColors::default_normal();
-                profile.colors.bright = config::AnsiColors::default_bright();
-            }
-
-            ui.add_space(4.0);
-            hex_color_row(ui, "Focus border", &mut profile.colors.focus_border);
-            hex_color_row(ui, "Broadcast border", &mut profile.colors.broadcast_border);
-
-            let mut custom_selection = !profile.colors.selection_background.is_empty();
-            if ui.checkbox(&mut custom_selection, "Custom selection colors").changed() {
-                if custom_selection {
-                    profile.colors.selection_background = "#4060c0".into();
-                    profile.colors.selection_foreground = "#ffffff".into();
-                } else {
-                    profile.colors.selection_background = String::new();
-                    profile.colors.selection_foreground = String::new();
+                for (label, t) in [
+                    ("General", ProfileTab::General),
+                    ("Colors", ProfileTab::Colors),
+                    ("Behavior", ProfileTab::Behavior),
+                ] {
+                    if ui.selectable_label(*profile_tab == t, label).clicked() {
+                        *profile_tab = t;
+                    }
                 }
-            }
-            if custom_selection {
-                hex_color_row(ui, "Selection background", &mut profile.colors.selection_background);
-                hex_color_row(ui, "Selection foreground", &mut profile.colors.selection_foreground);
-            }
-
-            ui.add_space(8.0);
-            ui.label(egui::RichText::new("Scrolling").strong());
-            ui.checkbox(&mut profile.scrollback.infinite, "Infinite scrollback");
-            if !profile.scrollback.infinite {
-                ui.horizontal(|ui| {
-                    ui.label("History (lines)");
-                    ui.add(
-                        egui::DragValue::new(&mut profile.scrollback.history)
-                            .range(100..=1_000_000)
-                            .speed(100.0),
-                    );
-                });
-            }
-
-            ui.add_space(8.0);
-            ui.label(egui::RichText::new("Transparency").strong());
-            ui.horizontal(|ui| {
-                ui.label("Opacity");
-                ui.add(
-                    egui::Slider::new(&mut profile.transparency.opacity, 0.3..=1.0)
-                        .fixed_decimals(2),
-                );
             });
-            ui.label(
-                egui::RichText::new(
-                    "Requires a running compositor (e.g. picom, mutter, kwin). \
-                     Has no effect if your window manager does not support \
-                     composited transparency.",
-                )
-                .small()
-                .weak(),
-            );
+            ui.separator();
 
-            ui.add_space(8.0);
-            ui.label(egui::RichText::new("Cursor").strong());
-            ui.checkbox(&mut profile.cursor_blink, "Cursor blink");
-
-            ui.add_space(8.0);
-            ui.label(egui::RichText::new("Clipboard").strong());
-            ui.checkbox(&mut profile.copy_on_selection, "Copy on selection");
-            ui.checkbox(&mut profile.smart_copy, "Smart copy (Ctrl+Shift+C sends Ctrl+C when no selection)");
-
-            ui.add_space(8.0);
-            ui.label(egui::RichText::new("Scroll behavior").strong());
-            ui.checkbox(&mut profile.scroll_on_output, "Scroll on output");
-            ui.checkbox(&mut profile.scroll_on_keystroke, "Scroll on keystroke");
-
-            ui.add_space(8.0);
-            ui.label(egui::RichText::new("Shell").strong());
-            ui.horizontal(|ui| {
-                ui.label("When shell exits");
-                egui::ComboBox::from_id_salt("exit_action")
-                    .selected_text(match profile.exit_action {
-                        config::ExitAction::Close => "Close pane",
-                        config::ExitAction::Hold => "Hold open",
-                        config::ExitAction::Restart => "Restart shell",
-                    })
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut profile.exit_action, config::ExitAction::Close, "Close pane");
-                        ui.selectable_value(&mut profile.exit_action, config::ExitAction::Hold, "Hold open");
-                        ui.selectable_value(&mut profile.exit_action, config::ExitAction::Restart, "Restart shell");
-                    });
-            });
-
-            ui.add_space(8.0);
-            ui.label(egui::RichText::new("Selection").strong());
-            ui.horizontal(|ui| {
-                ui.label("Word characters");
-                ui.text_edit_singleline(&mut profile.word_chars);
-            });
+            let selected_idx = *selected;
+            let profile = &mut cfg.profiles[selected_idx];
+            match *profile_tab {
+                ProfileTab::General => profile_tab_general(ui, profile),
+                ProfileTab::Colors => {
+                    profile_tab_colors(ui, profile, palette_sel, selected_idx)
+                }
+                ProfileTab::Behavior => profile_tab_behavior(ui, profile),
+            }
         });
     });
 }
 
-fn draw_prefs_keybindings(ui: &mut egui::Ui) {
-    ui.heading("Keybindings");
-    ui.add_space(6.0);
+fn profile_tab_general(ui: &mut egui::Ui, profile: &mut config::Profile) {
+    ui.add_space(8.0);
+    ui.label(egui::RichText::new("Font").strong());
+    ui.horizontal(|ui| {
+        ui.label("Family");
+        ui.text_edit_singleline(&mut profile.font.family);
+    });
+    ui.horizontal(|ui| {
+        ui.label("Size");
+        ui.add(
+            egui::DragValue::new(&mut profile.font.size)
+                .range(6.0..=48.0)
+                .speed(0.1)
+                .suffix(" pt"),
+        );
+    });
     ui.label(
-        egui::RichText::new("Key remapping is not editable yet.")
+        egui::RichText::new("Font changes apply on Save.")
             .small()
             .weak(),
     );
+
+    ui.add_space(8.0);
+    ui.label(egui::RichText::new("Shell").strong());
+    ui.horizontal(|ui| {
+        ui.label("When shell exits");
+        egui::ComboBox::from_id_salt("exit_action")
+            .selected_text(match profile.exit_action {
+                config::ExitAction::Close => "Close pane",
+                config::ExitAction::Hold => "Hold open",
+                config::ExitAction::Restart => "Restart shell",
+            })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut profile.exit_action, config::ExitAction::Close, "Close pane");
+                ui.selectable_value(&mut profile.exit_action, config::ExitAction::Hold, "Hold open");
+                ui.selectable_value(&mut profile.exit_action, config::ExitAction::Restart, "Restart shell");
+            });
+    });
+
+    ui.add_space(8.0);
+    ui.label(egui::RichText::new("Selection").strong());
+    ui.horizontal(|ui| {
+        ui.label("Word characters");
+        ui.text_edit_singleline(&mut profile.word_chars);
+    });
+}
+
+fn profile_tab_colors(
+    ui: &mut egui::Ui,
+    profile: &mut config::Profile,
+    palette_sel: &mut Option<usize>,
+    selected: usize,
+) {
+    ui.add_space(8.0);
+    ui.label(egui::RichText::new("Colors").strong());
+    let current = presets::match_preset(
+        &profile.colors.foreground,
+        &profile.colors.background,
+        &profile.colors.cursor,
+    )
+    .unwrap_or(presets::CUSTOM);
+    ui.horizontal(|ui| {
+        ui.label("Preset");
+        egui::ComboBox::from_id_salt(("preset_combo", selected))
+            .selected_text(current)
+            .show_ui(ui, |ui| {
+                // "Custom" is a state indicator, not a selectable
+                // option: it has no preset colors to apply.
+                ui.label(presets::CUSTOM);
+                for preset in presets::PRESETS {
+                    if ui
+                        .selectable_label(current == preset.name, preset.name)
+                        .clicked()
+                    {
+                        profile.colors.foreground = preset.foreground.to_string();
+                        profile.colors.background = preset.background.to_string();
+                        profile.colors.cursor = preset.cursor.to_string();
+                    }
+                }
+            });
+    });
+    hex_color_row(ui, "Foreground", &mut profile.colors.foreground);
+    hex_color_row(ui, "Background", &mut profile.colors.background);
+    hex_color_row(ui, "Cursor", &mut profile.colors.cursor);
+
+    ui.add_space(4.0);
+    ui.label(egui::RichText::new("ANSI palette").strong());
+    ansi_palette_grid(ui, &mut profile.colors.normal, &mut profile.colors.bright, palette_sel);
+    ansi_palette_picker_window(ui, &mut profile.colors.normal, &mut profile.colors.bright, palette_sel);
+    ansi_palette_preview(ui, profile);
+    if ui.small_button("Reset palette").clicked() {
+        profile.colors.normal = config::AnsiColors::default_normal();
+        profile.colors.bright = config::AnsiColors::default_bright();
+    }
+
+    ui.add_space(4.0);
+    hex_color_row(ui, "Focus border", &mut profile.colors.focus_border);
+    hex_color_row(ui, "Broadcast border", &mut profile.colors.broadcast_border);
+
+    let mut custom_selection = !profile.colors.selection_background.is_empty();
+    if ui.checkbox(&mut custom_selection, "Custom selection colors").changed() {
+        if custom_selection {
+            profile.colors.selection_background = "#4060c0".into();
+            profile.colors.selection_foreground = "#ffffff".into();
+        } else {
+            profile.colors.selection_background = String::new();
+            profile.colors.selection_foreground = String::new();
+        }
+    }
+    if custom_selection {
+        hex_color_row(ui, "Selection background", &mut profile.colors.selection_background);
+        hex_color_row(ui, "Selection foreground", &mut profile.colors.selection_foreground);
+    }
+}
+
+fn profile_tab_behavior(ui: &mut egui::Ui, profile: &mut config::Profile) {
+    ui.add_space(8.0);
+    ui.label(egui::RichText::new("Scrolling").strong());
+    ui.checkbox(&mut profile.scrollback.infinite, "Infinite scrollback");
+    if !profile.scrollback.infinite {
+        ui.horizontal(|ui| {
+            ui.label("History (lines)");
+            ui.add(
+                egui::DragValue::new(&mut profile.scrollback.history)
+                    .range(100..=1_000_000)
+                    .speed(100.0),
+            );
+        });
+    }
+
+    ui.add_space(8.0);
+    ui.label(egui::RichText::new("Transparency").strong());
+    ui.horizontal(|ui| {
+        ui.label("Opacity");
+        ui.add(
+            egui::Slider::new(&mut profile.transparency.opacity, 0.3..=1.0)
+                .fixed_decimals(2),
+        );
+    });
+    ui.label(
+        egui::RichText::new(
+            "Requires a running compositor (e.g. picom, mutter, kwin). \
+             Has no effect if your window manager does not support \
+             composited transparency.",
+        )
+        .small()
+        .weak(),
+    );
+
+    ui.add_space(8.0);
+    ui.label(egui::RichText::new("Cursor").strong());
+    ui.checkbox(&mut profile.cursor_blink, "Cursor blink");
+
+    ui.add_space(8.0);
+    ui.label(egui::RichText::new("Clipboard").strong());
+    ui.checkbox(&mut profile.copy_on_selection, "Copy on selection");
+    ui.checkbox(&mut profile.smart_copy, "Smart copy (Ctrl+Shift+C sends Ctrl+C when no selection)");
+
+    ui.add_space(8.0);
+    ui.label(egui::RichText::new("Scroll behavior").strong());
+    ui.checkbox(&mut profile.scroll_on_output, "Scroll on output");
+    ui.checkbox(&mut profile.scroll_on_keystroke, "Scroll on keystroke");
+}
+
+fn draw_prefs_keybindings(ui: &mut egui::Ui, bindings: &BindingTable) {
+    ui.heading("Keybindings");
+    ui.add_space(6.0);
+    ui.label(
+        egui::RichText::new(
+            "Key remapping is editable in the config file; this table reflects \
+             your current bindings.",
+        )
+        .small()
+        .weak(),
+    );
     ui.add_space(6.0);
     egui::Grid::new("keybindings").striped(true).show(ui, |ui| {
-        for (combo, action) in [
-            ("Ctrl+Shift+E", "Split vertically"),
-            ("Ctrl+Shift+O", "Split horizontally"),
-            ("Ctrl+Shift+W", "Close pane"),
-            ("Ctrl+Shift+T", "New tab"),
-            ("Ctrl+Shift+C / Ctrl+Shift+V", "Copy / Paste"),
-            ("Ctrl+Tab / Ctrl+Shift+Tab", "Cycle panes forward / backward"),
-            ("Alt+Arrow", "Focus adjacent pane"),
-            ("Ctrl+PageUp / Ctrl+PageDown", "Previous / next tab"),
-            ("Ctrl+,", "Open Preferences"),
-            ("Middle-click", "Paste primary selection"),
+        for (action, label) in [
+            (Action::SplitVertical, "Split vertically"),
+            (Action::SplitHorizontal, "Split horizontally"),
+            (Action::SplitAuto, "Split auto"),
+            (Action::ClosePane, "Close pane"),
+            (Action::NewTab, "New tab"),
+            (Action::CloseWindow, "Close window"),
+            (Action::NewWindow, "New window"),
+            (Action::Copy, "Copy"),
+            (Action::Paste, "Paste"),
+            (Action::ToggleSearch, "Search"),
+            (Action::FocusNext, "Cycle panes forward"),
+            (Action::FocusPrev, "Cycle panes backward"),
+            (Action::GoLeft, "Focus pane left"),
+            (Action::GoRight, "Focus pane right"),
+            (Action::GoUp, "Focus pane above"),
+            (Action::GoDown, "Focus pane below"),
+            (Action::ResizeLeft, "Resize pane left"),
+            (Action::ResizeRight, "Resize pane right"),
+            (Action::ResizeUp, "Resize pane up"),
+            (Action::ResizeDown, "Resize pane down"),
+            (Action::NextTab, "Next tab"),
+            (Action::PrevTab, "Previous tab"),
+            (Action::MoveTabLeft, "Move tab left"),
+            (Action::MoveTabRight, "Move tab right"),
+            (Action::ToggleZoom, "Maximize pane"),
+            (Action::ToggleBroadcast, "Toggle broadcast"),
+            (Action::ToggleReadOnly, "Toggle read-only"),
+            (Action::ToggleScrollbar, "Toggle scrollbar"),
+            (Action::ToggleFullscreen, "Fullscreen"),
+            (Action::ZoomIn, "Increase font size"),
+            (Action::ZoomOut, "Decrease font size"),
+            (Action::ZoomReset, "Reset font size"),
+            (Action::ResetTerminal, "Reset terminal"),
+            (Action::ResetClear, "Reset and clear"),
+            (Action::SetTitle, "Set pane title"),
+            (Action::OpenTerminalHere, "Open terminal here"),
+            (Action::OpenPrefs, "Open Preferences"),
         ] {
-            ui.label(combo);
-            ui.label(action);
+            if let Some(combo) = bindings.combo_for(action) {
+                ui.label(combo);
+                ui.label(label);
+                ui.end_row();
+            }
+        }
+        if let Some(combo) = bindings.combo_for(Action::SwitchToTab(1)) {
+            let prefix = combo
+                .strip_suffix(|c: char| c.is_ascii_digit())
+                .unwrap_or(&combo);
+            ui.label(format!("{combo} \u{2026} {prefix}9"));
+            ui.label("Switch to tab 1-9");
             ui.end_row();
         }
+        ui.label("Middle-click");
+        ui.label("Paste primary selection");
+        ui.end_row();
     });
 }
 

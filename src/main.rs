@@ -465,7 +465,7 @@ impl App {
     }
 
     pub(crate) fn draw_prefs_content(&mut self, ui: &mut egui::Ui) {
-        let result = self.prefs.draw(ui);
+        let result = self.prefs.draw(ui, &self.input.bindings);
         match result {
             PrefsResult::Applied(config) => {
                 self.apply_prefs(config);
@@ -749,6 +749,7 @@ impl App {
                 renderer: &self.render.renderer,
                 cursor_blink_epoch: self.input.cursor_blink_epoch,
                 user_config: view_config,
+                bindings: &self.input.bindings,
                 egui_ctx: &egui_ctx,
                 dialogs: &mut self.dialogs,
             };

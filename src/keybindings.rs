@@ -170,6 +170,35 @@ impl BindingTable {
     pub fn lookup(&self, key: egui::Key, modifiers: egui::Modifiers) -> Option<Action> {
         self.map.get(&(Mods::from_egui(modifiers), key)).copied()
     }
+
+    /// Display combo bound to an action, e.g. "Ctrl+Shift+O", for menu
+    /// shortcut hints. When several combos map to the action, returns the
+    /// lexicographically smallest so the hint is stable across runs.
+    pub fn combo_for(&self, action: Action) -> Option<String> {
+        self.map
+            .iter()
+            .filter(|(_, a)| **a == action)
+            .map(|(&(mods, key), _)| format_combo(mods, key))
+            .min()
+    }
+}
+
+fn format_combo(mods: Mods, key: egui::Key) -> String {
+    let mut s = String::new();
+    if mods.ctrl {
+        s.push_str("Ctrl+");
+    }
+    if mods.alt {
+        s.push_str("Alt+");
+    }
+    if mods.shift {
+        s.push_str("Shift+");
+    }
+    if mods.mac_cmd {
+        s.push_str("Cmd+");
+    }
+    s.push_str(key.name());
+    s
 }
 
 pub fn defaults_for_platform(force_linux: bool) -> Vec<(String, Action)> {
@@ -894,5 +923,23 @@ mod tests {
         let defs = linux_defaults();
         assert!(defs.iter().any(|(_, a)| matches!(a, Action::RotateCW)));
         assert!(defs.iter().any(|(_, a)| matches!(a, Action::RotateCCW)));
+    }
+
+    #[test]
+    fn combo_for_reverse_lookup() {
+        let table = BindingTable::new(true);
+        assert_eq!(
+            table.combo_for(Action::SplitHorizontal).as_deref(),
+            Some("Ctrl+Shift+O")
+        );
+        // User override is reflected in the hint.
+        let mut table = BindingTable::new(true);
+        table.apply_user(&[("split_horizontal".into(), "Ctrl+Alt+H".into())]);
+        let combos: Vec<String> = ["Ctrl+Alt+H", "Ctrl+Shift+O"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let got = table.combo_for(Action::SplitHorizontal).unwrap();
+        assert!(combos.contains(&got), "unexpected combo {got}");
     }
 }
