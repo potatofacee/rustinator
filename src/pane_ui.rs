@@ -7,8 +7,8 @@ use egui;
 use crate::config::Config;
 use crate::font::FontContext;
 use crate::layout::{self, Direction, LayoutTemplate};
-use crate::mouse::{MouseButton, MouseKind, MouseMods};
-use crate::pane::{CursorOverlay, PaneId, UrlMatch};
+use crate::mouse::{should_report_motion, MouseButton, MouseKind, MouseMods};
+use crate::pane::{CursorOverlay, PaneId, Underline, UrlMatch};
 use crate::renderer::{BgInstance, Renderer};
 use crate::keybindings::{Action, BindingTable};
 use crate::tabs::{TabManager, PANE_GAP};
@@ -341,7 +341,20 @@ fn handle_pane_mouse(
         .interact_pointer_pos()
         .or_else(|| response.hover_pos());
     let inner_rect = terminal_rect.shrink(FOCUS_BORDER);
-    let pointer_cell = pointer.map(|p| cell_at(p, inner_rect, ppp, cell_w, cell_h));
+    // Pixel->cell from fixed cell width; then resolve a click on the right half
+    // of a double-width glyph (its WIDE_CHAR_SPACER column) back to the base
+    // column, matching alacritty's whole-glyph hit semantics. All downstream
+    // uses (selection, mouse-to-app, URL hit-test) get the authoritative column.
+    let pointer_cell = pointer.map(|p| {
+        let (col, row) = cell_at(p, inner_rect, ppp, cell_w, cell_h);
+        let col = tab
+            .panes
+            .get(&pane_id)
+            .and_then(|p| p.cached.as_ref())
+            .map(|frame| crate::pane::resolve_wide_click_col(&frame.cells, row, col))
+            .unwrap_or(col);
+        (col, row)
+    });
     // URL hit-testing only matters while Ctrl is held (hover highlight + click).
     // Scan on demand for the pointer's row instead of every frame snapshot.
     let url_at_pointer = if ctrl_held {
@@ -413,6 +426,34 @@ fn handle_pane_mouse(
                         for _ in 0..steps.min(8) {
                             pane.send_mouse(MouseKind::Press, btn, col, row, mm);
                         }
+                    }
+                }
+
+                // Cell-motion / drag reporting (modes 1002/1003). The pointer moves
+                // at frame rate, but a terminal only cares about cell transitions, so
+                // we coalesce by reporting only when the resolved cell changes from the
+                // last one reported for this pane (tracked in egui temp data).
+                if response.hovered() {
+                    let (held_button, button_held) = ui.input(|i| {
+                        if i.pointer.primary_down() {
+                            (MouseButton::Left, true)
+                        } else if i.pointer.secondary_down() {
+                            (MouseButton::Right, true)
+                        } else if i.pointer.middle_down() {
+                            (MouseButton::Middle, true)
+                        } else {
+                            (MouseButton::Left, false)
+                        }
+                    });
+                    let motion_id = egui::Id::new(("pane_motion_cell", tab_idx, pane_id));
+                    let last_cell: Option<(i32, i32)> =
+                        ui.ctx().data(|d| d.get_temp(motion_id));
+                    let cell_changed = last_cell != Some((col, row));
+                    if should_report_motion(pane.term_mode(), button_held, cell_changed) {
+                        pane.send_mouse(MouseKind::Motion, held_button, col, row, mm);
+                    }
+                    if cell_changed {
+                        ui.ctx().data_mut(|d| d.insert_temp(motion_id, (col, row)));
                     }
                 }
             }
@@ -795,9 +836,25 @@ fn paint_pane(
                             cell.fg
                         };
                         if let Some(gi) = renderer.build_glyph_instance(
-                            cell.c, cell.style, cell.col, cell.row, glyph_fg, &mut font,
+                            cell.c, cell.style, cell.col, cell.row, glyph_fg, cell.hidden, &mut font,
                         ) {
                             gl_instances.push(gi);
+                        }
+                        // Composite overlay (Approach A): stack each extra
+                        // codepoint's glyph over the same cell origin. Combining
+                        // marks are zero-advance by definition, so this is
+                        // approximately correct for accents. crossfont can't
+                        // shape clusters, so emoji ZWJ sequences render as base
+                        // + visible joiners rather than one merged glyph -- this
+                        // stops the silent data drop, not full emoji shaping.
+                        // build_glyph_instance returns None for empty glyphs, so
+                        // bare combining chars that don't rasterize are skipped.
+                        for &zw in &cell.zerowidth {
+                            if let Some(gi) = renderer.build_glyph_instance(
+                                zw, cell.style, cell.col, cell.row, glyph_fg, cell.hidden, &mut font,
+                            ) {
+                                gl_instances.push(gi);
+                            }
                         }
                     }
                 }
@@ -853,6 +910,103 @@ fn paint_pane(
                     // right
                     bg.push(BgInstance { cell: [col, row], color,
                         offset_cells: [1.0 - bw, bh], size_cells: [bw, 1.0 - 2.0 * bh] });
+                }
+            }
+        }
+
+        // SGR underline + strikeout decorations. Positions are expressed as
+        // fractions of the cell (BgInstance is cell-relative), matching the
+        // url-underline / underline-cursor paths; no font metrics needed.
+        // HIDDEN cells already have fg == bg from the snapshot, so their
+        // decoration color is invisible (nothing to special-case here).
+        {
+            let ch = renderer.cell_h;
+            // Single-line thickness ~1.5px, clamped, in cell-height units.
+            let t = (1.5 / ch).clamp(0.04, 0.2);
+            // Underline sits near the descender; strikeout near mid-cell.
+            let u_y = 1.0 - t - 0.06;
+            let s_y = 0.5 - t * 0.5;
+            for cell in &frame.cells {
+                let col = cell.col;
+                let row = cell.row;
+                let uc = cell.underline_color;
+                // A double-width (CJK) base cell spans two columns; its blank
+                // spacer carries no flags, so the decoration must cover both.
+                let w = if cell.wide { 2.0 } else { 1.0 };
+                match cell.underline {
+                    Underline::None => {}
+                    Underline::Single => {
+                        bg.push(BgInstance {
+                            cell: [col, row],
+                            color: uc,
+                            offset_cells: [0.0, u_y],
+                            size_cells: [w, t],
+                        });
+                    }
+                    Underline::Double => {
+                        // Two thinner lines straddling the single-line position.
+                        let tt = t * 0.6;
+                        bg.push(BgInstance {
+                            cell: [col, row],
+                            color: uc,
+                            offset_cells: [0.0, u_y - tt],
+                            size_cells: [w, tt],
+                        });
+                        bg.push(BgInstance {
+                            cell: [col, row],
+                            color: uc,
+                            offset_cells: [0.0, u_y + tt],
+                            size_cells: [w, tt],
+                        });
+                    }
+                    Underline::Dotted | Underline::Dashed => {
+                        // Stipple: short rects across the cell width. Dotted uses
+                        // a 1/4-cell period; dashed a 1/2-cell period with a
+                        // longer on-segment. No shader change.
+                        let (period, on): (f32, f32) = match cell.underline {
+                            Underline::Dotted => (0.25, 0.5),
+                            _ => (0.5, 0.6),
+                        };
+                        let seg = period * on;
+                        let mut x = 0.0;
+                        while x < w {
+                            bg.push(BgInstance {
+                                cell: [col, row],
+                                color: uc,
+                                offset_cells: [x, u_y],
+                                size_cells: [seg.min(w - x), t],
+                            });
+                            x += period;
+                        }
+                    }
+                    Underline::Curly => {
+                        // Approximation: a small triangle-wave of short rects at
+                        // alternating heights, visibly distinct from a flat
+                        // single line without a dedicated shader.
+                        let step: f32 = 0.25;
+                        let amp = t * 1.5;
+                        let mut x = 0.0;
+                        let mut up = false;
+                        while x < w {
+                            let y = if up { u_y - amp } else { u_y + amp };
+                            bg.push(BgInstance {
+                                cell: [col, row],
+                                color: uc,
+                                offset_cells: [x, y],
+                                size_cells: [step.min(w - x), t],
+                            });
+                            x += step;
+                            up = !up;
+                        }
+                    }
+                }
+                if cell.strikeout {
+                    bg.push(BgInstance {
+                        cell: [col, row],
+                        color: cell.fg,
+                        offset_cells: [0.0, s_y],
+                        size_cells: [w, t],
+                    });
                 }
             }
         }

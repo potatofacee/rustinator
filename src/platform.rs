@@ -54,6 +54,24 @@ pub(crate) fn macos_frontmost_pid() -> Option<i32> {
 }
 
 #[cfg(target_os = "macos")]
+pub(crate) fn preferred_locale_id() -> Option<String> {
+    use objc2::runtime::{AnyClass, AnyObject};
+    use objc2_foundation::NSString;
+
+    unsafe {
+        let cls = AnyClass::get(c"NSLocale")?;
+        let locale: *mut AnyObject = objc2::msg_send![cls, currentLocale];
+        if locale.is_null() { return None; }
+        let ident: *mut NSString = objc2::msg_send![&*locale, localeIdentifier];
+        if ident.is_null() { return None; }
+        let id = (*ident).to_string();
+        if id.is_empty() { return None; }
+        // Strip locale modifiers (e.g. "en_US@calendar=gregorian") — keep the bare id.
+        Some(id.split('@').next().unwrap_or(&id).to_string())
+    }
+}
+
+#[cfg(target_os = "macos")]
 pub(crate) fn macos_activate_pid(pid: i32) {
     use objc2::runtime::{AnyClass, AnyObject};
 

@@ -289,11 +289,13 @@ pasteboard access from non-main threads. Since paste is always triggered from
 the main thread, this should work, but verify with large pastes (>64KB) and
 binary content.
 
-**4e. Focus tracking**
+**4e. Focus tracking** — DONE (2026-05-31)
 
-When switching tabs, the old tab's panes should receive focus-out events and
-the new tab's focused pane should receive focus-in. Currently `notify_focus`
-only fires on OS-level window focus changes.
+Focus-out/in (CSI I / CSI O, gated on DECSET 1004) is emitted on every focus
+transition: tab switch, directional focus, cycle, click-to-focus, new tab,
+and pane/tab close. Tab switch sends focus-out to only the old tab's *focused*
+pane (not all panes), matching the single-focused-pane model. Click-to-focus
+routes through `TabManager::set_focused_pane`, which emits paired events.
 
 ---
 

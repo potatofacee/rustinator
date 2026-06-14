@@ -12,7 +12,7 @@ const ATLAS_SIZE: i32 = 2048;
 const QUAD_VERTS: [f32; 8] = [0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0];
 
 const _: () = assert!(std::mem::size_of::<BgInstance>() == 40);
-const _: () = assert!(std::mem::size_of::<GlyphInstance>() == 56);
+const _: () = assert!(std::mem::size_of::<GlyphInstance>() == 60);
 
 /// One cell's bg rect (or a sub-cell rect like a beam/underline cursor).
 #[repr(C)]
@@ -43,7 +43,8 @@ pub struct GlyphInstance {
     pub color: [f32; 4],
     pub uv_rect: [f32; 4],   // u0,v0,u1,v1
     pub size_px: [f32; 2],   // glyph pixel size
-    pub offset_px: [f32; 2], // glyph offset from cell top-left
+    pub offset_px: [f32; 2],  // glyph offset from cell top-left
+    pub color_glyph: f32,     // 1.0 = color (emoji) glyph: draw atlas rgba; 0.0 = fg-tinted text
 }
 
 #[derive(Copy, Clone)]
@@ -52,6 +53,7 @@ struct AtlasEntry {
     size_px: [f32; 2],
     offset_px: [f32; 2],
     empty: bool, // space / missing glyph
+    color: bool, // rasterized from a color (RGBA) bitmap: draw its own rgba, not fg tint
 }
 
 pub struct Renderer {
@@ -213,6 +215,7 @@ impl Renderer {
                     size_px: [0.0; 2],
                     offset_px: [0.0; 2],
                     empty: true,
+                    color: false,
                 };
                 self.glyph_cache.insert(key, empty);
                 return empty;
@@ -225,6 +228,7 @@ impl Renderer {
                 size_px: [0.0; 2],
                 offset_px: [0.0; 2],
                 empty: true,
+                color: false,
             };
             self.glyph_cache.insert(key, empty);
             return empty;
@@ -239,6 +243,7 @@ impl Renderer {
                 size_px: [0.0; 2],
                 offset_px: [0.0; 2],
                 empty: true,
+                color: false,
             };
             self.glyph_cache.insert(key, empty);
             return empty;
@@ -250,7 +255,9 @@ impl Renderer {
         let h = raster.height;
         let (x, y) = self.shelf_alloc(w, h);
 
-        // Normalize source buffer to RGBA8 with alpha = average of RGB.
+        // Color (emoji) glyphs come back as an RGBA bitmap; grayscale text as Rgb.
+        let is_color = matches!(raster.buffer, BitmapBuffer::Rgba(_));
+        // Normalize source buffer to RGBA8 (straight alpha).
         let rgba = to_rgba(&raster.buffer, w as usize, h as usize);
         unsafe {
             self.gl.bind_texture(glow::TEXTURE_2D, Some(self.atlas_tex));
@@ -281,6 +288,7 @@ impl Renderer {
             // top-left of the cell; glyph's top-left in cell = ascent - top, left = left.
             offset_px: [raster.left as f32, self.ascent - raster.top as f32],
             empty: false,
+            color: is_color,
         };
         self.glyph_cache.insert(key, entry);
         entry
@@ -420,21 +428,22 @@ impl Renderer {
                     glow::STREAM_DRAW,
                 );
                 // Layout: ivec2 cell(0), vec4 color(8), vec4 uv_rect(24),
-                //         vec2 size_px(40), vec2 offset_px(48).
+                //         vec2 size_px(40), vec2 offset_px(48), float color_flag(56).
                 let stride: i32 = std::mem::size_of::<GlyphInstance>() as i32;
                 gl.vertex_attrib_pointer_i32(1, 2, glow::INT, stride, 0);
                 gl.vertex_attrib_pointer_f32(2, 4, glow::FLOAT, false, stride, 8);
                 gl.vertex_attrib_pointer_f32(3, 4, glow::FLOAT, false, stride, 24);
                 gl.vertex_attrib_pointer_f32(4, 2, glow::FLOAT, false, stride, 40);
                 gl.vertex_attrib_pointer_f32(5, 2, glow::FLOAT, false, stride, 48);
-                for loc in 1..=5 {
+                gl.vertex_attrib_pointer_f32(6, 1, glow::FLOAT, false, stride, 56);
+                for loc in 1..=6 {
                     gl.vertex_attrib_divisor(loc, 1);
                     gl.enable_vertex_attrib_array(loc);
                 }
 
                 gl.draw_arrays_instanced(glow::TRIANGLE_STRIP, 0, 4, glyph_instances.len() as i32);
 
-                for loc in 1..=5 {
+                for loc in 1..=6 {
                     gl.disable_vertex_attrib_array(loc);
                 }
                 gl.bind_texture(glow::TEXTURE_2D, None);
@@ -453,6 +462,10 @@ impl Renderer {
 
     /// Build a glyph instance for character `c` at `(col, row)` with color `fg`.
     /// Returns `None` for glyphs that should not emit a draw (e.g. spaces).
+    ///
+    /// `hidden` is the cell's HIDDEN (SGR 8) state. Normal text honors it via
+    /// fg == bg (drawn but invisible), but a color glyph ignores fg and would
+    /// still show, so a hidden color glyph is dropped entirely.
     pub fn build_glyph_instance(
         &mut self,
         c: char,
@@ -460,10 +473,14 @@ impl Renderer {
         col: i32,
         row: i32,
         fg: [f32; 4],
+        hidden: bool,
         font: &mut FontContext,
     ) -> Option<GlyphInstance> {
         let entry = self.get_or_insert_glyph(c, style, font);
         if entry.empty {
+            return None;
+        }
+        if hidden && entry.color {
             return None;
         }
         Some(GlyphInstance {
@@ -472,6 +489,7 @@ impl Renderer {
             uv_rect: entry.uv_rect,
             size_px: entry.size_px,
             offset_px: entry.offset_px,
+            color_glyph: if entry.color { 1.0 } else { 0.0 },
         })
     }
 }
@@ -506,10 +524,24 @@ fn to_rgba(buf: &BitmapBuffer, w: usize, h: usize) -> Vec<u8> {
             }
         }
         BitmapBuffer::Rgba(src) => {
-            // copy_from_slice panics on a length mismatch; copy only the bytes
-            // both buffers can hold (color/emoji glyphs can differ from w*h*4).
-            let n = out.len().min(src.len());
-            out[..n].copy_from_slice(&src[..n]);
+            // crossfont's color bitmaps arrive premultiplied (macOS CoreText uses
+            // kCGImageAlphaPremultipliedFirst). The glyph pass blends with a
+            // straight-alpha equation (o_color * alpha + dst * (1 - alpha)), so
+            // un-premultiply here: divide each channel by alpha. Without this the
+            // emoji would be darkened toward black along its edges (double-applied
+            // alpha). Pixels with alpha 0 stay 0.
+            let pixels = (w * h).min(src.len() / 4);
+            for i in 0..pixels {
+                let a = src[i * 4 + 3];
+                if a == 0 {
+                    continue;
+                }
+                let unmul = |c: u8| ((c as u32 * 255 + a as u32 / 2) / a as u32).min(255) as u8;
+                out[i * 4] = unmul(src[i * 4]);
+                out[i * 4 + 1] = unmul(src[i * 4 + 1]);
+                out[i * 4 + 2] = unmul(src[i * 4 + 2]);
+                out[i * 4 + 3] = a;
+            }
         }
     }
     out
@@ -615,12 +647,14 @@ layout(location = 2) in vec4 in_color;
 layout(location = 3) in vec4 in_uv_rect;
 layout(location = 4) in vec2 in_size_px;
 layout(location = 5) in vec2 in_offset_px;
+layout(location = 6) in float in_color_glyph;
 
 uniform vec2 u_cell_size;
 uniform vec2 u_viewport;
 
 out vec2 v_uv;
 out vec4 v_color;
+flat out float v_color_glyph;
 
 void main() {
     vec2 cell_origin = vec2(in_cell) * u_cell_size;
@@ -631,6 +665,7 @@ void main() {
 
     v_uv = mix(in_uv_rect.xy, in_uv_rect.zw, in_pos);
     v_color = in_color;
+    v_color_glyph = in_color_glyph;
 }
 "#;
 
@@ -638,6 +673,7 @@ const GLYPH_FRAG: &str = r#"#version 330 core
 
 in vec2 v_uv;
 in vec4 v_color;
+flat in float v_color_glyph;
 uniform sampler2D u_atlas;
 
 layout(location = 0, index = 0) out vec4 o_color;
@@ -647,9 +683,20 @@ layout(location = 0, index = 1) out vec4 o_mask;
 //   out = o_color * o_mask + dst * (1 - o_mask)
 // where o_mask has per-channel coverage from the LCD-filtered glyph bitmap.
 void main() {
-    vec3 mask = texture(u_atlas, v_uv).rgb;
-    float avg = (mask.r + mask.g + mask.b) / 3.0;
-    o_color = vec4(v_color.rgb, 1.0);
-    o_mask = vec4(mask * v_color.a, avg * v_color.a);
+    vec4 texel = texture(u_atlas, v_uv);
+    if (v_color_glyph > 0.5) {
+        // Color (emoji) glyph: draw its own straight-alpha rgba, ignore the cell
+        // fg. Same dual-source equation reduces to straight-alpha over when the
+        // mask is the scalar alpha: out = texel.rgb * a + dst * (1 - a).
+        float a = texel.a;
+        o_color = vec4(texel.rgb, 1.0);
+        o_mask = vec4(a, a, a, a);
+    } else {
+        // Grayscale text: per-channel LCD coverage tinted to the cell fg.
+        vec3 mask = texel.rgb;
+        float avg = (mask.r + mask.g + mask.b) / 3.0;
+        o_color = vec4(v_color.rgb, 1.0);
+        o_mask = vec4(mask * v_color.a, avg * v_color.a);
+    }
 }
 "#;
