@@ -27,8 +27,30 @@ impl MouseButton {
 pub enum MouseKind {
     Press,
     Release,
-    #[allow(dead_code)] // Reserved for drag-motion forwarding.
     Motion,
+}
+
+/// Decide whether a pointer-motion event should be forwarded to the PTY.
+///
+/// Mirrors xterm/alacritty: MOUSE_DRAG (1002, button-event) reports motion only
+/// while a button is held; MOUSE_MOTION (1003, any-event) reports motion always.
+/// `cell_changed` gates spam — a terminal only cares about cell transitions, not
+/// per-pixel moves, so we suppress reports that resolve to the same grid cell.
+pub fn should_report_motion(
+    term_mode: TermMode,
+    button_held: bool,
+    cell_changed: bool,
+) -> bool {
+    if !cell_changed {
+        return false;
+    }
+    if term_mode.contains(TermMode::MOUSE_MOTION) {
+        return true;
+    }
+    if term_mode.contains(TermMode::MOUSE_DRAG) {
+        return button_held;
+    }
+    false
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -136,6 +158,29 @@ mod tests {
         let bytes = encode(MouseKind::Motion, MouseButton::Left, 0, 0, mods, mode).unwrap();
         // Motion adds 32 to base code, so Left+motion = 32.
         assert_eq!(bytes, b"\x1b[<32;1;1M");
+    }
+
+    #[test]
+    fn should_report_motion_gating() {
+        let drag = TermMode::MOUSE_REPORT_CLICK | TermMode::MOUSE_DRAG;
+        let any = TermMode::MOUSE_REPORT_CLICK | TermMode::MOUSE_MOTION;
+        let click_only = TermMode::MOUSE_REPORT_CLICK;
+
+        // Cell unchanged: never report, regardless of mode/button.
+        assert!(!should_report_motion(any, true, false));
+        assert!(!should_report_motion(drag, true, false));
+
+        // DRAG (1002): only while a button is held.
+        assert!(should_report_motion(drag, true, true));
+        assert!(!should_report_motion(drag, false, true));
+
+        // MOTION (1003): always, even with no button held.
+        assert!(should_report_motion(any, false, true));
+        assert!(should_report_motion(any, true, true));
+
+        // Click-only / no motion mode: never report motion.
+        assert!(!should_report_motion(click_only, true, true));
+        assert!(!should_report_motion(TermMode::empty(), true, true));
     }
 
     #[test]

@@ -321,6 +321,16 @@ pub enum CursorOverlay {
     HollowBlock { col: i32, row: i32, color: [f32; 4] },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Underline {
+    None,
+    Single,
+    Double,
+    Curly,
+    Dotted,
+    Dashed,
+}
+
 pub struct CellSnapshot {
     pub col: i32,
     pub row: i32,
@@ -328,6 +338,73 @@ pub struct CellSnapshot {
     pub fg: [f32; 4],
     pub bg: [f32; 4],
     pub style: FontStyle,
+    pub underline: Underline,
+    pub underline_color: [f32; 4],
+    pub strikeout: bool,
+    /// True for the base cell of a double-width (CJK / full-width) glyph
+    /// (Flags::WIDE_CHAR). The following column is a WIDE_CHAR_SPACER whose `c`
+    /// is ' ' (so the glyph loop skips it) and whose bg matches this cell.
+    pub wide: bool,
+    /// HIDDEN (SGR 8). Normal text is drawn invisibly via fg == bg, but color
+    /// (emoji) glyphs ignore fg, so the renderer needs this flag to drop them.
+    pub hidden: bool,
+    /// Extra codepoints alacritty stores on this cell via `Cell::zerowidth()`:
+    /// combining marks (accents), ZWJ joiners, variation selectors, skin-tone
+    /// modifiers. `c` is the base scalar; these stack on top of it. Empty for
+    /// the overwhelmingly common single-scalar case, so no allocation there.
+    /// CellSnapshot is intentionally NOT `Copy` (and never was), so a `Vec`
+    /// here adds no ripple — every use reads scalar fields or borrows the cell.
+    pub zerowidth: Vec<char>,
+}
+
+/// Map cell flags to an underline style. Alacritty stores at most one
+/// underline style, but if several bits are set we mirror alacritty's own
+/// renderer precedence (undercurl > double > dotted > dashed > single).
+pub fn underline_from_flags(flags: Flags) -> Underline {
+    if flags.contains(Flags::UNDERCURL) {
+        Underline::Curly
+    } else if flags.contains(Flags::DOUBLE_UNDERLINE) {
+        Underline::Double
+    } else if flags.contains(Flags::DOTTED_UNDERLINE) {
+        Underline::Dotted
+    } else if flags.contains(Flags::DASHED_UNDERLINE) {
+        Underline::Dashed
+    } else if flags.contains(Flags::UNDERLINE) {
+        Underline::Single
+    } else {
+        Underline::None
+    }
+}
+
+/// Collect the extra (zero-width / combining) codepoints alacritty stores on a
+/// cell into an owned, render-order list for the snapshot. Returns an empty Vec
+/// (no allocation) when the cell carries no extras, which is the common case.
+pub(crate) fn extract_zerowidth(zerowidth: Option<&[char]>) -> Vec<char> {
+    zerowidth.map(<[char]>::to_vec).unwrap_or_default()
+}
+
+/// Resolve a pixel-derived (col, row) hit to the authoritative grid column.
+///
+/// Our pixel->cell math (`cell_at`) divides by a fixed cell width, so a click
+/// on the right half of a double-width glyph lands on its WIDE_CHAR_SPACER
+/// column (N+1) rather than the base char (N). Alacritty treats the whole glyph
+/// as the base point, so map a spacer hit back to the wide cell to its left.
+/// `cells` is the current frame snapshot; the spacer is identified as the
+/// blank cell immediately following a `wide` cell on the same row.
+pub(crate) fn resolve_wide_click_col(cells: &[CellSnapshot], row: i32, col: i32) -> i32 {
+    if col <= 0 {
+        return col;
+    }
+    let is_wide_at = |c: i32| {
+        cells
+            .iter()
+            .any(|cell| cell.row == row && cell.col == c && cell.wide)
+    };
+    if is_wide_at(col - 1) {
+        col - 1
+    } else {
+        col
+    }
 }
 
 fn point_from_grid(col: i32, row: i32, display_offset: i32) -> Point {
@@ -518,6 +595,7 @@ impl Pane {
         pty_opts.env.insert("CLICOLOR".into(), "1".into());
         pty_opts.env.insert("CLICOLOR_FORCE".into(), "1".into());
         crate::shell_integration::inject_env(&mut pty_opts.env);
+        ensure_utf8_locale(&mut pty_opts.env);
         if let Some(dir) = working_dir {
             pty_opts.working_directory = Some(dir.to_path_buf());
         } else if let Ok(home) = std::env::var("HOME") {
@@ -623,6 +701,7 @@ impl Pane {
         pty_opts.env.insert("CLICOLOR".into(), "1".into());
         pty_opts.env.insert("CLICOLOR_FORCE".into(), "1".into());
         crate::shell_integration::inject_env(&mut pty_opts.env);
+        ensure_utf8_locale(&mut pty_opts.env);
         let pty = tty::new(&pty_opts, window_size, self.id)
             .map_err(|e| format!("failed to open pty: {e}"))?;
         let child_pid = pty.child().id();
@@ -850,6 +929,10 @@ impl Pane {
             .intersects(TermMode::MOUSE_MODE)
     }
 
+    pub fn term_mode(&self) -> TermMode {
+        *self.terminal.lock().mode()
+    }
+
     pub fn send_mouse(
         &self,
         kind: MouseKind,
@@ -1073,6 +1156,23 @@ impl Pane {
                 (false, true) => FontStyle::Italic,
                 (false, false) => FontStyle::Regular,
             };
+            let underline = underline_from_flags(flags);
+            let strikeout = flags.contains(Flags::STRIKEOUT);
+            // SGR 58 underline color (cell.underline_color) when set, else the
+            // cell's resolved fg so the decoration tracks the glyph through
+            // inverse/dim/selection swaps.
+            let underline_color = match indexed.cell.underline_color() {
+                Some(c) => {
+                    let mut uc = resolve_color(c, palette, true, &self.defaults);
+                    if flags.contains(Flags::DIM) {
+                        uc[0] *= 0.66;
+                        uc[1] *= 0.66;
+                        uc[2] *= 0.66;
+                    }
+                    uc
+                }
+                None => fg,
+            };
             cells.push(CellSnapshot {
                 col,
                 row,
@@ -1080,6 +1180,14 @@ impl Pane {
                 fg,
                 bg,
                 style,
+                underline,
+                underline_color,
+                strikeout,
+                wide: flags.contains(Flags::WIDE_CHAR),
+                hidden: flags.contains(Flags::HIDDEN),
+                // Combining marks / joiners alacritty parked on this cell.
+                // Allocates only when present (clusters are rare).
+                zerowidth: extract_zerowidth(indexed.cell.zerowidth()),
             });
         }
 
@@ -1098,6 +1206,133 @@ impl Drop for Pane {
         if let Some(handle) = self.pty_handle.take() {
             let _ = handle.join();
         }
+    }
+}
+
+/// Treat empty inherited locale strings as unset (the real env here has
+/// LANG/LC_ALL/LC_CTYPE set-but-empty, which POSIX treats as unset).
+fn non_empty(v: Option<&str>) -> Option<&str> {
+    v.filter(|s| !s.is_empty())
+}
+
+/// True when a locale string designates a UTF-8 codeset, case-insensitively.
+fn locale_is_utf8(locale: &str) -> bool {
+    let lower = locale.to_ascii_lowercase();
+    let codeset = lower.rsplit('.').next().unwrap_or(&lower);
+    codeset == "utf-8" || codeset == "utf8" || lower.contains("utf-8") || lower.contains("utf8")
+}
+
+/// Given the inherited LC_ALL / LC_CTYPE / LANG values (None = unset/empty)
+/// and a UTF-8 fallback locale (e.g. "en_US.UTF-8"), decide what to inject.
+/// Returns None when the effective ctype locale is already UTF-8 (do nothing).
+/// Returns Some(locale) to set as LANG when the effective locale is not UTF-8.
+///
+/// Design: caller-validates. This fn is pure (no setlocale); when the effective
+/// locale is non-UTF-8 it returns the language-preserving candidate
+/// ("<lang>.UTF-8"); the caller probes it with setlocale and falls back if invalid.
+fn choose_utf8_locale(
+    lc_all: Option<&str>,
+    lc_ctype: Option<&str>,
+    lang: Option<&str>,
+    fallback: &str,
+) -> Option<String> {
+    // POSIX ctype precedence: LC_ALL > LC_CTYPE > LANG.
+    let effective = non_empty(lc_all)
+        .or_else(|| non_empty(lc_ctype))
+        .or_else(|| non_empty(lang));
+
+    match effective {
+        None => Some(fallback.to_string()),
+        Some(loc) if locale_is_utf8(loc) => None,
+        Some(loc) => {
+            // Preserve language/territory; drop codeset and modifier, force UTF-8.
+            let lang_part = loc.split('.').next().unwrap_or(loc);
+            let lang_part = lang_part.split('@').next().unwrap_or(lang_part);
+            Some(format!("{lang_part}.UTF-8"))
+        }
+    }
+}
+
+/// Probe whether `candidate` is a valid LC_CTYPE locale without disturbing our
+/// own process locale: save the current locale, try the candidate, then restore.
+fn locale_is_valid(candidate: &str) -> bool {
+    use std::ffi::CString;
+    let Ok(c_candidate) = CString::new(candidate) else { return false };
+    unsafe {
+        // setlocale(.., null) returns the current locale in a static buffer; copy
+        // it immediately before the next setlocale call clobbers that buffer.
+        let saved_ptr = libc::setlocale(libc::LC_CTYPE, std::ptr::null());
+        let saved = if saved_ptr.is_null() {
+            None
+        } else {
+            Some(std::ffi::CStr::from_ptr(saved_ptr).to_owned())
+        };
+
+        let ok = !libc::setlocale(libc::LC_CTYPE, c_candidate.as_ptr()).is_null();
+
+        // Restore the locale we found on entry.
+        if let Some(saved) = saved {
+            libc::setlocale(libc::LC_CTYPE, saved.as_ptr());
+        }
+        ok
+    }
+}
+
+/// Inject a UTF-8 ctype locale into the child env when the inherited locale is
+/// not already UTF-8. Standard terminal behavior (see iTerm2 "Set locale
+/// variables automatically", alacritty macOS locale fix) so vim/less/etc don't
+/// fall back to latin1 and mangle multibyte input.
+fn ensure_utf8_locale(env: &mut std::collections::HashMap<String, String>) {
+    let lc_all = std::env::var("LC_ALL").ok();
+    let lc_ctype = std::env::var("LC_CTYPE").ok();
+    let lang = std::env::var("LANG").ok();
+
+    let lc_all_eff = non_empty(lc_all.as_deref());
+    let lc_ctype_eff = non_empty(lc_ctype.as_deref());
+    let lang_eff = non_empty(lang.as_deref());
+
+    // Platform fallback: macOS derives from NSLocale; glibc/musl ship C.UTF-8.
+    #[cfg(target_os = "macos")]
+    let fallback = crate::platform::preferred_locale_id()
+        .map(|id| format!("{id}.UTF-8"))
+        .filter(|loc| locale_is_valid(loc))
+        .unwrap_or_else(|| "en_US.UTF-8".to_string());
+    #[cfg(not(target_os = "macos"))]
+    let fallback = {
+        if locale_is_valid("C.UTF-8") {
+            "C.UTF-8".to_string()
+        } else {
+            "en_US.UTF-8".to_string()
+        }
+    };
+
+    let Some(candidate) = choose_utf8_locale(lc_all_eff, lc_ctype_eff, lang_eff, &fallback) else {
+        return;
+    };
+
+    // Validate the candidate; fall back to the platform fallback, then C.UTF-8.
+    let chosen = if locale_is_valid(&candidate) {
+        candidate
+    } else if locale_is_valid(&fallback) {
+        fallback
+    } else if locale_is_valid("C.UTF-8") {
+        "C.UTF-8".to_string()
+    } else {
+        // Nothing usable — leave the env untouched rather than guess.
+        return;
+    };
+
+    env.insert("LANG".into(), chosen.clone());
+
+    // A non-UTF-8 LC_ALL would override LANG and force latin1; overriding it to
+    // the UTF-8 variant of the same locale is the only way to fix encoding.
+    if lc_all_eff.map(|v| !locale_is_utf8(v)).unwrap_or(false) {
+        env.insert("LC_ALL".into(), chosen.clone());
+    } else if lc_all_eff.is_none()
+        && lc_ctype_eff.map(|v| !locale_is_utf8(v)).unwrap_or(false)
+    {
+        // LC_CTYPE (no LC_ALL) would override LANG for ctype; align it too.
+        env.insert("LC_CTYPE".into(), chosen);
     }
 }
 
@@ -1153,6 +1388,148 @@ fn decckm_override(key: egui::Key, mods: egui::Modifiers) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
 
+    const FB: &str = "en_US.UTF-8";
+
+    #[test]
+    fn zerowidth_extraction_preserves_order_and_empty() {
+        // No extras -> empty Vec, no allocation path.
+        assert!(extract_zerowidth(None).is_empty());
+        // e + COMBINING ACUTE -> carried in order on top of the base scalar.
+        let combining = ['\u{0301}'];
+        assert_eq!(extract_zerowidth(Some(&combining)), vec!['\u{0301}']);
+        // Emoji ZWJ family: base scalar is the cell's `c`; the joiner +
+        // following scalars are the zerowidth list, kept in source order.
+        let zwj = ['\u{200D}', '\u{1F469}', '\u{200D}', '\u{1F467}'];
+        assert_eq!(
+            extract_zerowidth(Some(&zwj)),
+            vec!['\u{200D}', '\u{1F469}', '\u{200D}', '\u{1F467}'],
+        );
+    }
+
+    #[test]
+    fn snapshot_cell_carries_zerowidth_cluster() {
+        // A CellSnapshot built with extras exposes base + zerowidth in order,
+        // so a downstream consumer (paint overlay, future copy path) sees the
+        // full grapheme cluster, not just the first scalar.
+        let cell = CellSnapshot {
+            col: 0,
+            row: 0,
+            c: 'e',
+            fg: [1.0; 4],
+            bg: [0.0, 0.0, 0.0, 1.0],
+            style: FontStyle::Regular,
+            underline: Underline::None,
+            underline_color: [1.0; 4],
+            strikeout: false,
+            wide: false,
+            hidden: false,
+            zerowidth: extract_zerowidth(Some(&['\u{0301}'])),
+        };
+        let cluster: Vec<char> = std::iter::once(cell.c).chain(cell.zerowidth.iter().copied()).collect();
+        assert_eq!(cluster, vec!['e', '\u{0301}']);
+    }
+
+    #[test]
+    fn underline_flag_mapping_and_precedence() {
+        assert_eq!(underline_from_flags(Flags::empty()), Underline::None);
+        assert_eq!(underline_from_flags(Flags::UNDERLINE), Underline::Single);
+        assert_eq!(
+            underline_from_flags(Flags::DOUBLE_UNDERLINE),
+            Underline::Double
+        );
+        assert_eq!(underline_from_flags(Flags::UNDERCURL), Underline::Curly);
+        assert_eq!(
+            underline_from_flags(Flags::DOTTED_UNDERLINE),
+            Underline::Dotted
+        );
+        assert_eq!(
+            underline_from_flags(Flags::DASHED_UNDERLINE),
+            Underline::Dashed
+        );
+        // Precedence: undercurl wins over a co-set single underline.
+        assert_eq!(
+            underline_from_flags(Flags::UNDERCURL | Flags::UNDERLINE),
+            Underline::Curly
+        );
+        // Strikeout is independent of underline style.
+        assert_eq!(underline_from_flags(Flags::STRIKEOUT), Underline::None);
+    }
+
+    #[test]
+    fn locale_all_empty_uses_fallback() {
+        assert_eq!(
+            choose_utf8_locale(None, None, None, FB),
+            Some(FB.to_string())
+        );
+    }
+
+    #[test]
+    fn locale_empty_strings_treated_as_unset() {
+        assert_eq!(
+            choose_utf8_locale(Some(""), Some(""), Some(""), FB),
+            Some(FB.to_string())
+        );
+    }
+
+    #[test]
+    fn locale_lang_utf8_returns_none() {
+        assert_eq!(choose_utf8_locale(None, None, Some("en_US.UTF-8"), FB), None);
+    }
+
+    #[test]
+    fn locale_lang_utf8_lowercase_spelling_returns_none() {
+        // case/spelling: "en_US.utf8" is already UTF-8.
+        assert_eq!(choose_utf8_locale(None, None, Some("en_US.utf8"), FB), None);
+    }
+
+    #[test]
+    fn locale_lc_all_c_gets_utf8_variant() {
+        assert_eq!(
+            choose_utf8_locale(Some("C"), None, None, FB),
+            Some("C.UTF-8".to_string())
+        );
+    }
+
+    #[test]
+    fn locale_lc_ctype_latin1_preserves_language() {
+        assert_eq!(
+            choose_utf8_locale(None, Some("en_US.ISO8859-1"), None, FB),
+            Some("en_US.UTF-8".to_string())
+        );
+    }
+
+    #[test]
+    fn locale_strips_codeset_and_modifier() {
+        assert_eq!(
+            choose_utf8_locale(None, Some("en_US.ISO8859-1@euro"), None, FB),
+            Some("en_US.UTF-8".to_string())
+        );
+    }
+
+    #[test]
+    fn locale_lc_all_precedence_beats_lang() {
+        // LC_ALL=C (non-UTF-8) wins over a UTF-8 LANG.
+        assert_eq!(
+            choose_utf8_locale(Some("C"), None, Some("en_US.UTF-8"), FB),
+            Some("C.UTF-8".to_string())
+        );
+        // And a UTF-8 LC_ALL wins over a non-UTF-8 LANG -> no change.
+        assert_eq!(
+            choose_utf8_locale(Some("en_US.UTF-8"), None, Some("C"), FB),
+            None
+        );
+    }
+
+    #[test]
+    fn locale_is_utf8_recognizes_variants() {
+        assert!(locale_is_utf8("C.UTF-8"));
+        assert!(locale_is_utf8("en_US.UTF-8"));
+        assert!(locale_is_utf8("en_US.utf8"));
+        assert!(locale_is_utf8("de_DE.UTF-8@euro"));
+        assert!(!locale_is_utf8("C"));
+        assert!(!locale_is_utf8("en_US.ISO8859-1"));
+    }
+
     fn make_cells(text: &str, row: i32) -> Vec<CellSnapshot> {
         text.chars()
             .enumerate()
@@ -1163,8 +1540,51 @@ mod tests {
                 fg: [1.0, 1.0, 1.0, 1.0],
                 bg: [0.0, 0.0, 0.0, 1.0],
                 style: FontStyle::Regular,
+                underline: Underline::None,
+                underline_color: [1.0, 1.0, 1.0, 1.0],
+                strikeout: false,
+                wide: false,
+                hidden: false,
+                zerowidth: Vec::new(),
             })
             .collect()
+    }
+
+    fn wide_cell(col: i32, row: i32, c: char, wide: bool) -> CellSnapshot {
+        CellSnapshot {
+            col,
+            row,
+            c,
+            fg: [1.0; 4],
+            bg: [0.0, 0.0, 0.0, 1.0],
+            style: FontStyle::Regular,
+            underline: Underline::None,
+            underline_color: [1.0; 4],
+            strikeout: false,
+            wide,
+            hidden: false,
+            zerowidth: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn resolve_wide_click_maps_spacer_to_base() {
+        // Row 0: 'A' (col 0), wide '中' base (col 1), spacer ' ' (col 2), 'B' (col 3).
+        let cells = vec![
+            wide_cell(0, 0, 'A', false),
+            wide_cell(1, 0, '中', true),
+            wide_cell(2, 0, ' ', false),
+            wide_cell(3, 0, 'B', false),
+        ];
+        // Click on the base column stays put.
+        assert_eq!(resolve_wide_click_col(&cells, 0, 1), 1);
+        // Click on the spacer (right half) resolves to the base column.
+        assert_eq!(resolve_wide_click_col(&cells, 0, 2), 1);
+        // Narrow columns are unaffected.
+        assert_eq!(resolve_wide_click_col(&cells, 0, 0), 0);
+        assert_eq!(resolve_wide_click_col(&cells, 0, 3), 3);
+        // A wide cell on another row must not bleed across rows.
+        assert_eq!(resolve_wide_click_col(&cells, 1, 2), 2);
     }
 
     #[test]
@@ -1388,6 +1808,12 @@ mod tests {
                 fg: [1.0; 4],
                 bg: [0.0, 0.0, 0.0, 1.0],
                 style: FontStyle::Regular,
+                underline: Underline::None,
+                underline_color: [1.0; 4],
+                strikeout: false,
+                wide: false,
+                hidden: false,
+                zerowidth: Vec::new(),
             })
             .collect()
     }
