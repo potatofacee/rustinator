@@ -471,11 +471,23 @@ fn handle_pane_mouse(
                 } else if primary_down {
                     if let Some(p) = pointer {
                         let visible_cols = (terminal_rect.width() * ppp / cell_w).floor() as i32;
-                        if p.y < terminal_rect.top() {
-                            pane.selection_auto_scroll(1, visible_cols);
-                        } else if p.y > terminal_rect.bottom() {
-                            pane.selection_auto_scroll(-1, visible_cols);
+                        // Auto-scroll when the drag reaches the top/bottom edge.
+                        // A maximized window's bottom edge coincides with the
+                        // screen edge, where the OS clamps the cursor so it can
+                        // never travel *past* the rect — so an edge band (>=/<=)
+                        // is used instead of a strict-outside test, else downward
+                        // auto-scroll never fires. When already at the scroll
+                        // limit, selection_auto_scroll returns false and we do a
+                        // normal in-bounds update so the edge line still selects.
+                        const EDGE: f32 = 6.0;
+                        let scrolled = if p.y <= terminal_rect.top() + EDGE {
+                            pane.selection_auto_scroll(1, visible_cols)
+                        } else if p.y >= terminal_rect.bottom() - EDGE {
+                            pane.selection_auto_scroll(-1, visible_cols)
                         } else {
+                            false
+                        };
+                        if !scrolled {
                             pane.update_selection(col, row);
                         }
                     }

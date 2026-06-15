@@ -164,6 +164,10 @@ pub(crate) struct App {
     /// Some(..) while the prefs panel has previewed unapplied colors; logic()
     /// restores the saved profile's colors when prefs closes without Apply.
     preview_defaults: Option<PaneDefaults>,
+    /// Set when the main window regains OS focus (e.g. via Cmd+Tab). On the next
+    /// logic pass, stale egui keyboard focus is cleared so terminal input flows
+    /// again without requiring a click. See `logic`.
+    focus_regained: bool,
 }
 
 /// Build the per-pane render defaults from a profile's color settings.
@@ -283,6 +287,7 @@ impl App {
             hotkey_changed: false,
             pending_zoom_steps: 0,
             preview_defaults: None,
+            focus_regained: false,
         })
     }
 
@@ -532,7 +537,10 @@ impl App {
         [0.0, 0.0, 0.0, 0.0]
     }
 
-    pub(crate) fn notify_focus(&self, focused: bool) {
+    pub(crate) fn notify_focus(&mut self, focused: bool) {
+        if focused {
+            self.focus_regained = true;
+        }
         if let Some(tab) = self.tab_mgr.tabs.get(self.tab_mgr.active_tab) {
             if let Some(pane) = tab.panes.get(&tab.focused) {
                 pane.send_focus_event(focused);
@@ -582,6 +590,17 @@ impl App {
                         pane.scroll_to_bottom();
                     }
                 }
+            }
+        }
+        // After the window regains OS focus (e.g. Cmd+Tab back in), egui can
+        // still hold keyboard focus on a widget from before the switch, which
+        // makes `egui_wants_keyboard_input()` true and silently drops terminal
+        // keys until the user clicks. Clear that stale focus so typing resumes
+        // immediately — but only when no text-input dialog is open, so a focused
+        // search/title field keeps its focus.
+        if std::mem::take(&mut self.focus_regained) && !self.dialogs.wants_text_input() {
+            if let Some(id) = ctx.memory(|m| m.focused()) {
+                ctx.memory_mut(|m| m.surrender_focus(id));
             }
         }
         if self.tab_mgr.tabs.is_empty() || ctx.egui_wants_keyboard_input() {

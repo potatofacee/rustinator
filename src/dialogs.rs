@@ -42,6 +42,12 @@ impl DialogState {
         }
     }
 
+    /// True when a dialog with a focused text field is open, so the main
+    /// window must not steal egui keyboard focus away from it.
+    pub(crate) fn wants_text_input(&self) -> bool {
+        self.search_open || self.title_dialog_open || self.layout_save_dialog
+    }
+
     pub(crate) fn draw_search(&mut self, ui: &mut egui::Ui) -> DialogAction {
         if !self.search_open {
             return DialogAction::None;
