@@ -2,6 +2,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use alacritty_terminal::selection::SelectionType;
+use alacritty_terminal::term::TermMode;
 use egui;
 
 use crate::config::Config;
@@ -506,7 +507,26 @@ fn handle_pane_mouse(
                 let lines = (scroll_y * ppp / cell_h).round() as i32;
                 if lines != 0 {
                     if let Some(pane) = tab.panes.get(&pane_id) {
-                        pane.scroll_by(lines);
+                        let mode = pane.mode();
+                        // Alternate scroll (xterm mode 1007): on the alt screen an
+                        // app like vim/less/man has no scrollback, so a wheel tick
+                        // is translated into arrow-key presses that scroll it.
+                        if mode.contains(TermMode::ALT_SCREEN)
+                            && mode.contains(TermMode::ALTERNATE_SCROLL)
+                        {
+                            // APP_CURSOR (DECCKM): SS3 (ESC O A/B) vs CSI (ESC [ A/B).
+                            let seq: &[u8] = match (lines > 0, mode.contains(TermMode::APP_CURSOR)) {
+                                (true, false) => b"\x1b[A",
+                                (true, true) => b"\x1bOA",
+                                (false, false) => b"\x1b[B",
+                                (false, true) => b"\x1bOB",
+                            };
+                            for _ in 0..lines.abs().min(8) {
+                                pane.send_bytes(seq.to_vec());
+                            }
+                        } else {
+                            pane.scroll_by(lines);
+                        }
                     }
                 }
             }
