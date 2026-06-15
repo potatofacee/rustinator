@@ -892,10 +892,11 @@ impl Pane {
         let mut term = self.terminal.lock();
         let before = term.grid().display_offset();
         term.scroll_display(Scroll::Delta(delta));
-        let display_offset = term.grid().display_offset() as i32;
-        if display_offset == before as i32 {
+        let new_offset = term.grid().display_offset();
+        if new_offset == before {
             return false;
         }
+        let display_offset = new_offset as i32;
         let row = if delta > 0 { 0 } else { term.screen_lines() as i32 - 1 };
         let col = if delta > 0 { 0 } else { cols.saturating_sub(1) };
         let point = point_from_grid(col, row, display_offset);
