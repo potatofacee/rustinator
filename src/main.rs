@@ -728,11 +728,23 @@ impl App {
                         egui::pos2(rect.left() + 4.0, rect.top()),
                         egui::pos2(close_rect.left() - 2.0, rect.bottom()),
                     );
-                    let galley = ui.painter().layout_no_wrap(
+                    // Elide to the area left of the close button so a long
+                    // title truncates with an ellipsis instead of painting over
+                    // the X and past the tab edge.
+                    let mut job = egui::text::LayoutJob::single_section(
                         title,
-                        egui::FontId::proportional(13.0),
-                        text_color,
+                        egui::text::TextFormat::simple(
+                            egui::FontId::proportional(13.0),
+                            text_color,
+                        ),
                     );
+                    job.wrap = egui::text::TextWrapping {
+                        max_width: text_area.width().max(0.0),
+                        max_rows: 1,
+                        break_anywhere: true,
+                        overflow_character: Some('\u{2026}'),
+                    };
+                    let galley = ui.painter().layout_job(job);
                     let text_pos = egui::Align2::CENTER_CENTER
                         .anchor_size(text_area.center(), galley.size());
                     let text_pos = text_pos.intersect(text_area);

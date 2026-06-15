@@ -504,6 +504,9 @@ impl ApplicationHandler<UserEvent> for WinitApp {
                         hk.repaint_at = Some(Instant::now());
                     }
                     WindowEvent::Focused(focused) => {
+                        // See main-window note: clear any phantom modifier
+                        // latched while unfocused so typing isn't swallowed.
+                        hk.current_modifiers = winit::event::Modifiers::default();
                         app.notify_focus(focused);
                         if !focused && self.hotkey_hide_on_focus_loss {
                             let dominated_by_grace = hk.shown_at
@@ -610,6 +613,12 @@ impl ApplicationHandler<UserEvent> for WinitApp {
             }
             WindowEvent::Focused(focused) => {
                 self.main_focused = focused;
+                // A modifier released while we were unfocused (e.g. Cmd let go
+                // mid Cmd+Tab) never reaches us as a ModifiersChanged, leaving a
+                // phantom modifier latched — after which every keystroke encodes
+                // as Cmd+key and produces no bytes. Resync to empty on any focus
+                // change; the next real ModifiersChanged repopulates it.
+                self.current_modifiers = winit::event::Modifiers::default();
                 app.notify_focus(focused);
             }
             WindowEvent::RedrawRequested => {
