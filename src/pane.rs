@@ -884,10 +884,18 @@ impl Pane {
         }
     }
 
-    pub fn selection_auto_scroll(&self, delta: i32, cols: i32) {
+    /// Scroll the display one step while extending the active selection to the
+    /// newly exposed edge. Returns `false` (without touching the selection) when
+    /// the display is already at the scroll limit, so the caller can fall back to
+    /// a normal in-bounds selection update.
+    pub fn selection_auto_scroll(&self, delta: i32, cols: i32) -> bool {
         let mut term = self.terminal.lock();
+        let before = term.grid().display_offset();
         term.scroll_display(Scroll::Delta(delta));
         let display_offset = term.grid().display_offset() as i32;
+        if display_offset == before as i32 {
+            return false;
+        }
         let row = if delta > 0 { 0 } else { term.screen_lines() as i32 - 1 };
         let col = if delta > 0 { 0 } else { cols.saturating_sub(1) };
         let point = point_from_grid(col, row, display_offset);
@@ -898,6 +906,7 @@ impl Pane {
         }
         drop(ui_sel);
         self.dirty.store(true, Ordering::Release);
+        true
     }
 
     pub fn clear_selection(&self) {
