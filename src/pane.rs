@@ -543,7 +543,6 @@ pub struct Pane {
     /// while `dead` is a persistent status. A dead pane's PTY channel is
     /// closed, so input must be a no-op rather than silently dropped.
     dead: Cell<bool>,
-    ui_selection: Mutex<Option<Selection>>,
     /// JoinHandle for the live PTY EventLoop thread, kept so the old thread can
     /// be joined (child reaped) before being replaced in `respawn`.
     pty_handle: Option<PtyLoopHandle>,
@@ -646,7 +645,6 @@ impl Pane {
             read_only: false,
             scrollbar_visible: true,
             dead: Cell::new(false),
-            ui_selection: Mutex::new(None),
             pty_handle,
         })
     }
@@ -735,7 +733,6 @@ impl Pane {
         self.pending_clipboard_store = pending_clipboard_store;
         self.cached = None;
         self.dead.set(false);
-        *self.ui_selection.lock().unwrap() = None;
 
         Ok(())
     }
@@ -862,24 +859,25 @@ impl Pane {
         }
     }
 
-    pub fn begin_selection(&self, col: i32, row: i32, ty: SelectionType) {
+    pub fn begin_selection(&self, col: i32, row: i32, side: Side, ty: SelectionType) {
         let mut term = self.terminal.lock();
         let display_offset = term.grid().display_offset() as i32;
         let point = point_from_grid(col, row, display_offset);
-        let sel = Selection::new(ty, point, Side::Left);
-        term.selection = Some(sel.clone());
-        *self.ui_selection.lock().unwrap() = Some(sel);
+        // `side` is which half of the cell the cursor sits in, matching
+        // alacritty/vte: it decides whether the anchor cell is included.
+        term.selection = Some(Selection::new(ty, point, side));
         self.dirty.store(true, Ordering::Release);
     }
 
-    pub fn update_selection(&self, col: i32, row: i32) {
+    pub fn update_selection(&self, col: i32, row: i32, side: Side) {
         let mut term = self.terminal.lock();
         let display_offset = term.grid().display_offset() as i32;
         let point = point_from_grid(col, row, display_offset);
-        let mut ui_sel = self.ui_selection.lock().unwrap();
-        if let Some(sel) = ui_sel.as_mut() {
-            sel.update(point, Side::Right);
-            term.selection = Some(sel.clone());
+        // Extend the live selection in place. The PTY thread rotates/invalidates
+        // `term.selection` as output scrolls, so editing it directly (rather than
+        // a stored mirror) keeps the highlight pinned to its content.
+        if let Some(sel) = term.selection.as_mut() {
+            sel.update(point, side);
             self.dirty.store(true, Ordering::Release);
         }
     }
@@ -899,22 +897,19 @@ impl Pane {
         let display_offset = new_offset as i32;
         let row = if delta > 0 { 0 } else { term.screen_lines() as i32 - 1 };
         let col = if delta > 0 { 0 } else { cols.saturating_sub(1) };
+        // Extend to the leading edge of the newly exposed line: left edge when
+        // scrolling up to the top, right edge when scrolling down to the bottom.
+        let side = if delta > 0 { Side::Left } else { Side::Right };
         let point = point_from_grid(col, row, display_offset);
-        let mut ui_sel = self.ui_selection.lock().unwrap();
-        if let Some(sel) = ui_sel.as_mut() {
-            sel.update(point, Side::Right);
-            term.selection = Some(sel.clone());
+        if let Some(sel) = term.selection.as_mut() {
+            sel.update(point, side);
         }
-        drop(ui_sel);
         self.dirty.store(true, Ordering::Release);
         true
     }
 
     pub fn clear_selection(&self) {
-        // Lock order: terminal first, then ui_selection (matches begin/update/
-        // snapshot) to avoid a deadlock with the PTY thread.
         let mut term = self.terminal.lock();
-        *self.ui_selection.lock().unwrap() = None;
         if term.selection.is_some() {
             term.selection = None;
             self.dirty.store(true, Ordering::Release);
@@ -922,13 +917,7 @@ impl Pane {
     }
 
     pub fn selection_text(&self) -> Option<String> {
-        // Lock order: terminal first, then ui_selection (matches begin/update/
-        // snapshot) to avoid a deadlock with the PTY thread.
-        let mut term = self.terminal.lock();
-        let sel = self.ui_selection.lock().unwrap().clone();
-        if let Some(s) = sel {
-            term.selection = Some(s);
-        }
+        let term = self.terminal.lock();
         term.selection_to_string()
     }
 
@@ -1053,12 +1042,7 @@ impl Pane {
     }
 
     pub fn snapshot(&self) -> Frame {
-        let mut term = self.terminal.lock();
-        let ui_sel = self.ui_selection.lock().unwrap();
-        if let Some(sel) = ui_sel.as_ref() {
-            term.selection = Some(sel.clone());
-        }
-        drop(ui_sel);
+        let term = self.terminal.lock();
         let lines = term.screen_lines() as i32;
         let content = term.renderable_content();
         let palette = content.colors;

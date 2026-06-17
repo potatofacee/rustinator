@@ -1,6 +1,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use alacritty_terminal::index::Side;
 use alacritty_terminal::selection::SelectionType;
 use alacritty_terminal::term::TermMode;
 use egui;
@@ -356,6 +357,7 @@ fn handle_pane_mouse(
             .unwrap_or(col);
         (col, row)
     });
+    let pointer_side = pointer.map(|p| cell_side(p, inner_rect, ppp, cell_w));
     // URL hit-testing only matters while Ctrl is held (hover highlight + click).
     // Scan on demand for the pointer's row instead of every frame snapshot.
     let url_at_pointer = if ctrl_held {
@@ -462,12 +464,13 @@ fn handle_pane_mouse(
     } else if !handled_by_url {
         if let Some((col, row)) = pointer_cell {
             if let Some(pane) = tab.panes.get(&pane_id) {
+                let side = pointer_side.unwrap_or(Side::Left);
                 if response.triple_clicked() {
-                    pane.begin_selection(col, row, SelectionType::Lines);
+                    pane.begin_selection(col, row, side, SelectionType::Lines);
                 } else if response.double_clicked() {
-                    pane.begin_selection(col, row, SelectionType::Semantic);
+                    pane.begin_selection(col, row, side, SelectionType::Semantic);
                 } else if just_pressed {
-                    pane.begin_selection(col, row, SelectionType::Simple);
+                    pane.begin_selection(col, row, side, SelectionType::Simple);
                 } else if primary_down {
                     if let Some(p) = pointer {
                         let visible_cols = (terminal_rect.width() * ppp / cell_w).floor() as i32;
@@ -488,7 +491,7 @@ fn handle_pane_mouse(
                             false
                         };
                         if !scrolled {
-                            pane.update_selection(col, row);
+                            pane.update_selection(col, row, side);
                         }
                     }
                 } else if response.clicked() {
@@ -1198,4 +1201,15 @@ fn cell_at(p: egui::Pos2, rect: egui::Rect, ppp: f32, cell_w: f32, cell_h: f32) 
     let col = (rel_x / cell_w).floor() as i32;
     let row = (rel_y / cell_h).floor() as i32;
     (col.max(0), row.max(0))
+}
+
+/// Which half of the cell the cursor sits in. Selection includes the anchor
+/// cell only when the cursor is on its right half, matching alacritty/vte.
+fn cell_side(p: egui::Pos2, rect: egui::Rect, ppp: f32, cell_w: f32) -> Side {
+    let rel_x = ((p.x - rect.left()).max(0.0)) * ppp;
+    if rel_x % cell_w >= cell_w / 2.0 {
+        Side::Right
+    } else {
+        Side::Left
+    }
 }
