@@ -781,7 +781,16 @@ fn paint_pane(
     };
 
     let url_underline = url_highlight;
-    let url_color: [f32; 4] = {
+    // Explicit OSC-8 links get a blue underline to distinguish them from
+    // heuristic matches (which use the terminal's default fg color).
+    let url_color: [f32; 4] = if let Some(ref u) = url_underline {
+        if u.is_hyperlink {
+            [0.0, 0.5, 1.0, 1.0] // bright blue for explicit hyperlinks
+        } else {
+            let [r, g, b] = pane.defaults.fg;
+            [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0]
+        }
+    } else {
         let [r, g, b] = pane.defaults.fg;
         [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0]
     };
@@ -1084,17 +1093,30 @@ fn paint_pane(
         std::env::var("RUSTINATOR_NO_FOCUS_BORDER").is_err()
     });
 
-    if focused && *SHOW_FOCUS_BORDER {
+    if *SHOW_FOCUS_BORDER {
         let profile = ctx.user_config.active();
-        let [r, g, b] = if ctx.tab_mgr.tabs[ctx.tab_mgr.active_tab].broadcast {
-            profile.broadcast_border_rgb()
+        // In broadcast mode every non-read-only pane receives keystrokes, so ring
+        // them all with the broadcast color -- not just the focused one. Otherwise
+        // the panes silently eating your input (e.g. a Ctrl+C) show no border at
+        // all and the broadcast state reads as ordinary focus.
+        let broadcast = ctx.tab_mgr.tabs[ctx.tab_mgr.active_tab].broadcast;
+        let read_only = ctx.tab_mgr.tabs[ctx.tab_mgr.active_tab]
+            .panes
+            .get(&pane_id)
+            .is_some_and(|p| p.read_only);
+        let border = if broadcast && !read_only {
+            Some(profile.broadcast_border_rgb())
+        } else if focused {
+            Some(profile.focus_border_rgb())
         } else {
-            profile.focus_border_rgb()
+            None
         };
-        let color = egui::Color32::from_rgb(r, g, b);
-        let stroke = egui::Stroke::new(FOCUS_BORDER, color);
-        ui.painter()
-            .rect_stroke(rect, 0.0, stroke, egui::StrokeKind::Inside);
+        if let Some([r, g, b]) = border {
+            let color = egui::Color32::from_rgb(r, g, b);
+            let stroke = egui::Stroke::new(FOCUS_BORDER, color);
+            ui.painter()
+                .rect_stroke(rect, 0.0, stroke, egui::StrokeKind::Inside);
+        }
     }
 }
 

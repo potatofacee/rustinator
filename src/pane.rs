@@ -311,6 +311,9 @@ pub struct UrlMatch {
     pub start_col: i32,
     pub end_col: i32, // exclusive
     pub url: String,
+    /// true when this match came from an explicit OSC-8 hyperlink (set_hyperlink),
+    /// false when it was found by heuristic text scanning.
+    pub is_hyperlink: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -355,6 +358,9 @@ pub struct CellSnapshot {
     /// CellSnapshot is intentionally NOT `Copy` (and never was), so a `Vec`
     /// here adds no ripple — every use reads scalar fields or borrows the cell.
     pub zerowidth: Vec<char>,
+    /// Explicit OSC-8 hyperlink target URI for this cell, if any.
+    /// None for the common case — no allocation when absent.
+    pub hyperlink: Option<String>,
 }
 
 /// Map cell flags to an underline style. Alacritty stores at most one
@@ -440,6 +446,10 @@ fn is_url_boundary(c: char) -> bool {
 fn match_urls_in_row(row: i32, chars: &[char], col_lookup: &[i32], out: &mut Vec<UrlMatch>) {
     let http = ['h', 't', 't', 'p', ':', '/', '/'];
     let https = ['h', 't', 't', 'p', 's', ':', '/', '/'];
+    let mailto = ['m', 'a', 'i', 'l', 't', 'o', ':'];
+    let file = ['f', 'i', 'l', 'e', ':', '/', '/'];
+    let ssh = ['s', 's', 'h', ':', '/', '/'];
+    let ftp = ['f', 't', 'p', ':', '/', '/'];
 
     let mut i = 0;
     while i < chars.len() {
@@ -448,9 +458,18 @@ fn match_urls_in_row(row: i32, chars: &[char], col_lookup: &[i32], out: &mut Vec
             Some(https.len())
         } else if rest.starts_with(&http) {
             Some(http.len())
+        } else if rest.starts_with(&mailto) {
+            Some(mailto.len())
+        } else if rest.starts_with(&file) {
+            Some(file.len())
+        } else if rest.starts_with(&ssh) {
+            Some(ssh.len())
+        } else if rest.starts_with(&ftp) {
+            Some(ftp.len())
         } else {
             None
         };
+
         if let Some(prefix_len) = matched {
             let mut j = i;
             while j < chars.len() && !is_url_boundary(chars[j]) {
@@ -463,11 +482,68 @@ fn match_urls_in_row(row: i32, chars: &[char], col_lookup: &[i32], out: &mut Vec
                     start_col: col_lookup[i],
                     end_col: col_lookup[j - 1] + 1,
                     url,
+                    is_hyperlink: false,
                 });
                 i = j;
                 continue;
             }
         }
+
+        // Bare www. detection
+        if chars[i] == 'w' && rest.len() >= 4 && rest[1] == 'w' && rest[2] == 'w' && rest[3] == '.' {
+            let mut j = i + 4;
+            while j < chars.len() && !is_url_boundary(chars[j]) {
+                j += 1;
+            }
+            if j > i + 4 {
+                let url: String = chars[i..j].iter().collect();
+                out.push(UrlMatch {
+                    row,
+                    start_col: col_lookup[i],
+                    end_col: col_lookup[j - 1] + 1,
+                    url,
+                    is_hyperlink: false,
+                });
+                i = j;
+                continue;
+            }
+        }
+
+        // Bare email detection (something@something.something)
+        if chars[i] == '@' || (rest.len() >= 3 && rest[0] != ' ' && rest.iter().take_while(|&&c| !is_url_boundary(c)).any(|&c| c == '@')) {
+            // Find the start of a potential email by looking back for @ in remaining chars
+            let at_pos = rest.iter().position(|&c| c == '@');
+            if let Some(at_offset) = at_pos {
+                // Check that there's valid local part before @ and domain after
+                let local_ok = at_offset > 0 && rest[..at_offset].iter().all(|&c| {
+                    c.is_alphanumeric() || matches!(c, '.' | '_' | '-' | '+')
+                });
+                if local_ok {
+                    let after_at = &rest[at_offset + 1..];
+                    let domain_end = after_at.iter().position(|&c| is_url_boundary(c)).unwrap_or(after_at.len());
+                    if domain_end > 0 && after_at[..domain_end].iter().any(|&c| c == '.') {
+                        let domain_ok = after_at[..domain_end].iter().all(|&c| {
+                            c.is_alphanumeric() || matches!(c, '.' | '-' | '_')
+                        });
+                        if domain_ok {
+                            let abs_j = i + at_offset + 1 + domain_end;
+                            let email_start = i;
+                            let url: String = chars[email_start..abs_j].iter().collect();
+                            out.push(UrlMatch {
+                                row,
+                                start_col: col_lookup[email_start],
+                                end_col: col_lookup[abs_j - 1] + 1,
+                                url,
+                                is_hyperlink: false,
+                            });
+                            i = abs_j;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
         i += 1;
     }
 }
@@ -494,8 +570,45 @@ fn scan_urls(cells: &[CellSnapshot]) -> Vec<UrlMatch> {
 // On-demand URL hit-test for a single cell. Scans only the pointer's row, so it
 // runs on hover/Ctrl-click instead of on every frame snapshot.
 pub(crate) fn scan_url_at(cells: &[CellSnapshot], row: i32, col: i32) -> Option<UrlMatch> {
+    // Collect cells on this row sorted by column.
+    let row_cells: Vec<&CellSnapshot> = cells.iter().filter(|c| c.row == row).collect();
+    if row_cells.is_empty() {
+        return None;
+    }
+
+    // First check: does the target cell carry an explicit OSC-8 hyperlink?
+    if let Some(target_cell) = row_cells.iter().find(|c| c.col == col) {
+        if let Some(ref uri) = target_cell.hyperlink {
+            // Find the contiguous run of cells sharing the same hyperlink URI.
+            let mut start_col = col;
+            for cell in row_cells.iter().rev() {
+                if cell.col < col && cell.hyperlink.as_deref() == Some(uri.as_str()) {
+                    start_col = cell.col;
+                } else if cell.col < col {
+                    break;
+                }
+            }
+            let mut end_col = col + 1;
+            for cell in &row_cells {
+                if cell.col > col && cell.hyperlink.as_deref() == Some(uri.as_str()) {
+                    end_col = cell.col + 1;
+                } else if cell.col > col {
+                    break;
+                }
+            }
+            return Some(UrlMatch {
+                row,
+                start_col,
+                end_col,
+                url: uri.clone(),
+                is_hyperlink: true,
+            });
+        }
+    }
+
+    // Fallback: heuristic URL matching.
     let mut cols: Vec<(i32, char)> =
-        cells.iter().filter(|c| c.row == row).map(|c| (c.col, c.c)).collect();
+        row_cells.iter().map(|c| (c.col, c.c)).collect();
     cols.sort_by_key(|&(c, _)| c);
     let chars: Vec<char> = cols.iter().map(|&(_, c)| c).collect();
     let col_lookup: Vec<i32> = cols.iter().map(|&(c, _)| c).collect();
@@ -1182,6 +1295,7 @@ impl Pane {
                 // Combining marks / joiners alacritty parked on this cell.
                 // Allocates only when present (clusters are rare).
                 zerowidth: extract_zerowidth(indexed.cell.zerowidth()),
+                hyperlink: indexed.cell.hyperlink().map(|h| h.uri().to_string()),
             });
         }
 
@@ -1418,6 +1532,7 @@ mod tests {
             wide: false,
             hidden: false,
             zerowidth: extract_zerowidth(Some(&['\u{0301}'])),
+            hyperlink: None,
         };
         let cluster: Vec<char> = std::iter::once(cell.c).chain(cell.zerowidth.iter().copied()).collect();
         assert_eq!(cluster, vec!['e', '\u{0301}']);
@@ -1540,6 +1655,7 @@ mod tests {
                 wide: false,
                 hidden: false,
                 zerowidth: Vec::new(),
+                hyperlink: None,
             })
             .collect()
     }
@@ -1558,6 +1674,7 @@ mod tests {
             wide,
             hidden: false,
             zerowidth: Vec::new(),
+            hyperlink: None,
         }
     }
 
@@ -1608,7 +1725,6 @@ mod tests {
 
     // Gap #3 (partial): email address detection
     #[test]
-    #[ignore = "gap #3 partial: scan_urls doesn't detect email addresses"]
     fn scan_urls_detects_email() {
         let cells = make_cells("contact user@example.com for help", 0);
         let urls = scan_urls(&cells);
@@ -1618,7 +1734,6 @@ mod tests {
 
     // Gap #3 (partial): mailto: URI
     #[test]
-    #[ignore = "gap #3 partial: scan_urls doesn't detect mailto: URIs"]
     fn scan_urls_detects_mailto() {
         let cells = make_cells("send to mailto:user@example.com now", 0);
         let urls = scan_urls(&cells);
@@ -1628,7 +1743,6 @@ mod tests {
 
     // Gap #3 (partial): file:// URI
     #[test]
-    #[ignore = "gap #3 partial: scan_urls doesn't detect file:// URIs"]
     fn scan_urls_detects_file_uri() {
         let cells = make_cells("open file:///home/user/doc.txt please", 0);
         let urls = scan_urls(&cells);
@@ -1638,7 +1752,6 @@ mod tests {
 
     // Gap #3 (partial): ssh:// URI
     #[test]
-    #[ignore = "gap #3 partial: scan_urls doesn't detect ssh:// URIs"]
     fn scan_urls_detects_ssh_uri() {
         let cells = make_cells("connect via ssh://user@host.com:22", 0);
         let urls = scan_urls(&cells);
@@ -1648,7 +1761,6 @@ mod tests {
 
     // Gap #3 (partial): ftp:// URI
     #[test]
-    #[ignore = "gap #3 partial: scan_urls doesn't detect ftp:// URIs"]
     fn scan_urls_detects_ftp_uri() {
         let cells = make_cells("download from ftp://files.example.com/pub", 0);
         let urls = scan_urls(&cells);
@@ -1658,7 +1770,6 @@ mod tests {
 
     // Gap #3 (partial): bare domain (www.example.com)
     #[test]
-    #[ignore = "gap #3 partial: scan_urls doesn't detect bare www. domains"]
     fn scan_urls_detects_bare_www() {
         let cells = make_cells("visit www.example.com for info", 0);
         let urls = scan_urls(&cells);
@@ -1668,9 +1779,47 @@ mod tests {
 
     // Gap #42: OSC-8 hyperlinks
     #[test]
-    #[ignore = "gap #42: OSC-8 hyperlink support not yet implemented"]
     fn url_match_has_hyperlink_flag() {
-        panic!("add is_hyperlink: bool to UrlMatch for OSC-8 support");
+        let uri = "https://example.com/link".to_string();
+        // Cells with explicit OSC-8 hyperlink on cols 5..9 ("docs")
+        let mut cells: Vec<CellSnapshot> = Vec::new();
+        for (i, &ch) in [' ', 's', 'e', 'e', ' ', 'd', 'o', 'c', 's'].iter().enumerate() {
+            let hyperlink = if i >= 5 && i <= 8 {
+                Some(uri.clone())
+            } else {
+                None
+            };
+            cells.push(CellSnapshot {
+                col: i as i32,
+                row: 0,
+                c: ch,
+                fg: [1.0; 4],
+                bg: [0.0, 0.0, 0.0, 1.0],
+                style: FontStyle::Regular,
+                underline: Underline::None,
+                underline_color: [1.0; 4],
+                strikeout: false,
+                wide: false,
+                hidden: false,
+                zerowidth: Vec::new(),
+                hyperlink,
+            });
+        }
+
+        // Click on 'd' (col 5) of the hyperlink run -> explicit match
+        let m = scan_url_at(&cells, 0, 5).expect("hyperlink cell should match");
+        assert!(m.is_hyperlink, "OSC-8 link should have is_hyperlink=true");
+        assert_eq!(m.url, "https://example.com/link");
+        assert_eq!(m.start_col, 5);
+        assert_eq!(m.end_col, 9);
+
+        // Heuristic URL match (no hyperlink) should have is_hyperlink=false
+        let cells2 = cells_from_str(0, "visit https://example.com today");
+        let m2 = scan_url_at(&cells2, 0, 6).expect("should match heuristic URL");
+        assert!(!m2.is_hyperlink, "heuristic match should have is_hyperlink=false");
+
+        // Click on space (col 0) with no URL -> no match
+        assert!(scan_url_at(&cells, 0, 0).is_none(), "space should not match");
     }
 
     // ---- DECCKM (application cursor mode) ----
@@ -1808,6 +1957,7 @@ mod tests {
                 wide: false,
                 hidden: false,
                 zerowidth: Vec::new(),
+                hyperlink: None,
             })
             .collect()
     }
