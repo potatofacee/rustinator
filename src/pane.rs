@@ -1451,6 +1451,31 @@ fn pane_cwd(pid: u32) -> Option<std::path::PathBuf> {
 
 #[cfg(target_os = "macos")]
 fn pane_cwd(pid: u32) -> Option<std::path::PathBuf> {
+    // The tracked pid is `/usr/bin/login`, which *forks* (not execs) the
+    // interactive shell. login's own cwd is unreadable via lsof (setuid) and
+    // would not follow the shell's `cd` anyway -- the shell that tracks the
+    // user's directory is login's child. Walk descendants breadth-first and
+    // return the first readable cwd, which is that shell.
+    use std::collections::{HashSet, VecDeque};
+    let mut queue: VecDeque<u32> = VecDeque::new();
+    let mut seen: HashSet<u32> = HashSet::new();
+    queue.push_back(pid);
+    while let Some(p) = queue.pop_front() {
+        if !seen.insert(p) {
+            continue;
+        }
+        if let Some(dir) = lsof_cwd(p) {
+            return Some(dir);
+        }
+        for child in child_pids(p) {
+            queue.push_back(child);
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn lsof_cwd(pid: u32) -> Option<std::path::PathBuf> {
     use std::process::Command;
     let output = Command::new("lsof")
         .args(["-a", "-p", &pid.to_string(), "-Fn", "-d", "cwd"])
@@ -1463,6 +1488,18 @@ fn pane_cwd(pid: u32) -> Option<std::path::PathBuf> {
         }
     }
     None
+}
+
+#[cfg(target_os = "macos")]
+fn child_pids(parent: u32) -> Vec<u32> {
+    use std::process::Command;
+    let Ok(output) = Command::new("pgrep").args(["-P", &parent.to_string()]).output() else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|l| l.trim().parse::<u32>().ok())
+        .collect()
 }
 
 #[cfg(not(any(
