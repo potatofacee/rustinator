@@ -4,7 +4,7 @@ Tracked, intentional limitations — not bugs to be surprised by. Each entry: wh
 the user sees, why it happens, the lift to fix, and the recommendation. Severity
 reflects impact on common terminal/TUI output.
 
-Last updated: 2026-06-14.
+Last updated: 2026-06-29.
 
 ---
 
@@ -80,22 +80,6 @@ attribute + VAO wiring + one shader line.
 
 ## Input / protocol
 
-### OSC 8 hyperlinks are not clickable (low)
-
-**Symptom:** Explicit terminal hyperlinks (OSC 8, used by `gh`, `bat`, some build
-tools) render as plain text. URL-like substrings are still detected and clickable
-via heuristic text-scan, but app-declared link targets are not honored.
-
-**Cause:** `set_hyperlink` is forwarded to the alacritty `Term` (so the data lives
-in the grid), but the snapshot never reads `cell.hyperlink()`; click handling uses
-only the heuristic URL matcher. Tracked by an `#[ignore]`d test in `pane.rs`.
-
-**Lift to fix (medium):** Carry `cell.hyperlink()` into the snapshot cell, group
-runs by link id, and prefer the explicit target over the heuristic match in the
-click/hover path.
-
-**Recommendation:** Low priority — links are still readable, just not click-exact.
-
 ### Kitty keyboard protocol: no key-release events (low)
 
 **Symptom:** A TUI that requests key *release* reporting (kitty
@@ -117,6 +101,10 @@ currently keep.
 - The two big correctness fixes that prompted this audit are **resolved**, not
   listed here: terminal query replies (DA/DSR/OSC color — the glow hang) and
   UTF-8 locale injection (multibyte mojibake).
+- OSC 8 hyperlinks (formerly listed here) are now **resolved** (2026-06-29):
+  `CellSnapshot.hyperlink` carries the explicit target and `scan_url_at` prefers
+  it over the heuristic match (pane.rs:579-607, 1298). Heuristic URL scheme
+  detection (mailto/file/ssh/ftp/email/www) also landed.
 - Wide-char (CJK) handling — width, click hit-testing, background, and underline/
   strikeout spanning — is **complete**, not a known issue.
 - All rendering fixes are GPU-path and cannot be unit-tested; runtime verification
