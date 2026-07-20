@@ -6,24 +6,41 @@ use alacritty_terminal::selection::SelectionType;
 use alacritty_terminal::term::TermMode;
 use egui;
 
-use crate::config::Config;
+use crate::config::{Config, SavedLayout};
 use crate::font::FontContext;
-use crate::layout::{self, Direction, LayoutTemplate};
+use crate::layout::{self, Direction};
 use crate::mouse::{should_report_motion, MouseButton, MouseKind, MouseMods};
 use crate::pane::{CursorOverlay, PaneId, Underline, UrlMatch};
+use crate::profile::ProfileName;
 use crate::renderer::{BgInstance, Renderer};
 use crate::keybindings::{Action, BindingTable};
 use crate::tabs::{TabManager, PANE_GAP};
+use crate::groups::{self, BroadcastScope, Indicator};
+use crate::title_bar::{self, TitleBarModel};
 
 const FOCUS_BORDER: f32 = 1.0;
-const PANE_TITLE_HEIGHT: f32 = 20.0;
 const CURSOR_BLINK_INTERVAL_MS: u128 = 530;
+
+/// A drag-and-drop payload originating outside the app (an OS file drop). winit's
+/// `DroppedFile` carries only a path and no coordinates, so window.rs records the
+/// path text plus the last cursor position (converted to egui points) here; a
+/// `draw_panes` consumer resolves the target pane once pane rects are known.
+pub(crate) struct ExternalDrop {
+    pub text: String,
+    pub pos: egui::Pos2,
+}
 
 pub(crate) struct PaneViewState {
     pub drag_source_pane: Option<PaneId>,
     pub last_pane_rect: Option<egui::Rect>,
     pub last_root_rect: Option<egui::Rect>,
-    pub layout_restore_pending: Option<LayoutTemplate>,
+    pub layout_restore_pending: Option<SavedLayout>,
+    pub pending_external_drop: Option<ExternalDrop>,
+    /// A profile switch selected from the right-click "Profiles" submenu. The
+    /// choice carries data (which pane, which profile name), so it can't be an
+    /// `Action` (that enum is Copy/Hash); it is staged here and applied by the
+    /// App after `draw_panes`, exactly like `layout_restore_pending`.
+    pub profile_switch_pending: Option<(PaneId, ProfileName)>,
 }
 
 impl PaneViewState {
@@ -33,6 +50,8 @@ impl PaneViewState {
             last_pane_rect: None,
             last_root_rect: None,
             layout_restore_pending: None,
+            pending_external_drop: None,
+            profile_switch_pending: None,
         }
     }
 }
@@ -88,174 +107,229 @@ pub(crate) fn draw_panes(
         );
     }
 
-    let ppp = ui.ctx().pixels_per_point();
-    let cell_w = ctx.cell_w;
-    let cell_h = ctx.cell_h;
-    let mods = ui.ctx().input(|i| i.modifiers);
-    let ctrl_held = mods.ctrl;
-    let shift_held = mods.shift;
-    let alt_held = mods.alt;
     let mut deferred: Vec<Action> = Vec::new();
     let show_title_bars = leaves.len() > 1;
     let mut pane_drop_rects: Vec<(PaneId, egui::Rect)> = Vec::new();
 
+    // Group identity of the focused pane, computed once per frame and threaded
+    // into each leaf so the broadcast indicator (titlebar dots + pane outline)
+    // can decide receiver status without re-deriving it per pane.
+    let active = ctx.tab_mgr.active_tab;
+    let focused_id = ctx.tab_mgr.tabs[active].focused;
+    let focused_group: Option<String> = ctx.tab_mgr.tabs[active]
+        .panes
+        .get(&focused_id)
+        .and_then(|p| p.group.clone());
+
     for (id, rect) in leaves {
-        let (title_rect, terminal_rect) = if show_title_bars {
-            let title = egui::Rect::from_min_size(
-                rect.min,
-                egui::vec2(rect.width(), PANE_TITLE_HEIGHT),
-            );
-            let terminal = egui::Rect::from_min_max(
-                egui::pos2(rect.left(), rect.top() + PANE_TITLE_HEIGHT),
-                rect.max,
-            );
-            (Some(title), terminal)
-        } else {
-            (None, rect)
-        };
-
-        if let Some(tr) = title_rect {
-            let focused = id == ctx.tab_mgr.tabs[ctx.tab_mgr.active_tab].focused;
-            let bg = if focused {
-                egui::Color32::from_gray(50)
-            } else {
-                egui::Color32::from_gray(30)
-            };
-            ui.painter().rect_filled(tr, 0.0, bg);
-
-            let title_resp = ui.interact(
-                tr,
-                egui::Id::new(("title_bar", ctx.tab_mgr.active_tab, id)),
-                egui::Sense::click_and_drag(),
-            );
-            if title_resp.drag_started() {
-                state.drag_source_pane = Some(id);
-                ctx.tab_mgr.active_tab_mut().focused = id;
-            }
-            if title_resp.clicked() {
-                ctx.tab_mgr.active_tab_mut().focused = id;
-            }
-            if title_resp.dragged() {
-                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
-            }
-
-            // Compute dimensions from the current frame's terminal_rect so the
-            // title bar never shows stale values from a previous frame.  This
-            // uses the same formula as paint_pane (inner_rect = shrink by
-            // FOCUS_BORDER, then pixel-space ÷ cell size).
-            let inner = terminal_rect.shrink(FOCUS_BORDER);
-            let current_cols = ((inner.width() * ppp / cell_w).floor() as usize).max(1);
-            let current_lines = ((inner.height() * ppp / cell_h).floor() as usize).max(1);
-
-            let title_text = ctx.tab_mgr.tabs[ctx.tab_mgr.active_tab]
-                .panes
-                .get(&id)
-                .map(|pane| {
-                    let name = pane.title().unwrap_or_default();
-                    let dims = format!("{}x{}", current_cols, current_lines);
-                    if name.is_empty() {
-                        dims
-                    } else {
-                        format!("{name}  {dims}")
-                    }
-                })
-                .unwrap_or_default();
-
-            let text_color = if focused {
-                egui::Color32::from_gray(220)
-            } else {
-                egui::Color32::from_gray(140)
-            };
-            let galley = ui.painter().layout_no_wrap(
-                title_text,
-                egui::FontId::proportional(12.0),
-                text_color,
-            );
-            let pos = egui::Align2::CENTER_CENTER
-                .anchor_size(tr.center(), galley.size());
-            ui.painter().galley(pos.min, galley, text_color);
-        }
-
-        pane_drop_rects.push((id, rect));
-
-        let response = ui.interact(
-            terminal_rect,
-            egui::Id::new(("pane", ctx.tab_mgr.active_tab, id)),
-            egui::Sense::click_and_drag(),
-        );
-
-        if response.clicked()
-            || response.secondary_clicked()
-            || response.middle_clicked()
-            || response.drag_started()
-            || response.double_clicked()
-            || response.triple_clicked()
-        {
-            let active = ctx.tab_mgr.active_tab;
-            ctx.tab_mgr.set_focused_pane(active, id);
-        }
-
-        if response.middle_clicked() {
-            ctx.tab_mgr.paste_primary(id);
-        }
-
-        let (handled_by_url, url_highlight) = handle_pane_mouse(
-            id,
-            ctx.tab_mgr.active_tab,
-            &mut ctx.tab_mgr.tabs[ctx.tab_mgr.active_tab],
-            &response,
-            terminal_rect,
+        draw_leaf(
+            state,
+            ctx,
             ui,
-            cell_w,
-            cell_h,
-            ppp,
-            ctrl_held,
-            shift_held,
-            alt_held,
-            ctx.user_config,
-            ctx.egui_ctx,
+            id,
+            rect,
+            show_title_bars,
+            zoomed,
+            focused_group.as_deref(),
+            &mut deferred,
+            &mut pane_drop_rects,
         );
-        let _ = handled_by_url;
-
-        let focused = id == ctx.tab_mgr.tabs[ctx.tab_mgr.active_tab].focused;
-        paint_pane(ctx, ui, id, terminal_rect, focused, url_highlight);
-
-        if state.drag_source_pane.is_some()
-            && state.drag_source_pane != Some(id)
-        {
-            if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
-                if rect.contains(pos) {
-                    let zone = drop_zone_rect(rect, pos);
-                    ui.painter().rect_filled(
-                        zone,
-                        0.0,
-                        egui::Color32::from_rgba_unmultiplied(0x40, 0x60, 0xc0, 0x50),
-                    );
-                }
-            }
-        }
-
-        if focused {
-            state.last_pane_rect = Some(terminal_rect);
-        }
-        response.context_menu(|ui| {
-            build_context_menu(
-                ui,
-                id,
-                &ctx.tab_mgr.tabs[ctx.tab_mgr.active_tab],
-                zoomed,
-                ctx.user_config,
-                ctx.bindings,
-                ctx.dialogs,
-                state,
-                &mut deferred,
-            );
-        });
     }
 
     handle_drag_drop(state, &mut ctx.tab_mgr.tabs[ctx.tab_mgr.active_tab], &pane_drop_rects, ui);
+    apply_external_drop(state, ctx.tab_mgr, &pane_drop_rects);
 
     deferred
+}
+
+/// Render one leaf pane: its optional title bar (interaction inline, paint
+/// delegated to `title_bar::paint`), terminal surface, mouse handling, drop-zone
+/// overlay, and context menu. Pushes into `deferred`/`pane_drop_rects` via the
+/// `&mut` params so `draw_panes` stays a thin loop. A zero-behavior extraction of
+/// the old per-leaf loop body plus the broadcast-scope indicator wiring.
+fn draw_leaf(
+    state: &mut PaneViewState,
+    ctx: &mut PaneViewCtx<'_>,
+    ui: &mut egui::Ui,
+    id: PaneId,
+    rect: egui::Rect,
+    show_title_bars: bool,
+    zoomed: Option<PaneId>,
+    focused_group: Option<&str>,
+    deferred: &mut Vec<Action>,
+    pane_drop_rects: &mut Vec<(PaneId, egui::Rect)>,
+) {
+    let ppp = ui.ctx().pixels_per_point();
+    let cell_w = ctx.cell_w;
+    let cell_h = ctx.cell_h;
+    let mods = ui.ctx().input(|i| i.modifiers);
+    let (ctrl_held, shift_held, alt_held) = (mods.ctrl, mods.shift, mods.alt);
+
+    let (title_rect, terminal_rect) = if show_title_bars {
+        let (title, terminal) = title_bar::split_rect(rect);
+        (Some(title), terminal)
+    } else {
+        (None, rect)
+    };
+
+    if let Some(tr) = title_rect {
+        draw_title_bar(state, ctx, ui, id, tr, terminal_rect, focused_group);
+    }
+
+    pane_drop_rects.push((id, rect));
+
+    let response = ui.interact(
+        terminal_rect,
+        egui::Id::new(("pane", ctx.tab_mgr.active_tab, id)),
+        egui::Sense::click_and_drag(),
+    );
+
+    if response.clicked()
+        || response.secondary_clicked()
+        || response.middle_clicked()
+        || response.drag_started()
+        || response.double_clicked()
+        || response.triple_clicked()
+    {
+        let active = ctx.tab_mgr.active_tab;
+        ctx.tab_mgr.set_focused_pane(active, id);
+    }
+
+    if response.middle_clicked() {
+        ctx.tab_mgr.paste_primary(id);
+    }
+
+    let (handled_by_url, url_highlight) = handle_pane_mouse(
+        id,
+        ctx.tab_mgr.active_tab,
+        &mut ctx.tab_mgr.tabs[ctx.tab_mgr.active_tab],
+        &response,
+        terminal_rect,
+        ui,
+        cell_w,
+        cell_h,
+        ppp,
+        ctrl_held,
+        shift_held,
+        alt_held,
+        ctx.user_config,
+        ctx.egui_ctx,
+    );
+    let _ = handled_by_url;
+
+    let focused = id == ctx.tab_mgr.tabs[ctx.tab_mgr.active_tab].focused;
+    paint_pane(ctx, ui, id, terminal_rect, focused, focused_group, url_highlight);
+
+    maybe_paint_drop_zone(state, ui, id, rect);
+
+    if focused {
+        state.last_pane_rect = Some(terminal_rect);
+    }
+
+    let scope = ctx.tab_mgr.broadcast_scope;
+    response.context_menu(|ui| {
+        build_context_menu(
+            ui,
+            id,
+            &ctx.tab_mgr.tabs[ctx.tab_mgr.active_tab],
+            zoomed,
+            scope,
+            ctx.user_config,
+            ctx.bindings,
+            ctx.dialogs,
+            state,
+            deferred,
+        );
+    });
+}
+
+/// Per-pane title bar. The interaction (click to focus, drag to rearrange) stays
+/// here because it mutates manager state; the visual (background, centered
+/// title/dimensions, the group-name label, and the broadcast transmit/receive
+/// dot) is delegated to `title_bar::paint` from a precomputed `TitleBarModel`.
+fn draw_title_bar(
+    state: &mut PaneViewState,
+    ctx: &mut PaneViewCtx<'_>,
+    ui: &mut egui::Ui,
+    id: PaneId,
+    title_rect: egui::Rect,
+    terminal_rect: egui::Rect,
+    focused_group: Option<&str>,
+) {
+    let focused = id == ctx.tab_mgr.tabs[ctx.tab_mgr.active_tab].focused;
+
+    let title_resp = ui.interact(
+        title_rect,
+        egui::Id::new(("title_bar", ctx.tab_mgr.active_tab, id)),
+        egui::Sense::click_and_drag(),
+    );
+    if title_resp.drag_started() {
+        state.drag_source_pane = Some(id);
+        ctx.tab_mgr.active_tab_mut().focused = id;
+    }
+    if title_resp.clicked() {
+        ctx.tab_mgr.active_tab_mut().focused = id;
+    }
+    if title_resp.dragged() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+    }
+
+    // Dimensions from this frame's terminal_rect (same formula as paint_pane:
+    // inner_rect = shrink by FOCUS_BORDER, then pixel-space ÷ cell size) so the
+    // bar never shows stale values from a previous frame.
+    let ppp = ui.ctx().pixels_per_point();
+    let inner = terminal_rect.shrink(FOCUS_BORDER);
+    let cols = ((inner.width() * ppp / ctx.cell_w).floor() as usize).max(1);
+    let lines = ((inner.height() * ppp / ctx.cell_h).floor() as usize).max(1);
+    let scope = ctx.tab_mgr.broadcast_scope;
+    let model = title_bar_model(
+        ctx.tab_mgr.tabs[ctx.tab_mgr.active_tab].panes.get(&id),
+        scope,
+        focused,
+        cols,
+        lines,
+        focused_group,
+    );
+    title_bar::paint(ui, title_rect, &model, ctx.user_config);
+}
+
+/// Build the value model `title_bar::paint` consumes from a pane (the title is
+/// the raw name; paint joins it with the dimensions) and the broadcast indicator
+/// derived from `groups::indicator`. A missing pane yields an empty model.
+fn title_bar_model(
+    pane: Option<&crate::pane::Pane>,
+    scope: BroadcastScope,
+    focused: bool,
+    cols: usize,
+    lines: usize,
+    focused_group: Option<&str>,
+) -> TitleBarModel {
+    let this_group = pane.and_then(|p| p.group.as_deref());
+    TitleBarModel {
+        title: pane.and_then(|p| p.title()).unwrap_or_default(),
+        cols,
+        lines,
+        group: pane.and_then(|p| p.group.clone()),
+        indicator: groups::indicator(scope, focused, this_group, focused_group),
+        focused,
+    }
+}
+
+/// Paint the directional drop-zone overlay on this pane while another pane's
+/// title bar is being dragged over it (no-op otherwise).
+fn maybe_paint_drop_zone(
+    state: &PaneViewState,
+    ui: &egui::Ui,
+    id: PaneId,
+    rect: egui::Rect,
+) {
+    if state.drag_source_pane.is_some() && state.drag_source_pane != Some(id) {
+        if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
+            if rect.contains(pos) {
+                paint_drop_zone_overlay(ui.painter(), rect, pos);
+            }
+        }
+    }
 }
 
 fn handle_dividers(
@@ -289,7 +363,15 @@ fn handle_dividers(
             ui.ctx().set_cursor_icon(cursor);
         }
         if resp.double_clicked() {
-            tab.layout.set_ratio(&div.path, 0.5);
+            // Super+double-click recursively equalizes every split in the tree
+            // to 50/50 (Terminator); a plain double-click equalizes only this
+            // divider. egui exposes Super only as mac_cmd, so the recursive case
+            // is macOS-only here (same limit as the existing Super+R binding).
+            if ui.input(|i| i.modifiers.mac_cmd) {
+                tab.layout.rebalance_recursive();
+            } else {
+                tab.layout.set_ratio(&div.path, 0.5);
+            }
         } else if resp.dragged() {
             if let Some(pointer) = resp.interact_pointer_pos() {
                 // Minimum pane size: 3 columns wide for a vertical (side-by-
@@ -363,7 +445,7 @@ fn handle_pane_mouse(
     let url_at_pointer = if ctrl_held {
         pointer_cell.and_then(|(col, row)| {
             let frame = tab.panes.get(&pane_id)?.cached.as_ref()?;
-            crate::pane::scan_url_at(&frame.cells, row, col)
+            url_at_click(&frame.cells, row, col)
         })
     } else {
         None
@@ -451,11 +533,12 @@ fn handle_pane_mouse(
                     let motion_id = egui::Id::new(("pane_motion_cell", tab_idx, pane_id));
                     let last_cell: Option<(i32, i32)> =
                         ui.ctx().data(|d| d.get_temp(motion_id));
-                    let cell_changed = last_cell != Some((col, row));
-                    if should_report_motion(pane.term_mode(), button_held, cell_changed) {
+                    let (should_send, new_last) =
+                        motion_report(pane.term_mode(), button_held, last_cell, (col, row));
+                    if should_send {
                         pane.send_mouse(MouseKind::Motion, held_button, col, row, mm);
                     }
-                    if cell_changed {
+                    if new_last != last_cell {
                         ui.ctx().data_mut(|d| d.insert_temp(motion_id, (col, row)));
                     }
                 }
@@ -536,8 +619,14 @@ fn handle_pane_mouse(
                                 (false, false) => b"\x1b[B",
                                 (false, true) => b"\x1bOB",
                             };
-                            for _ in 0..lines.abs().min(8) {
-                                pane.send_bytes(seq.to_vec());
+                            // Read-only gate: a wheel tick here is translated
+                            // into user keystrokes sent to the app, so it must
+                            // honor read-only (unlike terminal-response
+                            // send_bytes paths, which must never be suppressed).
+                            if !pane.read_only {
+                                for _ in 0..lines.abs().min(8) {
+                                    pane.send_bytes(seq.to_vec());
+                                }
                             }
                         } else {
                             pane.scroll_by(lines);
@@ -575,6 +664,7 @@ fn build_context_menu(
     pane_id: PaneId,
     tab: &crate::tabs::Tab,
     zoomed: Option<PaneId>,
+    scope: BroadcastScope,
     user_config: &Config,
     bindings: &BindingTable,
     dialogs: &mut crate::dialogs::DialogState,
@@ -598,17 +688,18 @@ fn build_context_menu(
         .panes.get(&pane_id).map_or(false, |p| p.read_only);
     let ro_label = if read_only { "Disable read-only" } else { "Read-only" };
     action_menu_item(ui, bindings, ro_label, Action::ToggleReadOnly, deferred);
-    let broadcast_label = if tab.broadcast {
-        "Stop broadcasting"
-    } else {
-        "Broadcast input to all panes"
-    };
-    action_menu_item(ui, bindings, broadcast_label, Action::ToggleBroadcast, deferred);
+    broadcast_and_group_menu(ui, pane_id, scope, bindings, dialogs, deferred);
     ui.separator();
     action_menu_item(ui, bindings, "Set title\u{2026}", Action::SetTitle, deferred);
     action_menu_item(ui, bindings, "Open Terminal Here", Action::OpenTerminalHere, deferred);
     action_menu_item(ui, bindings, "Close Pane", Action::ClosePane, deferred);
     ui.separator();
+    let current_profile = tab
+        .panes
+        .get(&pane_id)
+        .map(|p| p.profile.clone())
+        .unwrap_or_default();
+    profiles_menu(ui, pane_id, &current_profile, user_config, state);
     ui.menu_button("Layouts", |ui| {
         if ui.button("Save current layout\u{2026}").clicked() {
             dialogs.layout_save_buf.clear();
@@ -620,7 +711,7 @@ fn build_context_menu(
             ui.separator();
             for layout in &layouts {
                 if ui.button(&layout.name).clicked() {
-                    state.layout_restore_pending = Some(layout.template.clone());
+                    state.layout_restore_pending = Some(layout.clone());
                     ui.close();
                 }
             }
@@ -630,6 +721,75 @@ fn build_context_menu(
     action_menu_item(ui, bindings, "New Tab", Action::NewTab, deferred);
     ui.separator();
     action_menu_item(ui, bindings, "Preferences\u{2026}", Action::OpenPrefs, deferred);
+}
+
+/// Broadcast scope (Off/Group/All, shown radio-style with the active scope
+/// selected) plus the group set/clear entries. Replaces the old single broadcast
+/// toggle now that broadcast is a 3-way global scope and panes carry named
+/// groups. The explicit `BroadcastOff/Group/All` actions are unbound on Linux,
+/// so this menu is their reachable surface; `ToggleBroadcast` (Ctrl+Shift+B)
+/// keeps cycling the scope and is no longer a menu item.
+///
+/// "New group\u{2026}" opens the new-group naming dialog (mirroring the
+/// "Save current layout\u{2026}" / title-dialog pattern): it is data-carrying
+/// (the focused pane seeds the dialog), so unlike the broadcast scopes it can't
+/// fire a Copy/Hash `Action`. It just stages `DialogState`; `main.rs` reads the
+/// typed name on confirm and applies it to that pane via `groups::set_pane_group`. The old
+/// `GroupAll`/`GroupTab` placeholder entries are dropped from the menu; both stay
+/// reachable via their Linux default binds (Super+G / Super+T). "Ungroup" clears
+/// the group via `UngroupAll`.
+fn broadcast_and_group_menu(
+    ui: &mut egui::Ui,
+    pane_id: PaneId,
+    scope: BroadcastScope,
+    bindings: &BindingTable,
+    dialogs: &mut crate::dialogs::DialogState,
+    deferred: &mut Vec<Action>,
+) {
+    if ui.radio(scope == BroadcastScope::Off, "Broadcast off").clicked() {
+        deferred.push(Action::BroadcastOff);
+        ui.close();
+    }
+    if ui.radio(scope == BroadcastScope::Group, "Broadcast to group").clicked() {
+        deferred.push(Action::BroadcastGroup);
+        ui.close();
+    }
+    if ui.radio(scope == BroadcastScope::All, "Broadcast to all").clicked() {
+        deferred.push(Action::BroadcastAll);
+        ui.close();
+    }
+    ui.separator();
+    if ui.button("New group\u{2026}").clicked() {
+        dialogs.new_group_buf.clear();
+        dialogs.new_group_pane = Some(pane_id);
+        dialogs.new_group_dialog = true;
+        ui.close();
+    }
+    action_menu_item(ui, bindings, "Ungroup", Action::UngroupAll, deferred);
+}
+
+/// The right-click "Profiles" submenu: a radio list of the configured profile
+/// names with the clicked pane's current profile checked. Mirrors Terminator's
+/// per-terminal Profiles radio submenu. Selecting a name is data-carrying (which
+/// pane, which profile), so unlike the other entries it can't fire an `Action`
+/// (that enum is Copy/Hash); it stages `state.profile_switch_pending`, which the
+/// App applies after `draw_panes` as a live re-style (no respawn). Factored out
+/// so `build_context_menu` stays under 100 lines.
+fn profiles_menu(
+    ui: &mut egui::Ui,
+    pane_id: PaneId,
+    current: &str,
+    user_config: &Config,
+    state: &mut PaneViewState,
+) {
+    ui.menu_button("Profiles", |ui| {
+        for profile in &user_config.profiles {
+            if ui.radio(profile.name == current, &profile.name).clicked() {
+                state.profile_switch_pending = Some((pane_id, profile.name.clone()));
+                ui.close();
+            }
+        }
+    });
 }
 
 fn handle_drag_drop(
@@ -656,6 +816,50 @@ fn handle_drag_drop(
                     }
                 }
             }
+        }
+    }
+}
+
+/// Paint the directional drop-zone indicator while a pane title-bar drag is in
+/// flight: a translucent accent fill over the half the dropped pane will occupy
+/// plus a 2px accent outline. Terminator draws a bordered zone (not just a
+/// fill), and the egui overlay composites above the GL terminal (drawn via
+/// `egui_glow::CallbackFn`), so the indicator is visible on top of the pane.
+fn paint_drop_zone_overlay(painter: &egui::Painter, target_rect: egui::Rect, pos: egui::Pos2) {
+    let zone = drop_zone_rect(target_rect, pos);
+    let accent = egui::Color32::from_rgb(0x40, 0x60, 0xc0);
+    let fill = egui::Color32::from_rgba_unmultiplied(0x40, 0x60, 0xc0, 0x50);
+    painter.rect_filled(zone, 0.0, fill);
+    painter.rect_stroke(
+        zone,
+        0.0,
+        egui::Stroke::new(2.0, accent),
+        egui::StrokeKind::Inside,
+    );
+}
+
+/// Pure hit-test: the id of the first rect that contains `pos`, else None.
+/// Shared by the external-drop consumer and available to the pane drag-drop
+/// path (first match wins, mirroring `handle_drag_drop`'s rect scan).
+fn pane_at(pos: egui::Pos2, rects: &[(PaneId, egui::Rect)]) -> Option<PaneId> {
+    rects
+        .iter()
+        .find(|(_, rect)| rect.contains(pos))
+        .map(|(id, _)| *id)
+}
+
+/// Consume a pending external drop (a file path dropped onto the window from the
+/// OS). window.rs records the drop without pane context; here, where pane rects
+/// are known, resolve the pane under the drop point and paste the path into it.
+/// Read-only panes reject the paste inside `paste_text_into_pane`.
+fn apply_external_drop(
+    state: &mut PaneViewState,
+    tab_mgr: &mut TabManager,
+    rects: &[(PaneId, egui::Rect)],
+) {
+    if let Some(drop) = state.pending_external_drop.take() {
+        if let Some(id) = pane_at(drop.pos, rects) {
+            tab_mgr.paste_text_into_pane(id, &drop.text);
         }
     }
 }
@@ -735,6 +939,7 @@ fn paint_pane(
     pane_id: PaneId,
     rect: egui::Rect,
     focused: bool,
+    focused_group: Option<&str>,
     url_highlight: Option<UrlMatch>,
 ) {
     let cell_w = ctx.cell_w;
@@ -1094,29 +1299,60 @@ fn paint_pane(
     });
 
     if *SHOW_FOCUS_BORDER {
+        // The pane outline reflects broadcast state (Q2): the focused pane
+        // transmits, group/all receivers get a distinct dimmed ring, and an
+        // off / ungrouped pane keeps the normal focus border. read_only panes
+        // never receive input, so they only ever show the focus ring -- matching
+        // the previous `broadcast && !read_only` behavior.
         let profile = ctx.user_config.active();
-        // In broadcast mode every non-read-only pane receives keystrokes, so ring
-        // them all with the broadcast color -- not just the focused one. Otherwise
-        // the panes silently eating your input (e.g. a Ctrl+C) show no border at
-        // all and the broadcast state reads as ordinary focus.
-        let broadcast = ctx.tab_mgr.tabs[ctx.tab_mgr.active_tab].broadcast;
-        let read_only = ctx.tab_mgr.tabs[ctx.tab_mgr.active_tab]
-            .panes
-            .get(&pane_id)
-            .is_some_and(|p| p.read_only);
-        let border = if broadcast && !read_only {
-            Some(profile.broadcast_border_rgb())
-        } else if focused {
-            Some(profile.focus_border_rgb())
-        } else {
-            None
-        };
-        if let Some([r, g, b]) = border {
-            let color = egui::Color32::from_rgb(r, g, b);
+        let scope = ctx.tab_mgr.broadcast_scope;
+        let tab = &ctx.tab_mgr.tabs[ctx.tab_mgr.active_tab];
+        let pane = tab.panes.get(&pane_id);
+        let read_only = pane.is_some_and(|p| p.read_only);
+        let this_group = pane.and_then(|p| p.group.as_deref());
+        let indicator = groups::indicator(scope, focused, this_group, focused_group);
+        if let Some(color) = pane_border_color(profile, indicator, read_only, focused, this_group) {
             let stroke = egui::Stroke::new(FOCUS_BORDER, color);
             ui.painter()
                 .rect_stroke(rect, 0.0, stroke, egui::StrokeKind::Inside);
         }
+    }
+}
+
+/// Outline color for a pane. A grouped pane's border encodes group IDENTITY --
+/// its stable `groups::group_color` -- so same-group panes match at a glance;
+/// this replaces the broadcast-state color on the border (the transmit/receive
+/// STATE stays shown by the titlebar dot). Ungrouped panes keep the broadcast
+/// behavior: transmit and receive-on get distinct treatment -- full vs
+/// half-intensity `broadcast_border`, matching the titlebar dots in
+/// `title_bar::indicator_glyph` -- while an off / non-receiving pane uses the
+/// normal focus ring (focused) or nothing. The read_only guard is unchanged and
+/// takes precedence: a read_only pane (grouped or not) never receives input, so
+/// it shows only the focus ring when focused, reproducing the old
+/// `broadcast && !read_only` gate exactly.
+fn pane_border_color(
+    profile: &crate::config::Profile,
+    indicator: Indicator,
+    read_only: bool,
+    focused: bool,
+    group: Option<&str>,
+) -> Option<egui::Color32> {
+    let focus = || {
+        let [r, g, b] = profile.focus_border_rgb();
+        egui::Color32::from_rgb(r, g, b)
+    };
+    if read_only {
+        return focused.then(focus);
+    }
+    if let Some(name) = group {
+        return Some(groups::group_color(name));
+    }
+    let [r, g, b] = profile.broadcast_border_rgb();
+    match indicator {
+        Indicator::Transmit(BroadcastScope::Off) => Some(focus()),
+        Indicator::Transmit(_) => Some(egui::Color32::from_rgb(r, g, b)),
+        Indicator::ReceiveOn => Some(egui::Color32::from_rgb(r / 2, g / 2, b / 2)),
+        Indicator::ReceiveOff => None,
     }
 }
 
@@ -1233,5 +1469,282 @@ fn cell_side(p: egui::Pos2, rect: egui::Rect, ppp: f32, cell_w: f32) -> Side {
         Side::Right
     } else {
         Side::Left
+    }
+}
+
+/// Mouse-motion dedupe: given the cell last reported for this pane and the cell
+/// the pointer now resolves to, decide whether to forward a motion report (per
+/// the term's mouse mode and whether a button is held) and what the new
+/// last-reported cell should be. A report is only emitted on a cell transition,
+/// so per-pixel moves within one cell are suppressed. Lifted out of the
+/// per-frame motion block unchanged so the suppression is unit-testable.
+fn motion_report(
+    term_mode: TermMode,
+    button_held: bool,
+    last_cell: Option<(i32, i32)>,
+    cell: (i32, i32),
+) -> (bool, Option<(i32, i32)>) {
+    let cell_changed = last_cell != Some(cell);
+    let should_send = should_report_motion(term_mode, button_held, cell_changed);
+    let new_last = if cell_changed { Some(cell) } else { last_cell };
+    (should_send, new_last)
+}
+
+/// Resolve a raw pixel-derived click column to the wide-glyph base column and
+/// then hit-test for a URL at that cell. Composing the spacer resolution with
+/// the scan keeps a click on the right half of a double-width glyph (its
+/// WIDE_CHAR_SPACER column) from missing a URL anchored on the base column.
+fn url_at_click(cells: &[crate::pane::CellSnapshot], row: i32, col: i32) -> Option<UrlMatch> {
+    let col = crate::pane::resolve_wide_click_col(cells, row, col);
+    crate::pane::scan_url_at(cells, row, col)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::font::FontStyle;
+    use crate::pane::CellSnapshot;
+
+    fn rect_origin() -> egui::Rect {
+        egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1000.0, 1000.0))
+    }
+
+    #[test]
+    fn cell_at_maps_clamps_and_ppp_scales() {
+        let rect = rect_origin();
+        // Interior: with cell 10x20, pos(25,30) -> col 2 (25/10), row 1 (30/20).
+        assert_eq!(cell_at(egui::pos2(25.0, 30.0), rect, 1.0, 10.0, 20.0), (2, 1));
+        // Above-and-left of the rect clamps to the origin cell.
+        assert_eq!(cell_at(egui::pos2(-5.0, -5.0), rect, 1.0, 10.0, 20.0), (0, 0));
+        // pixels_per_point scales the effective coordinate: with cell_w=20,
+        // pos.x=15 is in col 0 at ppp=1 but col 1 at ppp=2 (15*2/20 = 1.5).
+        assert_eq!(cell_at(egui::pos2(15.0, 0.0), rect, 1.0, 20.0, 20.0), (0, 0));
+        assert_eq!(cell_at(egui::pos2(15.0, 0.0), rect, 2.0, 20.0, 20.0), (1, 0));
+    }
+
+    #[test]
+    fn cell_side_half_cell_threshold_inclusive_right() {
+        let rect = rect_origin();
+        // Within the first cell (cell_w=10): just under the half-cell is Left,
+        // exactly the half-cell is Right (the threshold is inclusive `>=`).
+        assert_eq!(cell_side(egui::pos2(4.9, 0.0), rect, 1.0, 10.0), Side::Left);
+        assert_eq!(cell_side(egui::pos2(5.0, 0.0), rect, 1.0, 10.0), Side::Right);
+        // The threshold is per-cell (modulo cell_w): the same boundary recurs in
+        // the second cell at 14.9 / 15.0.
+        assert_eq!(cell_side(egui::pos2(14.9, 0.0), rect, 1.0, 10.0), Side::Left);
+        assert_eq!(cell_side(egui::pos2(15.0, 0.0), rect, 1.0, 10.0), Side::Right);
+    }
+
+    #[test]
+    fn motion_report_suppresses_same_cell_reports_changed() {
+        let drag = TermMode::MOUSE_DRAG;
+        // Same cell with a button held: suppressed, last cell unchanged.
+        assert_eq!(
+            motion_report(drag, true, Some((5, 5)), (5, 5)),
+            (false, Some((5, 5)))
+        );
+        // Changed cell with a button held: reported, last cell advanced.
+        assert_eq!(
+            motion_report(drag, true, Some((5, 5)), (6, 5)),
+            (true, Some((6, 5)))
+        );
+        // No button held in drag mode: records the new cell but stays silent.
+        assert_eq!(
+            motion_report(drag, false, Some((5, 5)), (6, 5)),
+            (false, Some((6, 5)))
+        );
+    }
+
+    fn cell(col: i32, c: char, wide: bool, hyperlink: Option<&str>) -> CellSnapshot {
+        CellSnapshot {
+            col,
+            row: 0,
+            c,
+            fg: [1.0; 4],
+            bg: [0.0, 0.0, 0.0, 1.0],
+            style: FontStyle::Regular,
+            underline: Underline::None,
+            underline_color: [1.0; 4],
+            strikeout: false,
+            wide,
+            hidden: false,
+            zerowidth: Vec::new(),
+            hyperlink: hyperlink.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn url_at_click_resolves_wide_spacer_then_scans_hyperlink() {
+        let uri = "https://example.com/foo";
+        // A double-width glyph carrying an OSC-8 hyperlink at col 0, with its
+        // blank WIDE_CHAR_SPACER at col 1 (no hyperlink of its own).
+        let cells = vec![cell(0, '中', true, Some(uri)), cell(1, ' ', false, None)];
+        // Clicking the spacer column directly finds nothing: the spacer has no
+        // hyperlink and ' ' is not heuristically a URL.
+        assert!(crate::pane::scan_url_at(&cells, 0, 1).is_none());
+        // url_at_click first resolves the spacer back to the wide base column,
+        // so the OSC-8 hyperlink is found.
+        let m = url_at_click(&cells, 0, 1).expect("spacer should resolve to hyperlink");
+        assert_eq!(m.url, uri);
+        assert!(m.is_hyperlink);
+        assert_eq!(m.start_col, 0);
+    }
+
+    fn unit_rect() -> egui::Rect {
+        egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(100.0, 100.0))
+    }
+
+    #[test]
+    fn drop_zone_direction_picks_nearest_edge() {
+        let rect = unit_rect();
+        // Nearest the left edge -> vertical split, dropped pane first (left).
+        assert_eq!(
+            drop_zone_direction(rect, egui::pos2(10.0, 50.0)),
+            (Direction::Vertical, true)
+        );
+        // Nearest the right edge -> vertical split, dropped pane second (right).
+        assert_eq!(
+            drop_zone_direction(rect, egui::pos2(90.0, 50.0)),
+            (Direction::Vertical, false)
+        );
+        // Nearest the top edge -> horizontal split, dropped pane first (top).
+        assert_eq!(
+            drop_zone_direction(rect, egui::pos2(50.0, 10.0)),
+            (Direction::Horizontal, true)
+        );
+        // Nearest the bottom edge -> horizontal split, dropped pane second (bottom).
+        assert_eq!(
+            drop_zone_direction(rect, egui::pos2(50.0, 90.0)),
+            (Direction::Horizontal, false)
+        );
+    }
+
+    #[test]
+    fn drop_zone_rect_is_the_correct_half() {
+        let rect = unit_rect();
+        // Left edge -> left half.
+        assert_eq!(
+            drop_zone_rect(rect, egui::pos2(10.0, 50.0)),
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(50.0, 100.0))
+        );
+        // Right edge -> right half.
+        assert_eq!(
+            drop_zone_rect(rect, egui::pos2(90.0, 50.0)),
+            egui::Rect::from_min_max(egui::pos2(50.0, 0.0), egui::pos2(100.0, 100.0))
+        );
+        // Top edge -> top half.
+        assert_eq!(
+            drop_zone_rect(rect, egui::pos2(50.0, 10.0)),
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(100.0, 50.0))
+        );
+        // Bottom edge -> bottom half.
+        assert_eq!(
+            drop_zone_rect(rect, egui::pos2(50.0, 90.0)),
+            egui::Rect::from_min_max(egui::pos2(0.0, 50.0), egui::pos2(100.0, 100.0))
+        );
+    }
+
+    #[test]
+    fn pane_at_first_containing_rect_wins() {
+        let a = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(100.0, 100.0));
+        let b = egui::Rect::from_min_size(egui::pos2(100.0, 0.0), egui::vec2(100.0, 100.0));
+        let rects: Vec<(PaneId, egui::Rect)> = vec![(7, a), (9, b)];
+        // A point inside the first rect resolves to its id.
+        assert_eq!(pane_at(egui::pos2(50.0, 50.0), &rects), Some(7));
+        // A point inside the second rect resolves to its id.
+        assert_eq!(pane_at(egui::pos2(150.0, 50.0), &rects), Some(9));
+        // A point outside every rect resolves to None.
+        assert_eq!(pane_at(egui::pos2(500.0, 500.0), &rects), None);
+        // When rects overlap, the first listed match wins.
+        let overlap: Vec<(PaneId, egui::Rect)> = vec![(1, a), (2, a)];
+        assert_eq!(pane_at(egui::pos2(50.0, 50.0), &overlap), Some(1));
+    }
+
+    #[test]
+    fn pane_border_color_distinguishes_transmit_receive_and_readonly() {
+        use crate::config::Profile;
+        let p = Profile::default();
+        let focus = {
+            let [r, g, b] = p.focus_border_rgb();
+            egui::Color32::from_rgb(r, g, b)
+        };
+        let [br, bg, bb] = p.broadcast_border_rgb();
+        let transmit = egui::Color32::from_rgb(br, bg, bb);
+        let receive = egui::Color32::from_rgb(br / 2, bg / 2, bb / 2);
+
+        // Ungrouped panes (group = None) keep the broadcast behavior.
+        // Off + focused => the normal focus ring (Transmit(Off)).
+        assert_eq!(
+            pane_border_color(&p, Indicator::Transmit(BroadcastScope::Off), false, true, None),
+            Some(focus)
+        );
+        // A focused transmitter under Group/All gets the full broadcast color.
+        assert_eq!(
+            pane_border_color(&p, Indicator::Transmit(BroadcastScope::All), false, true, None),
+            Some(transmit)
+        );
+        assert_eq!(
+            pane_border_color(&p, Indicator::Transmit(BroadcastScope::Group), false, true, None),
+            Some(transmit)
+        );
+        // A receiver gets a distinct, dimmed broadcast ring.
+        assert_eq!(
+            pane_border_color(&p, Indicator::ReceiveOn, false, false, None),
+            Some(receive)
+        );
+        assert_ne!(transmit, receive);
+        // Not focused and not receiving => no ring.
+        assert_eq!(
+            pane_border_color(&p, Indicator::ReceiveOff, false, false, None),
+            None
+        );
+        // read_only never shows the broadcast/receive ring even when it would
+        // otherwise receive: only the focus ring when focused, else nothing.
+        assert_eq!(pane_border_color(&p, Indicator::ReceiveOn, true, false, None), None);
+        assert_eq!(
+            pane_border_color(&p, Indicator::Transmit(BroadcastScope::All), true, true, None),
+            Some(focus)
+        );
+    }
+
+    #[test]
+    fn pane_border_color_uses_group_color_for_grouped_panes() {
+        use crate::config::Profile;
+        let p = Profile::default();
+        let work = crate::groups::group_color("work");
+        // A grouped, non-read_only pane shows its stable group color regardless
+        // of broadcast state or focus -- the group identity replaces the
+        // broadcast-state border (state stays on the titlebar dot).
+        assert_eq!(
+            pane_border_color(&p, Indicator::ReceiveOff, false, false, Some("work")),
+            Some(work),
+            "an unfocused grouped pane is tagged with its group color"
+        );
+        assert_eq!(
+            pane_border_color(&p, Indicator::Transmit(BroadcastScope::Off), false, true, Some("work")),
+            Some(work),
+            "a focused grouped pane shows the group color, not the focus ring"
+        );
+        // Different groups -> different colors, so members are told apart.
+        assert_ne!(
+            pane_border_color(&p, Indicator::ReceiveOff, false, false, Some("work")),
+            pane_border_color(&p, Indicator::ReceiveOff, false, false, Some("logs")),
+        );
+        // The read_only guard still wins: a read_only grouped pane never shows
+        // the group color -- only the focus ring when focused, else nothing.
+        let focus = {
+            let [r, g, b] = p.focus_border_rgb();
+            egui::Color32::from_rgb(r, g, b)
+        };
+        assert_eq!(
+            pane_border_color(&p, Indicator::ReceiveOff, true, true, Some("work")),
+            Some(focus),
+            "read_only grouped + focused => focus ring (guard preserved)"
+        );
+        assert_eq!(
+            pane_border_color(&p, Indicator::ReceiveOff, true, false, Some("work")),
+            None,
+            "read_only grouped + unfocused => no ring (guard preserved)"
+        );
     }
 }

@@ -324,6 +324,44 @@ impl Node {
             }
         }
     }
+
+    /// Equalize this split to 50/50. Affects only the top-level split; nested
+    /// splits keep their ratios. No-op on a leaf.
+    /// Recursively equalize every split in the tree to 50/50.
+    pub fn rebalance_recursive(&mut self) {
+        if let Node::Split { ratio, left, right, .. } = self {
+            *ratio = 0.5;
+            left.rebalance_recursive();
+            right.rebalance_recursive();
+        }
+    }
+}
+
+/// Move a split divider by `step` whole cells and return the resulting ratio.
+///
+/// `container_px` is the container's pixel extent along the split axis and
+/// `cell_px` the cell extent along that same axis, so `total = container/cell`
+/// is the cell count. The current boundary (in cells) is stepped by `step`,
+/// clamped so neither child drops below `min_cells`, then converted back to a
+/// ratio. Degenerate containers (`total <= 0`, or too small to host two
+/// `min_cells` children) return `current_ratio` unchanged.
+pub fn ratio_after_cell_step(
+    current_ratio: f32,
+    step: i32,
+    container_px: f32,
+    cell_px: f32,
+    min_cells: f32,
+) -> f32 {
+    if cell_px <= 0.0 {
+        return current_ratio;
+    }
+    let total = container_px / cell_px;
+    if total <= 0.0 || 2.0 * min_cells > total {
+        return current_ratio;
+    }
+    let cur = (current_ratio * total).round();
+    let new = (cur + step as f32).clamp(min_cells, total - min_cells);
+    new / total
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -499,19 +537,64 @@ mod tests {
         }
     }
 
-    // Gap #45: rebalance dividers (equalize ratios)
-    // When implementing: add Node::rebalance() that sets ratio to 0.5.
-    #[test]
-    #[ignore = "gap #45: Node::rebalance not yet implemented"]
-    fn rebalance_equalizes_ratios() {
-        panic!("implement Node::rebalance(): set this split's ratio to 0.5");
+    /// Build Vertical(Leaf1 | Horizontal(Leaf2, Leaf3)) with off-centre ratios:
+    /// root ratio 0.3, nested ratio 0.7.
+    fn skewed_nested_tree() -> Node {
+        let mut root = Node::Leaf(1);
+        root.split_leaf(1, 2, Direction::Vertical);
+        root.split_leaf(2, 3, Direction::Horizontal);
+        root.set_ratio(&[], 0.3);
+        root.set_ratio(&[1], 0.7);
+        root
     }
 
-    // Gap #45: recursive rebalance (equalize all nested ratios)
+    fn nested_ratio(node: &Node) -> f32 {
+        match node {
+            Node::Split { right, .. } => match right.as_ref() {
+                Node::Split { ratio, .. } => *ratio,
+                _ => panic!("expected nested split on the right"),
+            },
+            _ => panic!("expected split at root"),
+        }
+    }
+
+    // Gap #45: recursive rebalance (equalize all nested ratios).
     #[test]
-    #[ignore = "gap #45: Node::rebalance_recursive not yet implemented"]
     fn rebalance_recursive_equalizes_nested() {
-        panic!("implement Node::rebalance_recursive(): set all ratios to 0.5 recursively");
+        let mut root = skewed_nested_tree();
+        root.rebalance_recursive();
+        // Every split in the tree is now 0.5.
+        assert!((root_ratio(&root) - 0.5).abs() < 1e-6);
+        assert!((nested_ratio(&root) - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn ratio_after_cell_step_moves_one_cell() {
+        // 100px container / 10px cells = 10 cells; ratio 0.5 => boundary at 5.
+        let up = ratio_after_cell_step(0.5, 1, 100.0, 10.0, 1.0);
+        assert!((up - 0.6).abs() < 1e-6);
+        let down = ratio_after_cell_step(0.5, -1, 100.0, 10.0, 1.0);
+        assert!((down - 0.4).abs() < 1e-6);
+    }
+
+    #[test]
+    fn ratio_after_cell_step_clamps_to_min_cells() {
+        // Stepping down past the floor pins the boundary at min_cells = 2 of 10.
+        let r = ratio_after_cell_step(0.3, -5, 100.0, 10.0, 2.0);
+        assert!((r - 0.2).abs() < 1e-6);
+        // Stepping up past the ceiling pins it at total - min_cells = 8 of 10.
+        let r = ratio_after_cell_step(0.7, 5, 100.0, 10.0, 2.0);
+        assert!((r - 0.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn ratio_after_cell_step_degenerate_returns_input() {
+        // total <= 0 (zero container) returns the input ratio untouched.
+        assert!((ratio_after_cell_step(0.42, 1, 0.0, 10.0, 1.0) - 0.42).abs() < 1e-6);
+        // Zero cell size is also degenerate.
+        assert!((ratio_after_cell_step(0.42, 1, 100.0, 0.0, 1.0) - 0.42).abs() < 1e-6);
+        // Container too small to host two min-size children (2*2 > 3 cells).
+        assert!((ratio_after_cell_step(0.42, 1, 30.0, 10.0, 2.0) - 0.42).abs() < 1e-6);
     }
 
     // Gap #4 (partial): layout template stores per-terminal metadata
@@ -519,5 +602,175 @@ mod tests {
     #[ignore = "gap #4 partial: LayoutTemplate doesn't store per-terminal cwd/command/group"]
     fn layout_template_with_metadata() {
         panic!("extend LayoutTemplate::Terminal to carry optional cwd, command, group, profile");
+    }
+
+    // ── Block B: ratio / divider / rect / remove_leaf gaps ────────────
+
+    /// Read the ratio of the top-level Split (panics if the root is a leaf).
+    fn root_ratio(node: &Node) -> f32 {
+        match node {
+            Node::Split { ratio, .. } => *ratio,
+            _ => panic!("expected split at root"),
+        }
+    }
+
+    #[test]
+    fn set_ratio_clamps_out_of_range() {
+        let mut root = Node::Leaf(1);
+        root.split_leaf(1, 2, Direction::Vertical);
+
+        // Above the upper bound clamps to 0.95.
+        root.set_ratio(&[], 2.0);
+        assert!((root_ratio(&root) - 0.95).abs() < 1e-6);
+
+        // Below the lower bound clamps to 0.05.
+        root.set_ratio(&[], -1.0);
+        assert!((root_ratio(&root) - 0.05).abs() < 1e-6);
+
+        // An in-range value passes through untouched.
+        root.set_ratio(&[], 0.42);
+        assert!((root_ratio(&root) - 0.42).abs() < 1e-6);
+    }
+
+    #[test]
+    fn set_ratio_min_cells_clamps_band_from_pixels() {
+        let mut root = Node::Leaf(1);
+        root.split_leaf(1, 2, Direction::Vertical);
+
+        // container 100px, cell 10px, min 2 cells => min_frac = 0.2,
+        // so the allowed band is [0.20, 0.80].
+        let container = 100.0;
+        let cell = 10.0;
+        let min_cells = 2.0;
+
+        // Request below the band -> clamped up to 0.20.
+        root.set_ratio_min_cells(&[], 0.01, container, cell, min_cells);
+        assert!((root_ratio(&root) - 0.20).abs() < 1e-6);
+
+        // Request above the band -> clamped down to 0.80.
+        root.set_ratio_min_cells(&[], 0.99, container, cell, min_cells);
+        assert!((root_ratio(&root) - 0.80).abs() < 1e-6);
+
+        // Request inside the band passes through.
+        root.set_ratio_min_cells(&[], 0.50, container, cell, min_cells);
+        assert!((root_ratio(&root) - 0.50).abs() < 1e-6);
+    }
+
+    #[test]
+    fn set_ratio_min_cells_degenerate_container_falls_back_to_center() {
+        let mut root = Node::Leaf(1);
+        root.split_leaf(1, 2, Direction::Vertical);
+
+        // container 10px but each min child wants 2 cells * 10px = 20px,
+        // i.e. larger than the whole container. The band collapses to the
+        // centre, so any requested ratio lands at 0.5.
+        let container = 10.0;
+        let cell = 10.0;
+        let min_cells = 2.0;
+
+        root.set_ratio_min_cells(&[], 0.10, container, cell, min_cells);
+        assert!((root_ratio(&root) - 0.5).abs() < 1e-6);
+
+        root.set_ratio_min_cells(&[], 0.90, container, cell, min_cells);
+        assert!((root_ratio(&root) - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn set_ratio_walks_path_and_noops_on_leaf() {
+        // root: Vertical(Leaf1 | Horizontal(Leaf2, Leaf3))
+        let mut root = Node::Leaf(1);
+        root.split_leaf(1, 2, Direction::Vertical);
+        root.split_leaf(2, 3, Direction::Horizontal);
+
+        // Walk to the nested split via path [1] and set its ratio.
+        root.set_ratio(&[1], 0.30);
+        match &root {
+            Node::Split { ratio, right, .. } => {
+                // Root ratio untouched.
+                assert!((ratio - 0.5).abs() < 1e-6);
+                match right.as_ref() {
+                    Node::Split { ratio: inner, .. } => {
+                        assert!((inner - 0.30).abs() < 1e-6);
+                    }
+                    _ => panic!("expected nested split on the right"),
+                }
+            }
+            _ => panic!("expected split at root"),
+        }
+
+        // Path pointing at a leaf is a no-op (no panic, ratios unchanged).
+        root.set_ratio(&[0], 0.10);
+        assert!((root_ratio(&root) - 0.5).abs() < 1e-6);
+
+        // set_ratio on a bare leaf root is a no-op.
+        let mut leaf = Node::Leaf(7);
+        leaf.set_ratio(&[], 0.25);
+        assert!(matches!(leaf, Node::Leaf(7)));
+    }
+
+    #[test]
+    fn walk_dividers_paths_and_vertical_center() {
+        // root: Vertical(Leaf1 | Horizontal(Leaf2, Leaf3))
+        let mut root = Node::Leaf(1);
+        root.split_leaf(1, 2, Direction::Vertical);
+        root.split_leaf(2, 3, Direction::Horizontal);
+
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(100.0, 60.0));
+        let mut out = Vec::new();
+        root.walk_dividers(rect, 0.0, &mut out);
+
+        // Two internal splits -> two handles.
+        assert_eq!(out.len(), 2);
+
+        // The root divider comes first with an empty path and is vertical,
+        // centred at x = 50 across the full height.
+        assert_eq!(out[0].path, Vec::<u8>::new());
+        assert_eq!(out[0].dir, Direction::Vertical);
+        assert!((out[0].rect.center().x - 50.0).abs() < 0.01);
+
+        // The nested divider lives down the right branch -> path [1].
+        assert_eq!(out[1].path, vec![1u8]);
+        assert_eq!(out[1].dir, Direction::Horizontal);
+    }
+
+    #[test]
+    fn walk_rects_vertical_gap_channel() {
+        let mut root = Node::Leaf(1);
+        root.split_leaf(1, 2, Direction::Vertical);
+
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(100.0, 60.0));
+        let gap = 10.0;
+        let mut out = Vec::new();
+        root.walk_rects(rect, gap, &mut out);
+
+        assert_eq!(out.len(), 2);
+        let (_, left_rect) = out[0];
+        let (_, right_rect) = out[1];
+
+        // Split at x = 50; each side recedes by gap/2 = 5px, leaving a 10px
+        // empty channel between them.
+        assert!((left_rect.right() - 45.0).abs() < 0.01);
+        assert!((right_rect.left() - 55.0).abs() < 0.01);
+        assert!((right_rect.left() - left_rect.right() - gap).abs() < 0.01);
+    }
+
+    #[test]
+    fn remove_leaf_promotes_multileaf_sibling_subtree() {
+        // root: Vertical(Leaf1 | Horizontal(Leaf2, Leaf3))
+        let mut root = Node::Leaf(1);
+        root.split_leaf(1, 2, Direction::Vertical);
+        root.split_leaf(2, 3, Direction::Horizontal);
+
+        // Removing the single left leaf promotes the *multi-leaf* right
+        // subtree to the root, preserving its structure.
+        match root.remove_leaf(1) {
+            RemoveResult::Found => {}
+            _ => panic!("expected Found"),
+        }
+        assert_eq!(leaves(&root), vec![2, 3]);
+        match &root {
+            Node::Split { dir, .. } => assert_eq!(*dir, Direction::Horizontal),
+            _ => panic!("expected the multi-leaf subtree to be promoted, got a leaf"),
+        }
     }
 }

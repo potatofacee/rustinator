@@ -6,7 +6,6 @@ use glow::HasContext as _;
 use glutin::config::{Config as GlConfig, ConfigTemplateBuilder, GlConfig as _};
 use glutin::context::{
     ContextApi, ContextAttributesBuilder, NotCurrentGlContext, PossiblyCurrentContext,
-    PossiblyCurrentGlContext as _,
 };
 use glutin::display::{Display, GlDisplay as _};
 use glutin::surface::{GlSurface as _, Surface, SurfaceAttributesBuilder, WindowSurface};
@@ -14,17 +13,27 @@ use raw_window_handle::HasWindowHandle as _;
 use winit::event_loop::ActiveEventLoop;
 use winit::window::{Window, WindowAttributes};
 
-pub(crate) struct GlState {
-    pub(crate) gl_context: PossiblyCurrentContext,
-    pub(crate) gl_surface: Surface<WindowSurface>,
+use crate::gl_window::GlWindow;
+
+/// Process-global GL state that outlives every window: the ONE shared context,
+/// its display/config, and the shared `glow::Context`. Each window owns only a
+/// `Surface` (in its `GlWindow`); this struct owns everything they share. Split
+/// out of the former `GlState`, whose window/surface/painter now live in the
+/// primary `GlWindow` returned alongside it by `new`.
+pub(crate) struct SharedGl {
+    gl_context: PossiblyCurrentContext,
     pub(crate) gl_display: Display,
     pub(crate) gl_config: GlConfig,
-    pub(crate) window: Window,
     pub(crate) gl: Arc<glow::Context>,
 }
 
-impl GlState {
-    pub(crate) fn new(event_loop: &ActiveEventLoop) -> Self {
+impl SharedGl {
+    /// Build the shared context (display + config + the first context/surface via
+    /// `create_context_and_surface`) and wrap the primary window into a `GlWindow`
+    /// from those shared handles — the same construction the prefs/hotkey windows
+    /// already use. The primary painter keeps `srgb=true`, matching the inline
+    /// primary painter it replaces.
+    pub(crate) fn new(event_loop: &ActiveEventLoop) -> (SharedGl, GlWindow) {
         let window_attrs = WindowAttributes::default()
             .with_title("rustinator")
             .with_inner_size(winit::dpi::LogicalSize::new(900.0f32, 560.0))
@@ -80,28 +89,28 @@ impl GlState {
             }
         }
 
-        Self {
+        let shared = SharedGl {
             gl_context,
-            gl_surface,
             gl_display: display,
             gl_config,
-            window,
             gl,
-        }
+        };
+
+        let primary = GlWindow::new_primary(
+            event_loop,
+            window,
+            gl_surface,
+            &shared.gl,
+            &shared.gl_context,
+            egui::ViewportId::ROOT,
+            true,
+        );
+
+        (shared, primary)
     }
 
-    pub(crate) fn swap_buffers(&self) {
-        self.gl_surface.swap_buffers(&self.gl_context).ok();
-    }
-
-    pub(crate) fn resize(&self, width: u32, height: u32) {
-        if let (Some(w), Some(h)) = (NonZeroU32::new(width), NonZeroU32::new(height)) {
-            self.gl_surface.resize(&self.gl_context, w, h);
-        }
-    }
-
-    pub(crate) fn make_current(&self) {
-        self.gl_context.make_current(&self.gl_surface).ok();
+    pub(crate) fn context(&self) -> &PossiblyCurrentContext {
+        &self.gl_context
     }
 }
 

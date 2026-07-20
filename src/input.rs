@@ -16,34 +16,22 @@ pub(crate) fn process_keys(
     bindings: &BindingTable,
     raw_keys: Vec<RawTermKey>,
     targets: &[&Pane],
+    focused_alt_screen: bool,
     scroll_on_keystroke: bool,
 ) -> Vec<Action> {
-    let mut actions: Vec<Action> = Vec::new();
-
     if targets.is_empty() {
-        return actions;
+        return Vec::new();
     }
 
     // When the focused pane is in alt-screen, the three default Linux bindings
     // that collide with TUIs (Ctrl+Tab -> FocusNext, Ctrl+PageUp -> PrevTab,
     // Ctrl+PageDown -> NextTab) should pass through to the child rather than be
-    // consumed. We only suppress these when bound to their conflicting combos.
-    let alt_screen = targets.iter().any(|p| p.mode().contains(TermMode::ALT_SCREEN));
-
-    let consumed: Vec<bool> = raw_keys
-        .iter()
-        .map(|rk| {
-            if let Some(action) = bindings.lookup(rk.key, rk.mods) {
-                if alt_screen && is_alt_screen_passthrough(action, rk.key, rk.mods) {
-                    return false;
-                }
-                actions.push(action);
-                true
-            } else {
-                false
-            }
-        })
-        .collect();
+    // consumed. This keys off the FOCUSED pane only: under broadcast `targets`
+    // is every non-read_only pane, so a background alt-screen pane must not
+    // change how the focused pane's keys are routed.
+    let keys: Vec<(egui::Key, egui::Modifiers)> =
+        raw_keys.iter().map(|rk| (rk.key, rk.mods)).collect();
+    let (actions, consumed) = classify_keys(bindings, &keys, focused_alt_screen);
 
     ctx.input_mut(|i| {
         i.events.retain(|ev| {
@@ -120,6 +108,78 @@ fn is_alt_screen_passthrough(action: Action, key: egui::Key, mods: egui::Modifie
     )
 }
 
+/// Whether process_keys should consume a bound action (true) or let it fall
+/// through to the child PTY (false). The three TUI-colliding navigation
+/// bindings pass through only while the *focused* pane is in alt-screen; this
+/// is computed from the focused-pane flag alone, never from background
+/// broadcast targets.
+fn should_consume_binding(
+    action: Action,
+    key: egui::Key,
+    mods: egui::Modifiers,
+    focused_alt_screen: bool,
+) -> bool {
+    !(focused_alt_screen && is_alt_screen_passthrough(action, key, mods))
+}
+
+/// Classify a batch of key presses against the binding table. Returns the
+/// actions to dispatch (in key order) plus a `consumed` flag parallel to
+/// `keys`: true when the key was swallowed as a binding, false when it must
+/// fall through to the child PTY. The three TUI-colliding nav bindings pass
+/// through (consumed=false, no action emitted) while the focused pane is in
+/// alt-screen.
+fn classify_keys(
+    bindings: &BindingTable,
+    keys: &[(egui::Key, egui::Modifiers)],
+    focused_alt_screen: bool,
+) -> (Vec<Action>, Vec<bool>) {
+    let mut actions: Vec<Action> = Vec::new();
+    let consumed: Vec<bool> = keys
+        .iter()
+        .map(|&(key, mods)| {
+            if let Some(action) = bindings.lookup(key, mods) {
+                if !should_consume_binding(action, key, mods, focused_alt_screen) {
+                    return false;
+                }
+                actions.push(action);
+                true
+            } else {
+                false
+            }
+        })
+        .collect();
+    (actions, consumed)
+}
+
+/// Normalize pasted text (CRLF/LF -> CR) and, when the terminal has bracketed
+/// paste enabled, wrap it in `\x1b[200~` / `\x1b[201~` markers. Mirrors
+/// `Pane::send_paste`; see the cross-file note in the review (this is the pure
+/// core that `send_paste` should route through).
+pub(crate) fn encode_paste(text: &str, bracketed: bool) -> Vec<u8> {
+    let fixed = text.replace("\r\n", "\r").replace('\n', "\r");
+    if bracketed {
+        let mut v = Vec::with_capacity(fixed.len() + 12);
+        v.extend_from_slice(b"\x1b[200~");
+        v.extend_from_slice(fixed.as_bytes());
+        v.extend_from_slice(b"\x1b[201~");
+        v
+    } else {
+        fixed.into_bytes()
+    }
+}
+
+/// Focus-reporting bytes for a focus-in/out transition, gated on the terminal
+/// having FOCUS_IN_OUT (mode 1004) enabled. `\x1b[I` on focus-in, `\x1b[O` on
+/// focus-out, None when the mode is off. Mirrors `Pane::send_focus_event`.
+pub(crate) fn focus_event_bytes(mode: TermMode, focused: bool) -> Option<Vec<u8>> {
+    if mode.contains(TermMode::FOCUS_IN_OUT) {
+        let seq: &[u8] = if focused { b"\x1b[I" } else { b"\x1b[O" };
+        Some(seq.to_vec())
+    } else {
+        None
+    }
+}
+
 pub(crate) fn encode_raw_key(event: &winit::event::KeyEvent, modifiers: winit::event::Modifiers) -> Option<RawTermKey> {
     if !event.state.is_pressed() {
         return None;
@@ -137,7 +197,7 @@ pub(crate) fn encode_raw_key(event: &winit::event::KeyEvent, modifiers: winit::e
     };
 
     if let Key::Named(named) = &event.logical_key {
-        if let Some(bytes) = encode_named_key(*named, shift, alt, ctrl) {
+        if let Some(bytes) = named_logical_key_bytes(*named, mods.mac_cmd, shift, alt, ctrl) {
             return Some(RawTermKey {
                 key: egui_key.unwrap_or(egui::Key::Escape),
                 mods,
@@ -159,8 +219,7 @@ pub(crate) fn encode_raw_key(event: &winit::event::KeyEvent, modifiers: winit::e
             let s = c.as_ref();
             let mut chars = s.chars();
             if let (Some(ch), None) = (chars.next(), chars.next()) {
-                if ch.is_ascii_alphabetic() {
-                    let b = (ch.to_ascii_uppercase() as u8) - 0x40;
+                if let Some(b) = ctrl_letter_byte(ch) {
                     return Some(RawTermKey {
                         key: egui_key.unwrap_or(egui::Key::Space),
                         mods,
@@ -227,6 +286,37 @@ pub(crate) fn legacy_mod_param(shift: bool, alt: bool, ctrl: bool) -> u8 {
     if alt { m |= 2; }
     if ctrl { m |= 4; }
     1 + m
+}
+
+/// Legacy bytes for a Named logical key under the given modifier flags,
+/// honoring the macOS Cmd/Super guard. When `mac_cmd` is held the combo is an
+/// inert shortcut and must emit no bytes (bug M9): previously the
+/// `encode_named_key` block ran before the mac_cmd byte-less guard, so
+/// Cmd+Left/Backspace/Enter/Up/Down leaked their legacy sequences. Returns None
+/// when the key has no legacy encoding or when `mac_cmd` is set, letting the
+/// caller fall through to the byte-less RawTermKey. (Cmd+PageUp/Down never reach
+/// here — they are consumed earlier as Prev/NextTab bindings.)
+fn named_logical_key_bytes(
+    named: NamedKey,
+    mac_cmd: bool,
+    shift: bool,
+    alt: bool,
+    ctrl: bool,
+) -> Option<Vec<u8>> {
+    if mac_cmd {
+        return None;
+    }
+    encode_named_key(named, shift, alt, ctrl)
+}
+
+/// Maps an ASCII letter to its Ctrl control byte (Ctrl+A=0x01 .. Ctrl+Z=0x1a),
+/// case-insensitively. Returns None for any non-letter.
+fn ctrl_letter_byte(ch: char) -> Option<u8> {
+    if ch.is_ascii_alphabetic() {
+        Some((ch.to_ascii_uppercase() as u8) - 0x40)
+    } else {
+        None
+    }
 }
 
 pub(crate) fn encode_named_key(named: NamedKey, shift: bool, alt: bool, ctrl: bool) -> Option<Vec<u8>> {
@@ -896,5 +986,135 @@ mod tests {
         assert_eq!(named_to_egui_key(NamedKey::PageDown), Some(egui::Key::PageDown));
         assert_eq!(named_to_egui_key(NamedKey::Insert), Some(egui::Key::Insert));
         assert_eq!(named_to_egui_key(NamedKey::Delete), Some(egui::Key::Delete));
+    }
+
+    #[test]
+    fn alt_screen_passthrough_matches_only_nav_combos() {
+        let ctrl = egui::Modifiers { ctrl: true, ..Default::default() };
+        // The three Linux nav bindings on plain Ctrl are passthrough candidates.
+        assert!(is_alt_screen_passthrough(Action::FocusNext, egui::Key::Tab, ctrl));
+        assert!(is_alt_screen_passthrough(Action::PrevTab, egui::Key::PageUp, ctrl));
+        assert!(is_alt_screen_passthrough(Action::NextTab, egui::Key::PageDown, ctrl));
+        // Right action, wrong key -> not a passthrough.
+        assert!(!is_alt_screen_passthrough(Action::FocusNext, egui::Key::PageUp, ctrl));
+        // Right action + key but an extra modifier (not plain Ctrl) -> false.
+        let ctrl_shift = egui::Modifiers { ctrl: true, shift: true, ..Default::default() };
+        assert!(!is_alt_screen_passthrough(Action::FocusNext, egui::Key::Tab, ctrl_shift));
+        // A non-nav action on Ctrl+Tab -> false.
+        assert!(!is_alt_screen_passthrough(Action::Paste, egui::Key::Tab, ctrl));
+    }
+
+    #[test]
+    fn alt_screen_uses_focused_not_any_target() {
+        let ctrl = egui::Modifiers { ctrl: true, ..Default::default() };
+        // M3: the passthrough decision is driven by the FOCUSED pane's
+        // alt-screen flag, not by any (e.g. background broadcast) target. With
+        // the focused pane NOT in alt-screen, the nav binding is consumed even
+        // though a background target may be in alt-screen.
+        assert!(should_consume_binding(Action::FocusNext, egui::Key::Tab, ctrl, false));
+        // With the focused pane IN alt-screen, the same nav binding passes through.
+        assert!(!should_consume_binding(Action::FocusNext, egui::Key::Tab, ctrl, true));
+        // A non-nav binding is consumed even when the focused pane is alt-screen.
+        assert!(should_consume_binding(Action::Paste, egui::Key::V, ctrl, true));
+    }
+
+    #[test]
+    fn classify_keys_alt_screen_passes_only_nav_bindings() {
+        let bindings = BindingTable::new(true);
+        let ctrl = egui::Modifiers { ctrl: true, ..Default::default() };
+        let ctrl_shift = egui::Modifiers { ctrl: true, shift: true, ..Default::default() };
+        // Focused pane in alt-screen: Ctrl+Tab (FocusNext) passes through to the
+        // child (consumed=false, no action), while Ctrl+Shift+C (Copy) is still
+        // consumed normally.
+        let (actions, consumed) = classify_keys(
+            &bindings,
+            &[(egui::Key::Tab, ctrl), (egui::Key::C, ctrl_shift)],
+            true,
+        );
+        assert_eq!(actions, vec![Action::Copy]);
+        assert_eq!(consumed, vec![false, true]);
+    }
+
+    #[test]
+    fn classify_keys_off_alt_screen_consumes_nav_and_passes_unbound() {
+        let bindings = BindingTable::new(true);
+        let ctrl = egui::Modifiers { ctrl: true, ..Default::default() };
+        let none = egui::Modifiers::default();
+        // Not alt-screen: Ctrl+Tab is consumed as FocusNext; a plain unbound key
+        // (A) falls through to the child (consumed=false, no action).
+        let (actions, consumed) = classify_keys(
+            &bindings,
+            &[(egui::Key::Tab, ctrl), (egui::Key::A, none)],
+            false,
+        );
+        assert_eq!(actions, vec![Action::FocusNext]);
+        assert_eq!(consumed, vec![true, false]);
+    }
+
+    #[test]
+    fn ctrl_letter_byte_maps_az_and_rejects_nonletters() {
+        assert_eq!(ctrl_letter_byte('c'), Some(0x03));
+        assert_eq!(ctrl_letter_byte('a'), Some(0x01));
+        assert_eq!(ctrl_letter_byte('z'), Some(0x1a));
+        assert_eq!(ctrl_letter_byte('C'), Some(0x03));
+        assert_eq!(ctrl_letter_byte('6'), None);
+        assert_eq!(ctrl_letter_byte('['), None);
+    }
+
+    #[test]
+    fn encode_paste_normalizes_crlf_and_lf_to_cr() {
+        // CRLF is collapsed before bare LF, so "\r\n" -> "\r" (not "\r\r").
+        assert_eq!(encode_paste("a\r\nb\nc", false), b"a\rb\rc".to_vec());
+    }
+
+    #[test]
+    fn encode_paste_wraps_in_bracketed_markers() {
+        assert_eq!(
+            encode_paste("a\nb", true),
+            b"\x1b[200~a\rb\x1b[201~".to_vec()
+        );
+        // No markers when bracketed paste is off.
+        assert_eq!(encode_paste("x", false), b"x".to_vec());
+    }
+
+    #[test]
+    fn focus_event_bytes_gates_on_focus_in_out() {
+        // Mode off -> nothing emitted, regardless of focus direction.
+        assert_eq!(focus_event_bytes(TermMode::empty(), true), None);
+        assert_eq!(focus_event_bytes(TermMode::empty(), false), None);
+        // Mode on -> CSI I on focus-in, CSI O on focus-out.
+        assert_eq!(
+            focus_event_bytes(TermMode::FOCUS_IN_OUT, true),
+            Some(b"\x1b[I".to_vec())
+        );
+        assert_eq!(
+            focus_event_bytes(TermMode::FOCUS_IN_OUT, false),
+            Some(b"\x1b[O".to_vec())
+        );
+    }
+
+    #[test]
+    fn cmd_named_key_yields_no_bytes() {
+        // M9 regression: Cmd/Super + a Named key must be an inert shortcut, not
+        // leak the key's legacy sequence. The named-key path returns None when
+        // mac_cmd is set, so encode_raw_key falls through to a byte-less key.
+        for named in [
+            NamedKey::ArrowLeft,
+            NamedKey::Backspace,
+            NamedKey::Enter,
+            NamedKey::ArrowUp,
+            NamedKey::ArrowDown,
+        ] {
+            assert_eq!(named_logical_key_bytes(named, true, false, false, false), None);
+        }
+        // Without Cmd, the same keys still produce their normal legacy bytes.
+        assert_eq!(
+            named_logical_key_bytes(NamedKey::ArrowLeft, false, false, false, false),
+            Some(b"\x1b[D".to_vec())
+        );
+        assert_eq!(
+            named_logical_key_bytes(NamedKey::Enter, false, false, false, false),
+            Some(b"\r".to_vec())
+        );
     }
 }

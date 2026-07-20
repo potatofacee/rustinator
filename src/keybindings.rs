@@ -21,6 +21,7 @@ pub enum Action {
     Paste,
     OpenPrefs,
     ToggleZoom,
+    ScaledZoom,
     ToggleBroadcast,
     ToggleSearch,
     ZoomIn,
@@ -53,6 +54,19 @@ pub enum Action {
     ToggleReadOnly,
     SetTitle,
     OpenTerminalHere,
+    GroupAll,
+    UngroupAll,
+    GroupTab,
+    UngroupTab,
+    UngroupWin,
+    BroadcastOff,
+    BroadcastGroup,
+    BroadcastAll,
+    InsertNumber,
+    InsertPadded,
+    NextProfile,
+    PreviousProfile,
+    LayoutLauncher,
 }
 
 impl Action {
@@ -70,6 +84,7 @@ impl Action {
             "paste" => Action::Paste,
             "open_prefs" => Action::OpenPrefs,
             "toggle_zoom" => Action::ToggleZoom,
+            "scaled_zoom" => Action::ScaledZoom,
             "toggle_broadcast" => Action::ToggleBroadcast,
             "toggle_search" => Action::ToggleSearch,
             "zoom_in" => Action::ZoomIn,
@@ -111,6 +126,19 @@ impl Action {
             "toggle_read_only" => Action::ToggleReadOnly,
             "set_title" => Action::SetTitle,
             "open_terminal_here" => Action::OpenTerminalHere,
+            "group_all" => Action::GroupAll,
+            "ungroup_all" => Action::UngroupAll,
+            "group_tab" => Action::GroupTab,
+            "ungroup_tab" => Action::UngroupTab,
+            "ungroup_win" => Action::UngroupWin,
+            "broadcast_off" => Action::BroadcastOff,
+            "broadcast_group" => Action::BroadcastGroup,
+            "broadcast_all" => Action::BroadcastAll,
+            "insert_number" => Action::InsertNumber,
+            "insert_padded" => Action::InsertPadded,
+            "next_profile" => Action::NextProfile,
+            "previous_profile" => Action::PreviousProfile,
+            "layout_launcher" => Action::LayoutLauncher,
             _ => return None,
         })
     }
@@ -292,7 +320,7 @@ fn linux_defaults() -> Vec<(String, Action)> {
         ("Ctrl+Shift+T".into(), Action::NewTab),             // new_tab
         ("Ctrl+Shift+I".into(), Action::NewWindow),          // new_window
         // ("Super+I", Action::NewTerminator),         // new_terminator — not implemented
-        // ("Alt+L", Action::LayoutLauncher),          // layout_launcher — not implemented
+        ("Alt+L".into(), Action::LayoutLauncher),            // layout_launcher
 
         // ── Navigation (focus) ───────────────────────────────────────
         ("Ctrl+Tab".into(), Action::FocusNext),              // cycle_next
@@ -322,7 +350,7 @@ fn linux_defaults() -> Vec<(String, Action)> {
         // ── Zoom & fullscreen ────────────────────────────────────────
         ("F11".into(), Action::ToggleFullscreen),             // full_screen
         ("Ctrl+Shift+X".into(), Action::ToggleZoom),          // toggle_zoom
-        // ("Ctrl+Shift+Z", Action::ScaledZoom),       // scaled_zoom — not implemented
+        ("Ctrl+Shift+Z".into(), Action::ScaledZoom),          // scaled_zoom
         ("Ctrl+Shift+Alt+A".into(), Action::HideWindow),
         ("Ctrl+Equals".into(), Action::ZoomIn),               // zoom_in (Ctrl+Plus)
         ("Ctrl+Shift+Equals".into(), Action::ZoomIn),         // zoom_in (shifted = literal +)
@@ -346,19 +374,17 @@ fn linux_defaults() -> Vec<(String, Action)> {
 
         // ── Scrollbar & profiles ─────────────────────────────────────
         ("Ctrl+Shift+S".into(), Action::ToggleScrollbar),
-        // ("", Action::NextProfile),                   // next_profile — not implemented
-        // ("", Action::PreviousProfile),               // previous_profile — not implemented
+        // next_profile / previous_profile stay UNBOUND by default (Terminator
+        // parity; reachable via the right-click "Profiles" radio submenu).
 
         // ── Grouping & broadcasting ──────────────────────────────────
-        ("Ctrl+Shift+B".into(), Action::ToggleBroadcast),     // (rustinator toggle — Terminator uses separate scopes)
-        // ("Super+G", Action::GroupAll),               // group_all — not implemented
-        // ("Super+Shift+G", Action::UngroupAll),       // ungroup_all — not implemented
-        // ("Super+T", Action::GroupTab),               // group_tab — not implemented
-        // ("Super+Shift+T", Action::UngroupTab),       // ungroup_tab — not implemented
-        // ("Super+Shift+W", Action::UngroupWin),       // ungroup_win — not implemented
-        // ("", Action::BroadcastOff),                  // broadcast_off — not implemented
-        // ("", Action::BroadcastGroup),                // broadcast_group — not implemented
-        // ("", Action::BroadcastAll),                  // broadcast_all — not implemented
+        ("Ctrl+Shift+B".into(), Action::ToggleBroadcast),     // 3-way cycle Off->Group->All (rustinator-only; Terminator uses unbound scopes)
+        ("Super+G".into(), Action::GroupAll),                 // group_all
+        ("Super+Shift+G".into(), Action::UngroupAll),         // ungroup_all
+        ("Super+T".into(), Action::GroupTab),                 // group_tab
+        ("Super+Shift+T".into(), Action::UngroupTab),         // ungroup_tab
+        ("Super+Shift+W".into(), Action::UngroupWin),         // ungroup_win
+        // broadcast_off/group/all stay UNBOUND (Terminator parity; menu radio items)
 
         // ── Title editing ────────────────────────────────────────────
         // ("Ctrl+Alt+W", Action::EditWindowTitle),     // edit_window_title — not implemented
@@ -366,8 +392,8 @@ fn linux_defaults() -> Vec<(String, Action)> {
         // ("Ctrl+Alt+X", Action::EditTerminalTitle),   // edit_terminal_title — not implemented
 
         // ── Terminal index insert ────────────────────────────────────
-        // ("Super+1", Action::InsertNumber),           // insert_number — not implemented
-        // ("Super+0", Action::InsertPadded),           // insert_padded — not implemented
+        ("Super+1".into(), Action::InsertNumber),             // insert_number
+        ("Super+0".into(), Action::InsertPadded),             // insert_padded
 
         // ── Preferences & help ───────────────────────────────────────
         // ("", Action::OpenPrefs),                     // preferences — unbound in Terminator
@@ -865,9 +891,8 @@ mod tests {
 
     // Gap #15: scaled zoom (distinct from maximize)
     #[test]
-    #[ignore = "gap #15: Action::ScaledZoom not yet implemented"]
     fn action_scaled_zoom() {
-        assert!(Action::from_str("scaled_zoom").is_some());
+        assert_eq!(Action::from_str("scaled_zoom"), Some(Action::ScaledZoom));
     }
 
     #[test]
@@ -883,6 +908,34 @@ mod tests {
     #[test]
     fn action_toggle_scrollbar() {
         assert!(Action::from_str("toggle_scrollbar").is_some());
+    }
+
+    // Profile cycling: both parse from their config strings. Unbound by default
+    // (Terminator parity), so there is no default-binding assertion.
+    #[test]
+    fn action_next_previous_profile() {
+        assert_eq!(Action::from_str("next_profile"), Some(Action::NextProfile));
+        assert_eq!(
+            Action::from_str("previous_profile"),
+            Some(Action::PreviousProfile)
+        );
+    }
+
+    // Gap #4: Layout Launcher (Terminator's Alt+L). Parses from its config
+    // string and is bound to Alt+L in the Linux defaults.
+    #[test]
+    fn action_layout_launcher() {
+        assert_eq!(
+            Action::from_str("layout_launcher"),
+            Some(Action::LayoutLauncher)
+        );
+    }
+
+    #[test]
+    fn binding_alt_l_layout_launcher() {
+        let table = BindingTable::new(true);
+        let mods = egui::Modifiers { alt: true, ..Default::default() };
+        assert_eq!(table.lookup(egui::Key::L, mods), Some(Action::LayoutLauncher));
     }
 
     // Gap #27: insert terminal number
@@ -901,16 +954,42 @@ mod tests {
 
     // Gap #13: broadcast scopes (all/group/off)
     #[test]
-    #[ignore = "gap #13: Action::BroadcastAll/Group/Off not yet implemented"]
     fn action_broadcast_scopes() {
         assert!(Action::from_str("broadcast_all").is_some());
         assert!(Action::from_str("broadcast_group").is_some());
         assert!(Action::from_str("broadcast_off").is_some());
     }
 
+    // Gap #13: the 7 group/insert actions get Linux default binds at the exact
+    // Super+ combos Terminator uses (config.py:184-199). Super maps to mac_cmd
+    // in our Mods, so look them up with mac_cmd set under force_linux=true.
+    #[test]
+    fn defaults_include_grouping_super_binds() {
+        let table = BindingTable::new(true);
+        let cmd = egui::Modifiers { mac_cmd: true, ..Default::default() };
+        let cmd_shift = egui::Modifiers { mac_cmd: true, shift: true, ..Default::default() };
+        assert_eq!(table.lookup(egui::Key::G, cmd), Some(Action::GroupAll));
+        assert_eq!(table.lookup(egui::Key::G, cmd_shift), Some(Action::UngroupAll));
+        assert_eq!(table.lookup(egui::Key::T, cmd), Some(Action::GroupTab));
+        assert_eq!(table.lookup(egui::Key::T, cmd_shift), Some(Action::UngroupTab));
+        assert_eq!(table.lookup(egui::Key::W, cmd_shift), Some(Action::UngroupWin));
+        assert_eq!(table.lookup(egui::Key::Num1, cmd), Some(Action::InsertNumber));
+        assert_eq!(table.lookup(egui::Key::Num0, cmd), Some(Action::InsertPadded));
+    }
+
+    // The 3 broadcast scopes stay UNBOUND by default (Terminator parity; menu
+    // radio items only).
+    #[test]
+    fn broadcast_scopes_unbound_by_default() {
+        let bound: Vec<Action> = linux_defaults().into_iter().map(|(_, a)| a).collect();
+        assert!(!bound.contains(&Action::BroadcastOff));
+        assert!(!bound.contains(&Action::BroadcastGroup));
+        assert!(!bound.contains(&Action::BroadcastAll));
+    }
+
     // Gap #13: default bindings for broadcast scopes
     #[test]
-    #[ignore = "gap #13: default broadcast scope keybindings not yet added"]
+    #[ignore = "gap #13: broadcast scopes are intentionally unbound (Terminator parity)"]
     fn defaults_include_broadcast_scopes() {
         let defs = linux_defaults();
         let actions: Vec<_> = defs.iter().map(|(_, a)| a).collect();
@@ -941,5 +1020,198 @@ mod tests {
             .collect();
         let got = table.combo_for(Action::SplitHorizontal).unwrap();
         assert!(combos.contains(&got), "unexpected combo {got}");
+    }
+
+    // ── Dispatch-coverage guard ───────────────────────────────────────
+    // Every dispatchable Action must be reachable from either a default key
+    // binding or the right-click context menu. This guards the planned
+    // action-dispatch unification: if a future change drops both the binding
+    // and the menu entry for an Action, this test fails.
+
+    /// Every `Action` variant, exactly once (parameterized `SwitchToTab` has a
+    /// single representative). The exhaustiveness guard below makes adding a new
+    /// variant a compile error until it is listed here, so the list cannot
+    /// silently fall out of sync with the enum.
+    fn all_actions() -> Vec<Action> {
+        // Compile-time exhaustiveness guard: a new Action variant breaks this
+        // match and forces an update to the list below.
+        fn _assert_exhaustive(a: Action) {
+            match a {
+                Action::SplitHorizontal
+                | Action::SplitVertical
+                | Action::ClosePane
+                | Action::NewTab
+                | Action::NextTab
+                | Action::PrevTab
+                | Action::FocusNext
+                | Action::FocusPrev
+                | Action::Copy
+                | Action::Paste
+                | Action::OpenPrefs
+                | Action::ToggleZoom
+                | Action::ScaledZoom
+                | Action::ToggleBroadcast
+                | Action::ToggleSearch
+                | Action::ZoomIn
+                | Action::ZoomOut
+                | Action::ZoomReset
+                | Action::CloseWindow
+                | Action::ToggleFullscreen
+                | Action::ResizeLeft
+                | Action::ResizeRight
+                | Action::ResizeUp
+                | Action::ResizeDown
+                | Action::ResetTerminal
+                | Action::ResetClear
+                | Action::NewWindow
+                | Action::QuitHotkeyWindow
+                | Action::MoveTabLeft
+                | Action::MoveTabRight
+                | Action::SwitchToTab(_)
+                | Action::GoUp
+                | Action::GoDown
+                | Action::GoLeft
+                | Action::GoRight
+                | Action::GoNext
+                | Action::GoPrev
+                | Action::RotateCW
+                | Action::RotateCCW
+                | Action::SplitAuto
+                | Action::ToggleScrollbar
+                | Action::HideWindow
+                | Action::ToggleReadOnly
+                | Action::SetTitle
+                | Action::OpenTerminalHere
+                | Action::GroupAll
+                | Action::UngroupAll
+                | Action::GroupTab
+                | Action::UngroupTab
+                | Action::UngroupWin
+                | Action::BroadcastOff
+                | Action::BroadcastGroup
+                | Action::BroadcastAll
+                | Action::InsertNumber
+                | Action::InsertPadded
+                | Action::NextProfile
+                | Action::PreviousProfile
+                | Action::LayoutLauncher => {}
+            }
+        }
+        vec![
+            Action::SplitHorizontal,
+            Action::SplitVertical,
+            Action::ClosePane,
+            Action::NewTab,
+            Action::NextTab,
+            Action::PrevTab,
+            Action::FocusNext,
+            Action::FocusPrev,
+            Action::Copy,
+            Action::Paste,
+            Action::OpenPrefs,
+            Action::ToggleZoom,
+            Action::ScaledZoom,
+            Action::ToggleBroadcast,
+            Action::ToggleSearch,
+            Action::ZoomIn,
+            Action::ZoomOut,
+            Action::ZoomReset,
+            Action::CloseWindow,
+            Action::ToggleFullscreen,
+            Action::ResizeLeft,
+            Action::ResizeRight,
+            Action::ResizeUp,
+            Action::ResizeDown,
+            Action::ResetTerminal,
+            Action::ResetClear,
+            Action::NewWindow,
+            Action::QuitHotkeyWindow,
+            Action::MoveTabLeft,
+            Action::MoveTabRight,
+            Action::SwitchToTab(1),
+            Action::GoUp,
+            Action::GoDown,
+            Action::GoLeft,
+            Action::GoRight,
+            Action::GoNext,
+            Action::GoPrev,
+            Action::RotateCW,
+            Action::RotateCCW,
+            Action::SplitAuto,
+            Action::ToggleScrollbar,
+            Action::HideWindow,
+            Action::ToggleReadOnly,
+            Action::SetTitle,
+            Action::OpenTerminalHere,
+            Action::GroupAll,
+            Action::UngroupAll,
+            Action::GroupTab,
+            Action::UngroupTab,
+            Action::UngroupWin,
+            Action::BroadcastOff,
+            Action::BroadcastGroup,
+            Action::BroadcastAll,
+            Action::InsertNumber,
+            Action::InsertPadded,
+            Action::NextProfile,
+            Action::PreviousProfile,
+            Action::LayoutLauncher,
+        ]
+    }
+
+    /// Actions reachable from the right-click context menu. Mirrors the
+    /// `action_menu_item` entries in `pane_ui::build_context_menu`.
+    fn context_menu_actions() -> Vec<Action> {
+        vec![
+            Action::Copy,
+            Action::Paste,
+            Action::SplitHorizontal,
+            Action::SplitVertical,
+            Action::SplitAuto,
+            Action::ToggleZoom,
+            Action::ToggleReadOnly,
+            // The 3 broadcast scopes replace the old single ToggleBroadcast item
+            // in the per-pane context menu (`broadcast_and_group_menu`).
+            // ToggleBroadcast leaves the menu but stays bound to Ctrl+Shift+B.
+            Action::BroadcastOff,
+            Action::BroadcastGroup,
+            Action::BroadcastAll,
+            Action::SetTitle,
+            Action::OpenTerminalHere,
+            Action::ClosePane,
+            Action::NewTab,
+            Action::OpenPrefs,
+        ]
+    }
+
+    #[test]
+    fn every_action_reachable_via_binding_or_menu() {
+        use std::collections::HashSet;
+        let bound: HashSet<Action> = linux_defaults().into_iter().map(|(_, a)| a).collect();
+        let menu: HashSet<Action> = context_menu_actions().into_iter().collect();
+        for action in all_actions() {
+            // Explicit allowlist of intentionally unbound, non-menu actions:
+            //  - SwitchToTab(n): unbound by default (Terminator parity);
+            //    reachable only via user keybindings.
+            //  - QuitHotkeyWindow: dispatched by the dedicated hotkey window,
+            //    not the main binding table or pane menu.
+            //  - NextProfile/PreviousProfile: unbound by default (Terminator
+            //    parity); switched via the right-click "Profiles" submenu, not
+            //    these Actions.
+            if matches!(
+                action,
+                Action::SwitchToTab(_)
+                    | Action::QuitHotkeyWindow
+                    | Action::NextProfile
+                    | Action::PreviousProfile
+            ) {
+                continue;
+            }
+            assert!(
+                bound.contains(&action) || menu.contains(&action),
+                "Action {action:?} is unreachable: not in default linux bindings, \
+                 not in the context menu, and not in the intentional allowlist"
+            );
+        }
     }
 }

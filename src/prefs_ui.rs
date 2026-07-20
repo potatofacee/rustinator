@@ -205,6 +205,61 @@ fn draw_prefs_global(ui: &mut egui::Ui, cfg: &mut Config) {
                 .weak(),
         );
     }
+
+    prefs_tabs_group(ui, cfg);
+}
+
+// Tab-bar settings, mirroring Terminator's tab options. Bound directly to the
+// GlobalConfig fields; defaults (Top / homogeneous / close-button / append /
+// no-scroll) reproduce current behavior. Factored out of draw_prefs_global so
+// that fn stays well under 100 lines.
+fn prefs_tabs_group(ui: &mut egui::Ui, cfg: &mut Config) {
+    ui.add_space(16.0);
+    ui.heading("Tabs");
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        ui.label("Position");
+        egui::ComboBox::from_id_salt("tab_position")
+            .selected_text(match cfg.global.tab_position {
+                config::TabPosition::Top => "Top",
+                config::TabPosition::Bottom => "Bottom",
+                config::TabPosition::Left => "Left",
+                config::TabPosition::Right => "Right",
+                config::TabPosition::Hidden => "Hidden",
+            })
+            .show_ui(ui, |ui| {
+                use config::TabPosition;
+                ui.selectable_value(&mut cfg.global.tab_position, TabPosition::Top, "Top");
+                ui.selectable_value(&mut cfg.global.tab_position, TabPosition::Bottom, "Bottom");
+                ui.selectable_value(&mut cfg.global.tab_position, TabPosition::Left, "Left");
+                ui.selectable_value(&mut cfg.global.tab_position, TabPosition::Right, "Right");
+                ui.selectable_value(&mut cfg.global.tab_position, TabPosition::Hidden, "Hidden");
+            });
+    });
+    ui.checkbox(&mut cfg.global.homogeneous, "Equal-width tabs");
+    ui.checkbox(&mut cfg.global.close_button_on_tab, "Show close button on tabs");
+    ui.checkbox(
+        &mut cfg.global.new_tab_after_current,
+        "Open new tabs after the current tab",
+    );
+    ui.checkbox(
+        &mut cfg.global.scroll_tabbar,
+        "Scrollable tab bar (scroll when tabs overflow)",
+    );
+}
+
+// Remove `profiles[*selected]`, keeping the active-profile pointer valid and
+// clamping the selected index. Caller must guarantee `profiles.len() > 1` so a
+// survivor remains. Pure index/active fixup extracted from the delete button so
+// it can be unit-tested without egui.
+fn delete_profile(cfg: &mut Config, selected: &mut usize) {
+    let removed = cfg.profiles.remove(*selected);
+    if cfg.active_profile == removed.name {
+        cfg.active_profile = cfg.profiles[0].name.clone();
+    }
+    if *selected >= cfg.profiles.len() {
+        *selected = cfg.profiles.len() - 1;
+    }
 }
 
 fn draw_prefs_profiles(
@@ -244,13 +299,7 @@ fn draw_prefs_profiles(
                     .on_hover_text("Delete selected profile")
                     .clicked()
                 {
-                    let removed = cfg.profiles.remove(*selected);
-                    if cfg.active_profile == removed.name {
-                        cfg.active_profile = cfg.profiles[0].name.clone();
-                    }
-                    if *selected >= cfg.profiles.len() {
-                        *selected = cfg.profiles.len() - 1;
-                    }
+                    delete_profile(cfg, selected);
                 }
             });
         });
@@ -512,6 +561,7 @@ fn draw_prefs_keybindings(ui: &mut egui::Ui, bindings: &BindingTable) {
             (Action::MoveTabLeft, "Move tab left"),
             (Action::MoveTabRight, "Move tab right"),
             (Action::ToggleZoom, "Maximize pane"),
+            (Action::ScaledZoom, "Zoom pane (scaled font)"),
             (Action::ToggleBroadcast, "Toggle broadcast"),
             (Action::ToggleReadOnly, "Toggle read-only"),
             (Action::ToggleScrollbar, "Toggle scrollbar"),
@@ -683,4 +733,60 @@ fn ansi_palette_preview(ui: &mut egui::Ui, profile: &config::Profile) {
             .small()
             .weak(),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg_with(names: &[&str], active: &str) -> Config {
+        let mut cfg = Config::default();
+        cfg.profiles = names.iter().map(|n| config::Profile::new_named(n)).collect();
+        cfg.active_profile = active.to_string();
+        cfg
+    }
+
+    #[test]
+    fn delete_profile_keeps_active_valid_and_clamps_selected() {
+        // Deleting the active profile in the middle repoints active to a
+        // survivor and leaves selected pointing at a valid index.
+        let mut cfg = cfg_with(&["A", "B", "C"], "B");
+        let mut selected = 1usize;
+        delete_profile(&mut cfg, &mut selected);
+        assert_eq!(
+            cfg.profiles.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            ["A", "C"]
+        );
+        // Active "B" was removed -> repointed to profiles[0] = "A".
+        assert_eq!(cfg.active_profile, "A");
+        // selected (1) still in range of the 2 remaining profiles.
+        assert!(selected < cfg.profiles.len());
+        assert_eq!(selected, 1);
+
+        // Deleting the last profile clamps selected to the new last index.
+        let mut cfg = cfg_with(&["A", "B", "C"], "A");
+        let mut selected = 2usize;
+        delete_profile(&mut cfg, &mut selected);
+        assert_eq!(
+            cfg.profiles.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            ["A", "B"]
+        );
+        // Active "A" untouched (it was not the one removed).
+        assert_eq!(cfg.active_profile, "A");
+        // selected clamped from 2 (now OOB) down to the last valid index 1.
+        assert_eq!(selected, 1);
+        assert!(selected < cfg.profiles.len());
+
+        // Deleting down to a single survivor clamps selected to 0 and the
+        // active pointer remains valid.
+        let mut cfg = cfg_with(&["A", "B"], "B");
+        let mut selected = 1usize;
+        delete_profile(&mut cfg, &mut selected);
+        assert_eq!(
+            cfg.profiles.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            ["A"]
+        );
+        assert_eq!(cfg.active_profile, "A");
+        assert_eq!(selected, 0);
+    }
 }
