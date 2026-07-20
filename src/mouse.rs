@@ -103,8 +103,9 @@ pub fn encode(
         let suffix = if matches!(kind, MouseKind::Release) { 'm' } else { 'M' };
         Some(format!("\x1b[<{};{};{}{}", cb, col1, row1, suffix).into_bytes())
     } else {
-        // Legacy X10 / normal tracking. Release uses button code 3.
-        let cb_out = if matches!(kind, MouseKind::Release) { 3 } else { cb };
+        // Legacy X10 / normal tracking. Release uses button code 3 but keeps the
+        // shift/alt/ctrl modifier bits (matching xterm/alacritty: `3 + mods`).
+        let cb_out = if matches!(kind, MouseKind::Release) { 3 | (cb & (4 | 8 | 16)) } else { cb };
         let cb_byte = (cb_out + 32).min(255) as u8;
         // Clamp the 1-based coordinate to 223 (223 + 32 = 255) before adding the
         // 32 offset, so positions beyond 223 saturate at the max cell rather than
@@ -121,6 +122,37 @@ mod tests {
 
     fn sgr_mode() -> TermMode {
         TermMode::MOUSE_REPORT_CLICK | TermMode::SGR_MOUSE
+    }
+
+    fn legacy_mode() -> TermMode {
+        TermMode::MOUSE_REPORT_CLICK
+    }
+
+    #[test]
+    fn encode_legacy_x10_press_and_release_offsets() {
+        let mods = MouseMods { shift: false, alt: false, ctrl: false };
+        // Press Left at (0,0): cb=0, +32 offset on every byte; col1=row1=1, +32 = 33.
+        let press = encode(MouseKind::Press, MouseButton::Left, 0, 0, mods, legacy_mode()).unwrap();
+        assert_eq!(press, vec![0x1b, b'[', b'M', 32, 33, 33]);
+
+        // Release forces button code 3, +32 = 35; coords unchanged.
+        let release = encode(MouseKind::Release, MouseButton::Left, 0, 0, mods, legacy_mode()).unwrap();
+        assert_eq!(release, vec![0x1b, b'[', b'M', 35, 33, 33]);
+
+        // L1: a release with Alt held keeps the alt bit (3 | 8 = 11), +32 = 43,
+        // rather than discarding the modifier and emitting bare 3.
+        let alt = MouseMods { shift: false, alt: true, ctrl: false };
+        let alt_release = encode(MouseKind::Release, MouseButton::Left, 0, 0, alt, legacy_mode()).unwrap();
+        assert_eq!(alt_release, vec![0x1b, b'[', b'M', 43, 33, 33]);
+    }
+
+    #[test]
+    fn encode_legacy_x10_clamps_coords_at_255() {
+        let mods = MouseMods { shift: false, alt: false, ctrl: false };
+        // col 300 -> col1=301, clamped to 223, +32 = 255 (the max byte).
+        // row 7 -> row1=8, +32 = 40.
+        let bytes = encode(MouseKind::Press, MouseButton::Left, 300, 7, mods, legacy_mode()).unwrap();
+        assert_eq!(bytes, vec![0x1b, b'[', b'M', 32, 255, 40]);
     }
 
     #[test]

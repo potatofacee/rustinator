@@ -20,6 +20,7 @@ use egui;
 use crate::font::FontStyle;
 use crate::keyboard;
 use crate::mouse::{self, MouseButton, MouseKind, MouseMods};
+use crate::profile::{ProfileName, SpawnCommand};
 
 pub type PaneId = u64;
 
@@ -137,6 +138,60 @@ fn resolve_color(
         }),
     };
     rgb_to_f32(rgb.r, rgb.g, rgb.b)
+}
+
+/// Layer the per-cell SGR attributes onto a resolved (fg, bg) pair, returning
+/// the final colors. Order: INVERSE swap, then DIM, then HIDDEN, then the
+/// selection / block-cursor inversion.
+///
+/// DIM is applied *before* HIDDEN so a HIDDEN+DIM cell still satisfies the
+/// conceal invariant `fg == bg` exactly; dimming after concealing would leave
+/// `fg = 0.66*bg`, leaking the concealed glyph at ~66% brightness. (M8)
+///
+/// `selection_bg` / `selection_fg` are honored independently: a configured
+/// `selection_fg` is applied even when `selection_bg` is unset (the classic
+/// invert path), instead of being dropped. (L3)
+fn apply_cell_attrs(
+    mut fg: [f32; 4],
+    mut bg: [f32; 4],
+    flags: Flags,
+    is_selected: bool,
+    is_cursor: bool,
+    selection_bg: Option<[u8; 3]>,
+    selection_fg: Option<[u8; 3]>,
+) -> ([f32; 4], [f32; 4]) {
+    if flags.contains(Flags::INVERSE) {
+        std::mem::swap(&mut fg, &mut bg);
+    }
+    if flags.contains(Flags::DIM) {
+        fg[0] *= 0.66;
+        fg[1] *= 0.66;
+        fg[2] *= 0.66;
+    }
+    if flags.contains(Flags::HIDDEN) {
+        fg = bg;
+    }
+    if is_selected && !is_cursor {
+        // Profile selection colors when set; classic invert otherwise.
+        match selection_bg {
+            Some([r, g, b]) => {
+                bg = rgb_to_f32(r, g, b);
+                if let Some([r, g, b]) = selection_fg {
+                    fg = rgb_to_f32(r, g, b);
+                }
+            }
+            None => {
+                std::mem::swap(&mut fg, &mut bg);
+                // Honor selection_fg even without a selection_bg (L3).
+                if let Some([r, g, b]) = selection_fg {
+                    fg = rgb_to_f32(r, g, b);
+                }
+            }
+        }
+    } else if is_cursor {
+        std::mem::swap(&mut fg, &mut bg);
+    }
+    (fg, bg)
 }
 
 #[derive(Clone)]
@@ -441,6 +496,73 @@ fn is_url_boundary(c: char) -> bool {
         )
 }
 
+/// Case-insensitive (ASCII) prefix test, used to match URL scheme / `www`
+/// literals so `HTTPS://`, `Mailto:`, `WWW.` are recognized. alacritty/iTerm2
+/// match schemes case-insensitively (M7).
+fn starts_with_ignore_case(haystack: &[char], prefix: &[char]) -> bool {
+    haystack.len() >= prefix.len()
+        && haystack
+            .iter()
+            .zip(prefix)
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
+}
+
+/// Forward-scan a URL body from `start`, returning the exclusive end index.
+/// Stops at the first URL boundary, but balances parentheses the way alacritty
+/// does: a `)` is kept inside the URL while an earlier unmatched `(` is still
+/// open, and only ends the span when it has no matching `(`. (M6)
+fn scan_span_end(chars: &[char], start: usize) -> usize {
+    let mut depth: u32 = 0;
+    let mut j = start;
+    while j < chars.len() {
+        match chars[j] {
+            '(' => depth += 1,
+            ')' if depth > 0 => depth -= 1,
+            c if is_url_boundary(c) => break,
+            _ => {}
+        }
+        j += 1;
+    }
+    j
+}
+
+/// L7: drop a single trailing sentence-punctuation char (`. ! ? ,`) from a
+/// matched span `[start, end)`, returning the adjusted exclusive end. Never
+/// strips into the required scheme/`www` prefix (`min_len` chars), so a bare
+/// `https://` is never produced.
+fn strip_trailing_punct(chars: &[char], start: usize, end: usize, min_len: usize) -> usize {
+    if end > start + min_len + 1 && matches!(chars[end - 1], '.' | '!' | '?' | ',') {
+        end - 1
+    } else {
+        end
+    }
+}
+
+/// Build the parallel (chars, source-column) arrays for a single row's URL
+/// scan from cells already sorted by column. Drops the blank WIDE_CHAR_SPACER
+/// cell that follows each double-width glyph so a wide char does not read as a
+/// space (URL boundary) mid-URL. (L6) Each input tuple is `(col, char, wide)`,
+/// where `wide` marks the base cell of a double-width glyph.
+fn row_scan_arrays(sorted: &[(i32, char, bool)]) -> (Vec<char>, Vec<i32>) {
+    let mut chars = Vec::with_capacity(sorted.len());
+    let mut cols = Vec::with_capacity(sorted.len());
+    let mut prev: Option<(i32, bool)> = None;
+    for &(col, c, wide) in sorted {
+        if let Some((pcol, pwide)) = prev {
+            if pwide && c == ' ' && col == pcol + 1 {
+                // WIDE_CHAR_SPACER: skip it. Keep `prev` non-wide so a second
+                // blank can't be swallowed by the same wide base.
+                prev = Some((col, false));
+                continue;
+            }
+        }
+        chars.push(c);
+        cols.push(col);
+        prev = Some((col, wide));
+    }
+    (chars, cols)
+}
+
 // Match URLs within a single row's cells, already sorted by column.
 // `chars`/`col_lookup` are parallel arrays (char and its source column).
 fn match_urls_in_row(row: i32, chars: &[char], col_lookup: &[i32], out: &mut Vec<UrlMatch>) {
@@ -454,57 +576,58 @@ fn match_urls_in_row(row: i32, chars: &[char], col_lookup: &[i32], out: &mut Vec
     let mut i = 0;
     while i < chars.len() {
         let rest = &chars[i..];
-        let matched = if rest.starts_with(&https) {
+        let matched = if starts_with_ignore_case(rest, &https) {
             Some(https.len())
-        } else if rest.starts_with(&http) {
+        } else if starts_with_ignore_case(rest, &http) {
             Some(http.len())
-        } else if rest.starts_with(&mailto) {
+        } else if starts_with_ignore_case(rest, &mailto) {
             Some(mailto.len())
-        } else if rest.starts_with(&file) {
+        } else if starts_with_ignore_case(rest, &file) {
             Some(file.len())
-        } else if rest.starts_with(&ssh) {
+        } else if starts_with_ignore_case(rest, &ssh) {
             Some(ssh.len())
-        } else if rest.starts_with(&ftp) {
+        } else if starts_with_ignore_case(rest, &ftp) {
             Some(ftp.len())
         } else {
             None
         };
 
         if let Some(prefix_len) = matched {
-            let mut j = i;
-            while j < chars.len() && !is_url_boundary(chars[j]) {
-                j += 1;
-            }
-            if j > i + prefix_len {
-                let url: String = chars[i..j].iter().collect();
+            let scanned = scan_span_end(chars, i);
+            if scanned > i + prefix_len {
+                let end = strip_trailing_punct(chars, i, scanned, prefix_len);
+                let url: String = chars[i..end].iter().collect();
                 out.push(UrlMatch {
                     row,
                     start_col: col_lookup[i],
-                    end_col: col_lookup[j - 1] + 1,
+                    end_col: col_lookup[end - 1] + 1,
                     url,
                     is_hyperlink: false,
                 });
-                i = j;
+                i = scanned;
                 continue;
             }
         }
 
-        // Bare www. detection
-        if chars[i] == 'w' && rest.len() >= 4 && rest[1] == 'w' && rest[2] == 'w' && rest[3] == '.' {
-            let mut j = i + 4;
-            while j < chars.len() && !is_url_boundary(chars[j]) {
-                j += 1;
-            }
-            if j > i + 4 {
-                let url: String = chars[i..j].iter().collect();
+        // Bare www. detection (case-insensitive prefix; M7).
+        if rest.len() >= 4
+            && rest[0].eq_ignore_ascii_case(&'w')
+            && rest[1].eq_ignore_ascii_case(&'w')
+            && rest[2].eq_ignore_ascii_case(&'w')
+            && rest[3] == '.'
+        {
+            let scanned = scan_span_end(chars, i);
+            if scanned > i + 4 {
+                let end = strip_trailing_punct(chars, i, scanned, 4);
+                let url: String = chars[i..end].iter().collect();
                 out.push(UrlMatch {
                     row,
                     start_col: col_lookup[i],
-                    end_col: col_lookup[j - 1] + 1,
+                    end_col: col_lookup[end - 1] + 1,
                     url,
                     is_hyperlink: false,
                 });
-                i = j;
+                i = scanned;
                 continue;
             }
         }
@@ -528,11 +651,13 @@ fn match_urls_in_row(row: i32, chars: &[char], col_lookup: &[i32], out: &mut Vec
                         if domain_ok {
                             let abs_j = i + at_offset + 1 + domain_end;
                             let email_start = i;
-                            let url: String = chars[email_start..abs_j].iter().collect();
+                            // Drop a trailing sentence dot, e.g. "...@a.com." (L7).
+                            let end = strip_trailing_punct(chars, email_start, abs_j, at_offset + 1);
+                            let url: String = chars[email_start..end].iter().collect();
                             out.push(UrlMatch {
                                 row,
                                 start_col: col_lookup[email_start],
-                                end_col: col_lookup[abs_j - 1] + 1,
+                                end_col: col_lookup[end - 1] + 1,
                                 url,
                                 is_hyperlink: false,
                             });
@@ -551,17 +676,19 @@ fn match_urls_in_row(row: i32, chars: &[char], col_lookup: &[i32], out: &mut Vec
 #[cfg(test)]
 fn scan_urls(cells: &[CellSnapshot]) -> Vec<UrlMatch> {
     // Group cells by row in their emitted order.
-    let mut by_row: std::collections::BTreeMap<i32, Vec<(i32, char)>> =
+    let mut by_row: std::collections::BTreeMap<i32, Vec<(i32, char, bool)>> =
         std::collections::BTreeMap::new();
     for cell in cells {
-        by_row.entry(cell.row).or_default().push((cell.col, cell.c));
+        by_row
+            .entry(cell.row)
+            .or_default()
+            .push((cell.col, cell.c, cell.wide));
     }
 
     let mut out = Vec::new();
     for (row, mut cols) in by_row {
-        cols.sort_by_key(|&(c, _)| c);
-        let chars: Vec<char> = cols.iter().map(|&(_, c)| c).collect();
-        let col_lookup: Vec<i32> = cols.iter().map(|&(c, _)| c).collect();
+        cols.sort_by_key(|&(c, _, _)| c);
+        let (chars, col_lookup) = row_scan_arrays(&cols);
         match_urls_in_row(row, &chars, &col_lookup, &mut out);
     }
     out
@@ -606,17 +733,66 @@ pub(crate) fn scan_url_at(cells: &[CellSnapshot], row: i32, col: i32) -> Option<
         }
     }
 
-    // Fallback: heuristic URL matching.
-    let mut cols: Vec<(i32, char)> =
-        row_cells.iter().map(|c| (c.col, c.c)).collect();
-    cols.sort_by_key(|&(c, _)| c);
-    let chars: Vec<char> = cols.iter().map(|&(_, c)| c).collect();
-    let col_lookup: Vec<i32> = cols.iter().map(|&(c, _)| c).collect();
+    // Fallback: heuristic URL matching. Drop WIDE_CHAR_SPACER cells so a wide
+    // glyph doesn't read as a space mid-URL (L6).
+    let mut cols: Vec<(i32, char, bool)> =
+        row_cells.iter().map(|c| (c.col, c.c, c.wide)).collect();
+    cols.sort_by_key(|&(c, _, _)| c);
+    let (chars, col_lookup) = row_scan_arrays(&cols);
 
     let mut out = Vec::new();
     match_urls_in_row(row, &chars, &col_lookup, &mut out);
     out.into_iter()
         .find(|u| col >= u.start_col && col < u.end_col)
+}
+
+/// Resolve the working directory for a (re)spawned child: the explicitly
+/// requested directory if any, otherwise `$HOME`. The `$HOME` fallback matters
+/// on a macOS .app launched from the Dock, which inherits cwd `/` from launchd;
+/// a fresh shell (or a respawn) should start at the user's home, not root. Used
+/// by both `spawn` and `respawn` so a restarted pane no longer lands in `/`.
+/// (M11)
+fn resolve_working_dir(requested: Option<&std::path::Path>) -> Option<std::path::PathBuf> {
+    if let Some(dir) = requested {
+        Some(dir.to_path_buf())
+    } else {
+        std::env::var("HOME").ok().map(std::path::PathBuf::from)
+    }
+}
+
+/// Resolve a profile's [`SpawnCommand`] onto the child PTY options, shared by
+/// `spawn` and `respawn` so both follow one command path (replacing the old
+/// hardcoded login-shell block). Same "one helper for spawn + respawn" pattern
+/// as `resolve_working_dir`.
+///
+/// `program: None` means "the platform's default shell":
+/// - Linux/BSD: `$SHELL` (or `/bin/sh`), run with the profile's `args` — so the
+///   default profile reproduces today's `$SHELL --login`, and a custom command
+///   runs as `$SHELL -c <cmd>`.
+/// - macOS: an interactive shell is left unset so `tty::Options::default()`
+///   keeps using `/usr/bin/login` (today's macOS login path); only a custom
+///   command (`args == ["-c", …]`, per the `SpawnCommand` contract) overrides
+///   it with `$SHELL -c <cmd>`. This reproduces today's macOS spawn exactly for
+///   the default profile.
+///
+/// An explicit `program` is honored verbatim on every platform.
+fn apply_spawn_command(opts: &mut tty::Options, cmd: &SpawnCommand) {
+    if let Some(program) = &cmd.program {
+        opts.shell = Some(tty::Shell::new(program.clone(), cmd.args.clone()));
+        return;
+    }
+    // program == None: the platform default shell.
+    #[cfg(target_os = "macos")]
+    {
+        // macOS runs interactive shells through /usr/bin/login (today's path),
+        // so leave opts.shell unset for them; only a custom command forces
+        // $SHELL -c. Falls through to the $SHELL block below when it does.
+        if cmd.args.first().map(String::as_str) != Some("-c") {
+            return;
+        }
+    }
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+    opts.shell = Some(tty::Shell::new(shell, cmd.args.clone()));
 }
 
 pub struct Pane {
@@ -650,6 +826,20 @@ pub struct Pane {
     pub pending_clipboard_store: Arc<Mutex<Option<String>>>,
     pub read_only: bool,
     pub scrollbar_visible: bool,
+    /// Group identity: a group NAME string, or None when ungrouped (mirroring
+    /// Terminator's `terminal.group`). The name is the identity. Runtime-only;
+    /// survives respawn because respawn mutates `&mut self` in place. All
+    /// grouping/broadcast logic lives in `groups.rs`.
+    pub group: Option<String>,
+    /// The profile NAME this pane was spawned with or live-switched to (the
+    /// identity string, like `Config.active_profile`). Runtime-only; survives
+    /// respawn because respawn mutates `&mut self` in place and never resets it.
+    pub profile: ProfileName,
+    /// The resolved spawn command for `profile`, stamped at spawn and reused by
+    /// `respawn` to rebuild the child without re-reading `Config` (the reaper
+    /// loop holds none). A profile switch updates it so a later respawn uses the
+    /// new profile's command. Survives respawn for the same in-place reason.
+    pub spawn_command: SpawnCommand,
     /// True once the child process has exited and the pane is being held open
     /// (ExitAction::Hold). Distinct from the transient `exited` event flag:
     /// `exited` fires the Exit *event* once and is consumed by the reaper,
@@ -672,6 +862,8 @@ impl Pane {
         defaults: PaneDefaults,
         winit_proxy: Option<winit::event_loop::EventLoopProxy<crate::window::UserEvent>>,
         working_dir: Option<&std::path::Path>,
+        profile: ProfileName,
+        spawn_command: SpawnCommand,
     ) -> Result<Self, String> {
         let window_size = WindowSize {
             num_lines: lines as u16,
@@ -696,11 +888,7 @@ impl Pane {
         let terminal = Arc::new(FairMutex::new(term));
 
         let mut pty_opts = tty::Options::default();
-        #[cfg(not(target_os = "macos"))]
-        {
-            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-            pty_opts.shell = Some(tty::Shell::new(shell, vec!["--login".into()]));
-        }
+        apply_spawn_command(&mut pty_opts, &spawn_command);
         pty_opts.env.insert("TERM".into(), "xterm-256color".into());
         pty_opts.env.insert("COLORTERM".into(), "truecolor".into());
         pty_opts.env.insert("TERM_PROGRAM".into(), "rustinator".into());
@@ -708,13 +896,7 @@ impl Pane {
         pty_opts.env.insert("CLICOLOR_FORCE".into(), "1".into());
         crate::shell_integration::inject_env(&mut pty_opts.env);
         ensure_utf8_locale(&mut pty_opts.env);
-        if let Some(dir) = working_dir {
-            pty_opts.working_directory = Some(dir.to_path_buf());
-        } else if let Ok(home) = std::env::var("HOME") {
-            // A macOS .app launched from Finder/Dock inherits cwd `/` from launchd.
-            // Default a fresh shell (no inherited pane cwd) to $HOME instead of root.
-            pty_opts.working_directory = Some(std::path::PathBuf::from(home));
-        }
+        pty_opts.working_directory = resolve_working_dir(working_dir);
         let pty = tty::new(&pty_opts, window_size, id)
             .map_err(|e| format!("failed to open pty: {e}"))?;
         let child_pid = pty.child().id();
@@ -757,6 +939,9 @@ impl Pane {
             pending_clipboard_store,
             read_only: false,
             scrollbar_visible: true,
+            group: None,
+            profile,
+            spawn_command,
             dead: Cell::new(false),
             pty_handle,
         })
@@ -801,11 +986,10 @@ impl Pane {
         let terminal = Arc::new(FairMutex::new(term));
 
         let mut pty_opts = tty::Options::default();
-        #[cfg(not(target_os = "macos"))]
-        {
-            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-            pty_opts.shell = Some(tty::Shell::new(shell, vec!["--login".into()]));
-        }
+        // Reuse the command resolved at spawn time. The reaper loop holds no
+        // Config, and a dead pane may carry a different profile than the active
+        // one, so re-resolving here would risk the wrong command. (§5/§6)
+        apply_spawn_command(&mut pty_opts, &self.spawn_command);
         pty_opts.env.insert("TERM".into(), "xterm-256color".into());
         pty_opts.env.insert("COLORTERM".into(), "truecolor".into());
         pty_opts.env.insert("TERM_PROGRAM".into(), "rustinator".into());
@@ -813,6 +997,10 @@ impl Pane {
         pty_opts.env.insert("CLICOLOR_FORCE".into(), "1".into());
         crate::shell_integration::inject_env(&mut pty_opts.env);
         ensure_utf8_locale(&mut pty_opts.env);
+        // Same cwd resolution as spawn: requested dir -> $HOME fallback. Without
+        // this a Dock-launched .app respawns the shell at `/` instead of $HOME.
+        // (M11)
+        pty_opts.working_directory = resolve_working_dir(None);
         let pty = tty::new(&pty_opts, window_size, self.id)
             .map_err(|e| format!("failed to open pty: {e}"))?;
         let child_pid = pty.child().id();
@@ -966,9 +1154,8 @@ impl Pane {
     }
 
     pub fn send_focus_event(&self, focused: bool) {
-        if self.mode().contains(TermMode::FOCUS_IN_OUT) {
-            let seq = if focused { b"\x1b[I" } else { b"\x1b[O" };
-            self.send_bytes(seq.to_vec());
+        if let Some(bytes) = crate::input::focus_event_bytes(self.mode(), focused) {
+            self.send_bytes(bytes);
         }
     }
 
@@ -1136,22 +1323,12 @@ impl Pane {
     /// Send pasted text, wrapping in bracketed-paste sequences when the term
     /// has BRACKETED_PASTE enabled.
     pub fn send_paste(&self, text: &str) {
-        let fixed = text.replace("\r\n", "\r").replace('\n', "\r");
         let bracketed = self
             .terminal
             .lock()
             .mode()
             .contains(TermMode::BRACKETED_PASTE);
-        let bytes = if bracketed {
-            let mut v = Vec::with_capacity(fixed.len() + 12);
-            v.extend_from_slice(b"\x1b[200~");
-            v.extend_from_slice(fixed.as_bytes());
-            v.extend_from_slice(b"\x1b[201~");
-            v
-        } else {
-            fixed.into_bytes()
-        };
-        self.send_bytes(bytes);
+        self.send_bytes(crate::input::encode_paste(text, bracketed));
     }
 
     pub fn snapshot(&self) -> Frame {
@@ -1176,10 +1353,15 @@ impl Pane {
         let cursor_row = content.cursor.point.line.0 + display_offset;
         let selection = content.selection;
 
-        let cursor_color = {
-            let [r, g, b] = self.defaults.cursor;
-            [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0]
-        };
+        // Cursor color: honor a dynamic OSC-12 override (palette[Cursor]) and
+        // fall back to the profile default. resolve_color already does exactly
+        // that — palette entry first, else named_default(Cursor) = defaults.cursor. (L4)
+        let cursor_color = resolve_color(
+            Color::Named(NamedColor::Cursor),
+            palette,
+            true,
+            &self.defaults,
+        );
         // The snapshot has no focus / blink state, so it cannot know whether a
         // SOLID block cursor is actually being shown for this pane (an
         // unfocused or blink-off block is downgraded to a hollow outline in
@@ -1225,38 +1407,22 @@ impl Pane {
                 continue;
             }
             let col = indexed.point.column.0 as i32;
-            let mut fg = resolve_color(indexed.cell.fg, palette, true, &self.defaults);
-            let mut bg = resolve_color(indexed.cell.bg, palette, false, &self.defaults);
+            let fg_base = resolve_color(indexed.cell.fg, palette, true, &self.defaults);
+            let bg_base = resolve_color(indexed.cell.bg, palette, false, &self.defaults);
             let flags = indexed.cell.flags;
-            if flags.contains(Flags::INVERSE) {
-                std::mem::swap(&mut fg, &mut bg);
-            }
-            if flags.contains(Flags::HIDDEN) {
-                fg = bg;
-            }
-            if flags.contains(Flags::DIM) {
-                fg[0] *= 0.66;
-                fg[1] *= 0.66;
-                fg[2] *= 0.66;
-            }
             let is_cursor = cursor_invert_at_cell && col == cursor_col && row == cursor_row;
             let is_selected = selection
                 .map(|s| s.contains(indexed.point))
                 .unwrap_or(false);
-            if is_selected && !is_cursor {
-                // Profile selection colors when set; classic invert otherwise.
-                match self.defaults.selection_bg {
-                    Some([r, g, b]) => {
-                        bg = rgb_to_f32(r, g, b);
-                        if let Some([r, g, b]) = self.defaults.selection_fg {
-                            fg = rgb_to_f32(r, g, b);
-                        }
-                    }
-                    None => std::mem::swap(&mut fg, &mut bg),
-                }
-            } else if is_cursor {
-                std::mem::swap(&mut fg, &mut bg);
-            }
+            let (fg, bg) = apply_cell_attrs(
+                fg_base,
+                bg_base,
+                flags,
+                is_selected,
+                is_cursor,
+                self.defaults.selection_bg,
+                self.defaults.selection_fg,
+            );
             let style = match (flags.contains(Flags::BOLD), flags.contains(Flags::ITALIC)) {
                 (true, true) => FontStyle::BoldItalic,
                 (true, false) => FontStyle::Bold,
@@ -1573,6 +1739,90 @@ mod tests {
         };
         let cluster: Vec<char> = std::iter::once(cell.c).chain(cell.zerowidth.iter().copied()).collect();
         assert_eq!(cluster, vec!['e', '\u{0301}']);
+    }
+
+    // A throwaway WindowSize for constructing an EventProxy in isolation. The
+    // size never matters to these tests — only the atomic flags do.
+    fn test_window_size() -> WindowSize {
+        WindowSize {
+            num_lines: 24,
+            num_cols: 80,
+            cell_width: 8,
+            cell_height: 16,
+        }
+    }
+
+    #[test]
+    fn event_proxy_wakeup_coalesces_dirty_and_new_output() {
+        // No real winit proxy: the None path means wake() is a no-op, so we
+        // observe the coalescing latch (wake_pending) directly rather than
+        // counting Repaint events.
+        let proxy = EventProxy::new(None, test_window_size());
+        // new() arms dirty (initial paint); clear the flags we are about to
+        // assert Wakeup sets, so the assertions can't pass on the initial state.
+        proxy.dirty.store(false, Ordering::Release);
+        proxy.has_new_output.store(false, Ordering::Release);
+        proxy.wake_pending.store(false, Ordering::Release);
+
+        // First Wakeup sets dirty + has_new_output and arms the wake latch.
+        proxy.send_event(Event::Wakeup);
+        assert!(proxy.dirty.load(Ordering::Acquire), "Wakeup must set dirty");
+        assert!(
+            proxy.has_new_output.load(Ordering::Acquire),
+            "Wakeup must set has_new_output"
+        );
+        assert!(
+            proxy.wake_pending.load(Ordering::Acquire),
+            "Wakeup must arm wake_pending"
+        );
+
+        // Sustained output: further Wakeups while the latch is held coalesce —
+        // wake_pending stays armed and is not re-cleared, so at most one
+        // Repaint is in flight for this pane until a frame consumes it.
+        proxy.send_event(Event::Wakeup);
+        proxy.send_event(Event::Wakeup);
+        assert!(
+            proxy.wake_pending.load(Ordering::Acquire),
+            "coalesced Wakeups keep wake_pending armed"
+        );
+
+        // Pane::frame() disarms the latch when it snapshots the pane (mirrors
+        // the wake_pending.store(false) at the top of frame()), re-arming the
+        // pane to wake once more for the next burst of output.
+        proxy.wake_pending.store(false, Ordering::Release);
+        proxy.send_event(Event::Wakeup);
+        assert!(
+            proxy.wake_pending.load(Ordering::Acquire),
+            "Wakeup after a frame re-arms wake_pending"
+        );
+    }
+
+    #[test]
+    fn event_proxy_exit_sets_exited_only() {
+        let proxy = EventProxy::new(None, test_window_size());
+        // Clear the initial-paint flags so we can prove Exit leaves them alone.
+        proxy.dirty.store(false, Ordering::Release);
+        proxy.has_new_output.store(false, Ordering::Release);
+        proxy.wake_pending.store(false, Ordering::Release);
+
+        proxy.send_event(Event::Exit);
+
+        assert!(
+            proxy.exited.load(Ordering::Acquire),
+            "Exit must set the exited flag"
+        );
+        assert!(
+            !proxy.dirty.load(Ordering::Acquire),
+            "Exit must not set dirty"
+        );
+        assert!(
+            !proxy.has_new_output.load(Ordering::Acquire),
+            "Exit must not set has_new_output"
+        );
+        assert!(
+            !proxy.wake_pending.load(Ordering::Acquire),
+            "Exit must not arm wake_pending"
+        );
     }
 
     #[test]
@@ -2120,5 +2370,329 @@ mod tests {
     fn point_from_grid_negative_col_clamps() {
         let p = point_from_grid(-1, 0, 0);
         assert_eq!(p.column, Column(0));
+    }
+
+    // ---- apply_cell_attrs (INVERSE / DIM / HIDDEN / selection layering) ----
+
+    #[test]
+    fn apply_cell_attrs_inverse_hidden_selection_layering() {
+        let fg = [0.1, 0.2, 0.3, 1.0];
+        let bg = [0.4, 0.5, 0.6, 1.0];
+
+        // INVERSE swaps fg/bg.
+        let (f, b) = apply_cell_attrs(fg, bg, Flags::INVERSE, false, false, None, None);
+        assert_eq!(f, bg, "INVERSE: fg becomes the cell bg");
+        assert_eq!(b, fg, "INVERSE: bg becomes the cell fg");
+
+        // INVERSE | HIDDEN: after the swap, HIDDEN sets fg=bg, so fg==bg== the
+        // post-swap bg (the original fg). Conceal invariant holds.
+        let (f, b) =
+            apply_cell_attrs(fg, bg, Flags::INVERSE | Flags::HIDDEN, false, false, None, None);
+        assert_eq!(f, b, "HIDDEN must leave fg==bg");
+        assert_eq!(f, fg, "post-INVERSE bg is the original fg");
+
+        // HIDDEN | DIM: DIM runs BEFORE HIDDEN, so a concealed+dim cell ends
+        // fg==bg exactly (no 0.66*bg leak). (M8)
+        let (f, b) = apply_cell_attrs(fg, bg, Flags::HIDDEN | Flags::DIM, false, false, None, None);
+        assert_eq!(f, b, "HIDDEN+DIM must still conceal: fg==bg");
+        assert_eq!(f, bg, "concealed fg equals the cell bg, not a dimmed bg");
+
+        // Selected, no profile selection_bg -> classic invert.
+        let (f, b) = apply_cell_attrs(fg, bg, Flags::empty(), true, false, None, None);
+        assert_eq!(f, bg);
+        assert_eq!(b, fg);
+
+        // Selected, both profile selection colors set -> profile colors win.
+        let sel_bg = [10, 20, 30];
+        let sel_fg = [200, 210, 220];
+        let (f, b) =
+            apply_cell_attrs(fg, bg, Flags::empty(), true, false, Some(sel_bg), Some(sel_fg));
+        assert_eq!(b, rgb_to_f32(10, 20, 30));
+        assert_eq!(f, rgb_to_f32(200, 210, 220));
+
+        // Selected, selection_bg but no selection_fg -> keep the cell's fg.
+        let (f, b) = apply_cell_attrs(fg, bg, Flags::empty(), true, false, Some(sel_bg), None);
+        assert_eq!(b, rgb_to_f32(10, 20, 30));
+        assert_eq!(f, fg, "no selection_fg -> keep cell fg");
+
+        // L3: selection_fg set but selection_bg unset -> invert for the bg,
+        // apply selection_fg for the fg (previously dropped).
+        let (f, b) = apply_cell_attrs(fg, bg, Flags::empty(), true, false, None, Some(sel_fg));
+        assert_eq!(b, fg, "no selection_bg -> bg is the inverted cell fg");
+        assert_eq!(
+            f,
+            rgb_to_f32(200, 210, 220),
+            "selection_fg honored even without selection_bg"
+        );
+
+        // A block cursor cell inverts and ignores selection colors.
+        let (f, b) =
+            apply_cell_attrs(fg, bg, Flags::empty(), true, true, Some(sel_bg), Some(sel_fg));
+        assert_eq!(f, bg, "cursor cell inverts, not selection-colored");
+        assert_eq!(b, fg);
+    }
+
+    // ---- resolve_color fallbacks ----
+
+    #[test]
+    fn resolve_color_fallbacks_when_palette_unset() {
+        let defaults = PaneDefaults::default();
+        let palette = alacritty_terminal::term::color::Colors::default(); // all None
+
+        let bg = rgb_to_f32(defaults.bg[0], defaults.bg[1], defaults.bg[2]);
+        let fg = rgb_to_f32(defaults.fg[0], defaults.fg[1], defaults.fg[2]);
+
+        // Named Background -> profile bg.
+        assert_eq!(
+            resolve_color(Color::Named(NamedColor::Background), &palette, false, &defaults),
+            bg
+        );
+        // Named Foreground used AS a background (is_fg=false) -> bg, not fg.
+        assert_eq!(
+            resolve_color(Color::Named(NamedColor::Foreground), &palette, false, &defaults),
+            bg
+        );
+        // Named Foreground used as foreground -> fg.
+        assert_eq!(
+            resolve_color(Color::Named(NamedColor::Foreground), &palette, true, &defaults),
+            fg
+        );
+        // Indexed 196 -> 6x6x6 cube pure red.
+        assert_eq!(
+            resolve_color(Color::Indexed(196), &palette, true, &defaults),
+            [1.0, 0.0, 0.0, 1.0]
+        );
+    }
+
+    #[test]
+    fn resolve_color_cursor_prefers_osc12_over_default() {
+        let defaults = PaneDefaults::default();
+        // No OSC-12 -> profile cursor default (what snapshot now falls back to). (L4)
+        let palette = alacritty_terminal::term::color::Colors::default();
+        assert_eq!(
+            resolve_color(Color::Named(NamedColor::Cursor), &palette, true, &defaults),
+            rgb_to_f32(defaults.cursor[0], defaults.cursor[1], defaults.cursor[2]),
+        );
+        // OSC-12 sets palette[Cursor]; the live override wins. (L4)
+        let mut palette = alacritty_terminal::term::color::Colors::default();
+        palette[NamedColor::Cursor] = Some(Rgb { r: 255, g: 0, b: 0 });
+        assert_eq!(
+            resolve_color(Color::Named(NamedColor::Cursor), &palette, true, &defaults),
+            [1.0, 0.0, 0.0, 1.0],
+        );
+    }
+
+    // ---- scan_url_at hit-testing ----
+
+    #[test]
+    fn scan_url_at_runspan_middle_click_bounded_by_distinct_uris() {
+        // OSC-8 run A spans cols 2..=6; the neighbors carry *different* URIs, so
+        // the run must extend left and right only over URI-A cells.
+        let uri_a = "https://run-a.example".to_string();
+        let uri_left = "https://left.example".to_string();
+        let uri_right = "https://right.example".to_string();
+        let mut cells = cells_from_str(0, "AABBBBBCC"); // cols 0..=8
+        for cell in cells.iter_mut() {
+            cell.hyperlink = Some(match cell.col {
+                0 | 1 => uri_left.clone(),
+                2..=6 => uri_a.clone(),
+                _ => uri_right.clone(),
+            });
+        }
+        let m = scan_url_at(&cells, 0, 4).expect("col 4 is inside run A");
+        assert!(m.is_hyperlink);
+        assert_eq!(m.url, uri_a);
+        assert_eq!(m.start_col, 2, "run extends left to URI-A start");
+        assert_eq!(m.end_col, 7, "run extends right to URI-A end (exclusive)");
+    }
+
+    #[test]
+    fn scan_url_at_explicit_hyperlink_beats_heuristic() {
+        // The row text is itself a heuristic-matchable URL, but one cell also
+        // carries an explicit OSC-8 link. The explicit URI must take precedence
+        // and yield a single-cell span (only that cell carries the link).
+        let uri = "https://explicit.test/page".to_string();
+        let mut cells = cells_from_str(0, "https://heuristic.example");
+        let click_col = 10i32;
+        cells[click_col as usize].hyperlink = Some(uri.clone());
+
+        let m = scan_url_at(&cells, 0, click_col).expect("should match");
+        assert!(m.is_hyperlink, "explicit OSC-8 link wins over the heuristic");
+        assert_eq!(m.url, uri);
+        assert_eq!(m.start_col, click_col);
+        assert_eq!(m.end_col, click_col + 1);
+    }
+
+    #[test]
+    fn scan_url_at_picks_correct_url_among_multiple_and_boundary_space_none() {
+        // "https://a.com https://bb.com": URL A cols 0..=12, space col 13,
+        // URL B cols 14..=27.
+        let cells = cells_from_str(0, "https://a.com https://bb.com");
+        let a = scan_url_at(&cells, 0, 8).expect("col 8 inside URL A");
+        assert_eq!(a.url, "https://a.com");
+        let b = scan_url_at(&cells, 0, 20).expect("col 20 inside URL B");
+        assert_eq!(b.url, "https://bb.com");
+        assert!(
+            scan_url_at(&cells, 0, 13).is_none(),
+            "the boundary space matches no URL"
+        );
+    }
+
+    // ---- email span columns ----
+
+    #[test]
+    fn match_urls_email_span_columns_exact() {
+        let cells = cells_from_str(0, "x user@a.com");
+        let urls = scan_urls(&cells);
+        assert_eq!(urls.len(), 1);
+        assert_eq!(urls[0].url, "user@a.com");
+        assert_eq!(urls[0].start_col, 2);
+        assert_eq!(urls[0].end_col, 12);
+    }
+
+    // ---- M6: balanced parentheses kept inside the URL ----
+
+    #[test]
+    fn scan_urls_keeps_balanced_parens() {
+        let cells = cells_from_str(0, "see https://en.wikipedia.org/wiki/Foo_(bar)_baz end");
+        let urls = scan_urls(&cells);
+        assert_eq!(urls.len(), 1);
+        assert_eq!(urls[0].url, "https://en.wikipedia.org/wiki/Foo_(bar)_baz");
+        // An unmatched trailing ')' is still a boundary (see existing
+        // scan_urls_stops_at_boundary), so this is balance, not "ignore ')'".
+    }
+
+    // ---- M7: scheme / www matched case-insensitively ----
+
+    #[test]
+    fn scan_urls_scheme_and_www_case_insensitive() {
+        let cells = cells_from_str(0, "visit HTTPS://EXAMPLE.COM now");
+        let urls = scan_urls(&cells);
+        assert_eq!(urls.len(), 1);
+        assert_eq!(urls[0].url, "HTTPS://EXAMPLE.COM");
+
+        let cells = cells_from_str(0, "go WWW.Example.com now");
+        let urls = scan_urls(&cells);
+        assert_eq!(urls.len(), 1);
+        assert_eq!(urls[0].url, "WWW.Example.com");
+    }
+
+    // ---- L6: wide (CJK) chars must not truncate a URL at the spacer ----
+
+    #[test]
+    fn scan_urls_wide_char_not_truncated() {
+        // "http://" then 例(wide)+spacer, え(wide)+spacer, then ".jp/x".
+        let mut cells = Vec::new();
+        for (i, c) in "http://".chars().enumerate() {
+            cells.push(wide_cell(i as i32, 0, c, false));
+        }
+        cells.push(wide_cell(7, 0, '例', true));
+        cells.push(wide_cell(8, 0, ' ', false)); // WIDE_CHAR_SPACER
+        cells.push(wide_cell(9, 0, 'え', true));
+        cells.push(wide_cell(10, 0, ' ', false)); // WIDE_CHAR_SPACER
+        for (k, c) in ".jp/x".chars().enumerate() {
+            cells.push(wide_cell(11 + k as i32, 0, c, false));
+        }
+
+        let urls = scan_urls(&cells);
+        assert_eq!(urls.len(), 1, "wide chars must not split the URL");
+        assert_eq!(urls[0].url, "http://例え.jp/x");
+    }
+
+    // ---- L7: trailing sentence punctuation stripped ----
+
+    #[test]
+    fn scan_urls_strips_trailing_period() {
+        let cells = cells_from_str(0, "See https://example.com.");
+        let urls = scan_urls(&cells);
+        assert_eq!(urls.len(), 1);
+        assert_eq!(urls[0].url, "https://example.com");
+        assert!(urls[0].url.ends_with(".com"), "mid-URL dot is preserved");
+        // end_col excludes the stripped trailing '.'.
+        assert_eq!(urls[0].end_col, 23);
+
+        // Exclamation/question are stripped too.
+        let cells = cells_from_str(0, "go https://x.io! now");
+        let urls = scan_urls(&cells);
+        assert_eq!(urls.len(), 1);
+        assert_eq!(urls[0].url, "https://x.io");
+    }
+
+    // ---- M11: working-directory resolution shared by spawn / respawn ----
+
+    #[test]
+    fn resolve_working_dir_prefers_requested_over_home() {
+        let p = std::path::Path::new("/tmp/some/dir");
+        assert_eq!(resolve_working_dir(Some(p)), Some(p.to_path_buf()));
+    }
+
+    #[test]
+    fn resolve_working_dir_falls_back_to_home() {
+        // No requested dir -> $HOME (the M11 fix respawn relies on). Mirror the
+        // environment so the test is deterministic either way.
+        match std::env::var("HOME") {
+            Ok(home) => assert_eq!(
+                resolve_working_dir(None),
+                Some(std::path::PathBuf::from(home))
+            ),
+            Err(_) => assert_eq!(resolve_working_dir(None), None),
+        }
+    }
+
+    // ---- apply_spawn_command: profile-resolved child command ----
+
+    #[test]
+    fn apply_spawn_command_explicit_program_is_honored() {
+        // An explicit program runs verbatim with its args on every platform.
+        let mut opts = tty::Options::default();
+        let cmd = SpawnCommand {
+            program: Some("/bin/dash".into()),
+            args: vec!["-c".into(), "echo hi".into()],
+        };
+        apply_spawn_command(&mut opts, &cmd);
+        assert_eq!(
+            opts.shell,
+            Some(tty::Shell::new(
+                "/bin/dash".into(),
+                vec!["-c".into(), "echo hi".into()],
+            )),
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn apply_spawn_command_default_is_login_shell() {
+        // Default profile {None, ["--login"]} reproduces today's $SHELL --login
+        // on Linux/BSD. Mirror the ambient $SHELL so the assertion is exact.
+        let mut opts = tty::Options::default();
+        let cmd = SpawnCommand { program: None, args: vec!["--login".into()] };
+        apply_spawn_command(&mut opts, &cmd);
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+        assert_eq!(opts.shell, Some(tty::Shell::new(shell, vec!["--login".into()])));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn apply_spawn_command_macos_interactive_leaves_shell_unset() {
+        // macOS interactive shells stay unset so tty uses /usr/bin/login
+        // (today's macOS path) — reproducing the default-profile spawn exactly.
+        let mut opts = tty::Options::default();
+        let cmd = SpawnCommand { program: None, args: vec!["--login".into()] };
+        apply_spawn_command(&mut opts, &cmd);
+        assert_eq!(opts.shell, None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn apply_spawn_command_macos_custom_runs_via_shell() {
+        // A custom command overrides the macOS default with $SHELL -c <cmd>.
+        let mut opts = tty::Options::default();
+        let cmd = SpawnCommand { program: None, args: vec!["-c".into(), "ls".into()] };
+        apply_spawn_command(&mut opts, &cmd);
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+        assert_eq!(
+            opts.shell,
+            Some(tty::Shell::new(shell, vec!["-c".into(), "ls".into()])),
+        );
     }
 }

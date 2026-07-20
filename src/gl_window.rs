@@ -45,6 +45,32 @@ impl GlWindow {
                 .expect("failed to create GL surface")
         };
 
+        Self::new_primary(
+            event_loop,
+            window,
+            gl_surface,
+            gl,
+            main_context,
+            viewport_id,
+            srgb_framebuffers,
+        )
+    }
+
+    /// Assemble a `GlWindow` from an already-created `window` + `gl_surface`. The
+    /// primary window's surface is created in `SharedGl::new` (via
+    /// `create_context_and_surface`), so it is passed in here rather than created.
+    /// This is also the shared tail of `new`, so secondary windows take the exact
+    /// same painter/egui setup. `srgb_framebuffers` matches the per-window painter
+    /// setting — the primary passes `true`, as the inline primary painter did.
+    pub(crate) fn new_primary(
+        event_loop: &ActiveEventLoop,
+        window: Window,
+        gl_surface: Surface<WindowSurface>,
+        gl: &Arc<glow::Context>,
+        main_context: &PossiblyCurrentContext,
+        viewport_id: egui::ViewportId,
+        srgb_framebuffers: bool,
+    ) -> Self {
         main_context
             .make_current(&gl_surface)
             .expect("failed to make context current on surface");
@@ -101,6 +127,13 @@ impl GlWindow {
         if let (Some(w), Some(h)) = (NonZeroU32::new(width), NonZeroU32::new(height)) {
             self.gl_surface.resize(main_context, w, h);
         }
+    }
+
+    /// Make the shared context current on this window's surface. Used to restore
+    /// the primary as current after a secondary window painted/destroyed on its
+    /// own surface — the role the former `GlState::make_current` filled.
+    pub(crate) fn make_current(&self, main_context: &PossiblyCurrentContext) {
+        main_context.make_current(&self.gl_surface).ok();
     }
 
     pub(crate) fn swap_buffers(&self, main_context: &PossiblyCurrentContext) {

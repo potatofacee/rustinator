@@ -40,6 +40,21 @@ pub(crate) fn color_reply(prefix: &str, [r, g, b]: [u8; 3], terminator: &str) ->
     format!("\x1b]{};rgb:{:04x}/{:04x}/{:04x}{}", prefix, c16(r), c16(g), c16(b), terminator)
 }
 
+/// Whether a `clear_screen` call should also wipe scrollback. True only when
+/// the pane preference is set, the clear is `ClearMode::All`, and we are on the
+/// primary screen (alt-screen history belongs to the primary screen).
+pub(crate) fn wipes_scrollback(clear_wipes_scrollback: bool, is_all: bool, alt_screen: bool) -> bool {
+    clear_wipes_scrollback && is_all && !alt_screen
+}
+
+/// Resolve an OSC color-query reply: the runtime override if the program set
+/// one, otherwise the profile/index default.
+pub(crate) fn resolve_query_color(override_color: Option<Rgb>, index: usize, defaults: &PaneDefaults) -> [u8; 3] {
+    override_color
+        .map(|c| [c.r, c.g, c.b])
+        .unwrap_or_else(|| default_color_for_index(index, defaults))
+}
+
 /// Default color for a query index when the program has not set an override.
 /// Indices follow vte's NamedColor layout: 0-255 are the indexed palette,
 /// 256/257/258 are Foreground/Background/Cursor. Anything else (Dim* and
@@ -205,10 +220,11 @@ impl<T: EventListener> Handler for TermHandlerProxy<'_, T> {
     // sequence is forwarded untouched.
     fn clear_screen(&mut self, mode: ClearMode) {
         // matches! instead of ==: vte's ClearMode does not derive PartialEq.
-        if self.clear_wipes_scrollback
-            && matches!(mode, ClearMode::All)
-            && !self.term.mode().contains(TermMode::ALT_SCREEN)
-        {
+        if wipes_scrollback(
+            self.clear_wipes_scrollback,
+            matches!(mode, ClearMode::All),
+            self.term.mode().contains(TermMode::ALT_SCREEN),
+        ) {
             Handler::clear_screen(self.term, ClearMode::All);
             Handler::clear_screen(self.term, ClearMode::Saved);
         } else {
@@ -290,9 +306,7 @@ impl<T: EventListener> Handler for TermHandlerProxy<'_, T> {
     // holds &mut Term during the parse. The reply is queued on the loop's own
     // channel; the poller wakes and writes it to the PTY next iteration.
     fn dynamic_color_sequence(&mut self, prefix: String, index: usize, terminator: &str) {
-        let rgb = self.term.colors()[index]
-            .map(|c| [c.r, c.g, c.b])
-            .unwrap_or_else(|| default_color_for_index(index, &self.defaults));
+        let rgb = resolve_query_color(self.term.colors()[index], index, &self.defaults);
         let reply = color_reply(&prefix, rgb, terminator);
         let _ = self.writer.send(Msg::Input(reply.into_bytes().into()));
     }
@@ -372,8 +386,44 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
-    use super::{color_reply, default_color_for_index};
+    use super::{color_reply, default_color_for_index, resolve_query_color, wipes_scrollback};
+    use alacritty_terminal::vte::ansi::Rgb;
     use crate::pane::PaneDefaults;
+
+    // ---- clear_screen scrollback-wipe predicate ----
+
+    #[test]
+    fn wipes_scrollback_true_only_for_primary_all_with_flag() {
+        // (flag, is_all, alt_screen) -> wipes? True ONLY when the pref is set,
+        // the clear is ClearMode::All, and we are on the primary screen.
+        assert!(wipes_scrollback(true, true, false));
+        // Flag off: never wipe.
+        assert!(!wipes_scrollback(false, true, false));
+        // Not ClearMode::All (e.g. Below/Above): never wipe.
+        assert!(!wipes_scrollback(true, false, false));
+        // On the alt screen: never wipe (history belongs to the primary screen).
+        assert!(!wipes_scrollback(true, true, true));
+        // Remaining combinations are all false.
+        assert!(!wipes_scrollback(false, false, false));
+        assert!(!wipes_scrollback(false, true, true));
+        assert!(!wipes_scrollback(false, false, true));
+        assert!(!wipes_scrollback(true, false, true));
+    }
+
+    // ---- OSC color-query override resolution ----
+
+    #[test]
+    fn resolve_query_color_prefers_override_else_default() {
+        let d = PaneDefaults::default();
+        // Override present: the runtime color wins over the index-257 bg default.
+        let over = Rgb { r: 0x12, g: 0x34, b: 0x56 };
+        assert_ne!(over.r, d.bg[0]);
+        assert_eq!(resolve_query_color(Some(over), 257, &d), [0x12, 0x34, 0x56]);
+        // No override: fall back to the background default for index 257.
+        assert_eq!(resolve_query_color(None, 257, &d), d.bg);
+        // No override on a palette index falls back to the palette default.
+        assert_eq!(resolve_query_color(None, 1, &d), d.palette[1]);
+    }
 
     // ---- OSC color-query replies ----
 

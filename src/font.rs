@@ -108,3 +108,65 @@ impl FontContext {
         })
     }
 }
+
+/// Font multiplier for scaled-zoom: how much bigger the same content can be
+/// drawn when a pane of `pane_w` x `pane_h` is maximized to `full_w` x `full_h`.
+/// Returns `min(full_w/pane_w, full_h/pane_h)` clamped to `>= 1.0`, and `1.0`
+/// if any dimension is non-positive. Free-standing (takes f32s, not egui types).
+pub fn scaled_zoom_factor(pane_w: f32, pane_h: f32, full_w: f32, full_h: f32) -> f32 {
+    if pane_w <= 0.0 || pane_h <= 0.0 || full_w <= 0.0 || full_h <= 0.0 {
+        return 1.0;
+    }
+    (full_w / pane_w).min(full_h / pane_h).max(1.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scaled_zoom_factor_half_width_pane() {
+        // Half width but full height: the height axis is already maxed, so the
+        // tighter axis (height, 1.0) wins -- no scale, else it would overflow.
+        assert_eq!(scaled_zoom_factor(50.0, 100.0, 100.0, 100.0), 1.0);
+    }
+
+    #[test]
+    fn scaled_zoom_factor_equal_rects_is_one() {
+        assert_eq!(scaled_zoom_factor(100.0, 100.0, 100.0, 100.0), 1.0);
+    }
+
+    #[test]
+    fn scaled_zoom_factor_uses_min_axis() {
+        // Width allows 4x, height allows 2x -> the tighter axis wins.
+        assert_eq!(scaled_zoom_factor(25.0, 50.0, 100.0, 100.0), 2.0);
+    }
+
+    #[test]
+    fn scaled_zoom_factor_never_below_one() {
+        // Pane larger than the window must not shrink the font.
+        assert_eq!(scaled_zoom_factor(200.0, 200.0, 100.0, 100.0), 1.0);
+    }
+
+    #[test]
+    fn scaled_zoom_factor_zero_or_negative_dim_is_one() {
+        assert_eq!(scaled_zoom_factor(0.0, 100.0, 100.0, 100.0), 1.0);
+        assert_eq!(scaled_zoom_factor(100.0, 0.0, 100.0, 100.0), 1.0);
+        assert_eq!(scaled_zoom_factor(100.0, 100.0, 0.0, 100.0), 1.0);
+        assert_eq!(scaled_zoom_factor(100.0, 100.0, 100.0, -5.0), 1.0);
+    }
+
+    #[test]
+    fn font_style_index_matches_all_ordering() {
+        for (expected, style) in FontStyle::ALL.iter().enumerate() {
+            assert_eq!(
+                style.index(),
+                expected,
+                "FontStyle::{:?} index {} does not match its position {} in FontStyle::ALL",
+                style,
+                style.index(),
+                expected,
+            );
+        }
+    }
+}

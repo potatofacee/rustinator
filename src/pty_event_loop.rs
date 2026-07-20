@@ -549,3 +549,124 @@ impl<T> PeekableReceiver<T> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Block A P0 safety tests: lock the PTY write loop's state machine before
+    // the Phase 4a resize-debounce refactor reroutes message cadence through it.
+
+    /// The write queue should load an item into `writing`, hand it out via
+    /// `take_current`/`goto_next`, and signal `needs_write` exactly while there
+    /// is pending work (either an in-flight `writing` or a non-empty queue).
+    #[test]
+    fn state_write_queue_load_consume_and_needs_write_cycle() {
+        let mut state = State::default();
+
+        // Empty state: nothing to write.
+        assert!(!state.needs_write());
+        assert!(state.writing.is_none());
+
+        // Enqueue two items. The queue alone is enough to need a write.
+        state.write_list.push_back(Cow::Borrowed(&b"abc"[..]));
+        state.write_list.push_back(Cow::Borrowed(&b"de"[..]));
+        assert!(state.needs_write());
+        assert!(state.writing.is_none());
+
+        // ensure_next loads the first item out of the queue into `writing`.
+        state.ensure_next();
+        assert_eq!(state.write_list.len(), 1);
+        assert_eq!(state.writing.as_ref().unwrap().remaining_bytes(), b"abc");
+
+        // ensure_next is idempotent while an item is already in flight.
+        state.ensure_next();
+        assert_eq!(state.write_list.len(), 1);
+        assert_eq!(state.writing.as_ref().unwrap().remaining_bytes(), b"abc");
+
+        // take_current removes the in-flight item; the queued item keeps the
+        // needs-write signal asserted.
+        let current = state.take_current().expect("current item");
+        assert_eq!(current.remaining_bytes(), b"abc");
+        assert!(state.writing.is_none());
+        assert!(state.needs_write());
+
+        // goto_next pulls the second item out of the queue.
+        state.goto_next();
+        assert_eq!(state.write_list.len(), 0);
+        assert_eq!(state.writing.as_ref().unwrap().remaining_bytes(), b"de");
+        assert!(state.needs_write());
+
+        // set_current can restore an in-progress item (mirrors a short write
+        // pushing the partially written item back).
+        state.set_current(Some(Writing::new(Cow::Borrowed(&b"xy"[..]))));
+        assert_eq!(state.writing.as_ref().unwrap().remaining_bytes(), b"xy");
+        assert!(state.needs_write());
+
+        // Drain the last item: both the queue and `writing` are now empty.
+        let _ = state.take_current();
+        assert!(state.writing.is_none());
+        assert!(!state.needs_write());
+
+        // ensure_next over an empty queue leaves nothing in flight.
+        state.ensure_next();
+        assert!(state.writing.is_none());
+        assert!(!state.needs_write());
+    }
+
+    /// `Writing` tracks how far through a source buffer we have written.
+    /// Partial advances narrow `remaining_bytes`; a fully written (or empty)
+    /// source reports `finished` with no remaining bytes.
+    #[test]
+    fn writing_partial_write_accounting_and_empty_source() {
+        let mut w = Writing::new(Cow::Borrowed(&b"hello"[..]));
+        assert!(!w.finished());
+        assert_eq!(w.remaining_bytes(), b"hello");
+
+        // A partial write of 2 bytes shifts the remaining window.
+        w.advance(2);
+        assert_eq!(w.remaining_bytes(), b"llo");
+        assert!(!w.finished());
+
+        // Writing the rest finishes the item with no remaining bytes.
+        w.advance(3);
+        assert_eq!(w.remaining_bytes(), b"");
+        assert!(w.finished());
+
+        // An empty source is finished immediately and yields no bytes.
+        let empty = Writing::new(Cow::Borrowed(&b""[..]));
+        assert!(empty.finished());
+        assert_eq!(empty.remaining_bytes(), b"");
+    }
+
+    /// `peek` must not consume: repeated peeks return the same head item, and a
+    /// following sequence of `recv` calls drains every item in FIFO order
+    /// (starting with the peeked one). An empty-but-connected channel returns
+    /// `None` from both without panicking.
+    #[test]
+    fn peekable_receiver_peek_nonconsuming_then_recv_drains_in_order() {
+        let (tx, rx) = mpsc::channel::<u32>();
+        let mut peekable = PeekableReceiver::new(rx);
+
+        tx.send(1).unwrap();
+        tx.send(2).unwrap();
+        tx.send(3).unwrap();
+
+        // Peeking twice returns the same head item without consuming it.
+        assert_eq!(peekable.peek(), Some(&1));
+        assert_eq!(peekable.peek(), Some(&1));
+
+        // recv drains in order, beginning with the previously peeked item.
+        assert_eq!(peekable.recv(), Some(1));
+        assert_eq!(peekable.recv(), Some(2));
+        assert_eq!(peekable.recv(), Some(3));
+
+        // Channel is empty but still connected: no item, no panic.
+        assert_eq!(peekable.peek(), None);
+        assert_eq!(peekable.recv(), None);
+
+        // Keep the sender alive so the above exercises the connected-empty path
+        // (a dropped sender would make recv panic on Disconnected).
+        drop(tx);
+    }
+}

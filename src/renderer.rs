@@ -308,23 +308,17 @@ impl Renderer {
     /// Try to allocate a rectangle in the shelf packer. If the atlas is full,
     /// reset it and retry so the caller always gets valid coordinates.
     fn shelf_alloc(&mut self, w: i32, h: i32) -> (i32, i32) {
-        if self.shelf_cursor_x + w > ATLAS_SIZE {
-            self.shelf_y += self.shelf_h;
-            self.shelf_cursor_x = 0;
-            self.shelf_h = 0;
-        }
-        if self.shelf_y + h > ATLAS_SIZE {
+        let p = shelf_place(self.shelf_y, self.shelf_cursor_x, self.shelf_h, w, h, ATLAS_SIZE);
+        if p.needs_reset {
+            // Atlas is full vertically; clear it (cache + GL) so the glyph lands
+            // at (0, 0) in a fresh atlas. reset_atlas zeroes the shelf fields,
+            // which we immediately overwrite with the post-placement state below.
             self.reset_atlas();
-            // After reset shelf_y, shelf_cursor_x, shelf_h are all 0,
-            // so the glyph will be placed at (0, 0).
         }
-        if h > self.shelf_h {
-            self.shelf_h = h;
-        }
-        let x = self.shelf_cursor_x;
-        let y = self.shelf_y;
-        self.shelf_cursor_x += w;
-        (x, y)
+        self.shelf_y = p.shelf_y;
+        self.shelf_cursor_x = p.shelf_cursor_x;
+        self.shelf_h = p.shelf_h;
+        (p.x, p.y)
     }
 
     /// Bumped every time the atlas is cleared. Callers that build a batch of
@@ -505,6 +499,64 @@ impl Drop for Renderer {
             self.gl.delete_buffer(self.glyph_instance_vbo);
             self.gl.delete_texture(self.atlas_tex);
         }
+    }
+}
+
+/// Result of placing a `w`×`h` rectangle into the shelf packer.
+struct ShelfPlacement {
+    /// Top-left of the placed rectangle.
+    x: i32,
+    y: i32,
+    /// Shelf state after the placement.
+    shelf_y: i32,
+    shelf_cursor_x: i32,
+    shelf_h: i32,
+    /// True when the rectangle overflowed the atlas vertically and the packer
+    /// restarted at the origin; the caller must clear the atlas in that case.
+    needs_reset: bool,
+}
+
+/// Pure shelf-packing placement. Given the current shelf state and a `w`×`h`
+/// rectangle, compute where it lands and the resulting shelf state, in a fresh
+/// atlas of `size`×`size`. Mirrors `shelf_alloc`'s arithmetic with no GL/state
+/// side effects so it can be unit-tested.
+fn shelf_place(
+    shelf_y: i32,
+    shelf_cursor_x: i32,
+    shelf_h: i32,
+    w: i32,
+    h: i32,
+    size: i32,
+) -> ShelfPlacement {
+    let (mut shelf_y, mut shelf_cursor_x, mut shelf_h) = (shelf_y, shelf_cursor_x, shelf_h);
+    // No room left on this shelf: wrap to a new shelf below the current one.
+    if shelf_cursor_x + w > size {
+        shelf_y += shelf_h;
+        shelf_cursor_x = 0;
+        shelf_h = 0;
+    }
+    // The new shelf would overflow the atlas: signal a reset and restart at the
+    // origin so the glyph lands at (0, 0) in a fresh atlas.
+    let mut needs_reset = false;
+    if shelf_y + h > size {
+        needs_reset = true;
+        shelf_y = 0;
+        shelf_cursor_x = 0;
+        shelf_h = 0;
+    }
+    if h > shelf_h {
+        shelf_h = h;
+    }
+    let x = shelf_cursor_x;
+    let y = shelf_y;
+    shelf_cursor_x += w;
+    ShelfPlacement {
+        x,
+        y,
+        shelf_y,
+        shelf_cursor_x,
+        shelf_h,
+        needs_reset,
     }
 }
 
@@ -700,3 +752,85 @@ void main() {
     }
 }
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shelf_place_wrap_reset_and_exact_fit() {
+        const SIZE: i32 = 100;
+
+        // Advancing within a shelf: glyph lands at the cursor, cursor advances,
+        // shelf height grows to the tallest glyph, no wrap and no reset.
+        let p = shelf_place(0, 0, 0, 10, 20, SIZE);
+        assert_eq!((p.x, p.y), (0, 0));
+        assert_eq!(p.shelf_cursor_x, 10);
+        assert_eq!(p.shelf_y, 0);
+        assert_eq!(p.shelf_h, 20);
+        assert!(!p.needs_reset);
+
+        // Exact horizontal fit: cursor_x + w == size is NOT an overflow (strict
+        // `>`), so the glyph stays on the current shelf flush against the edge.
+        let p = shelf_place(0, 90, 20, 10, 15, SIZE);
+        assert_eq!((p.x, p.y), (90, 0));
+        assert_eq!(p.shelf_cursor_x, 100);
+        assert_eq!(p.shelf_y, 0);
+        // Existing shelf is taller than this glyph, so it is unchanged.
+        assert_eq!(p.shelf_h, 20);
+        assert!(!p.needs_reset);
+
+        // Over the row width: wrap to a new shelf below (shelf_y += old shelf_h),
+        // cursor resets to 0, the new glyph defines the new shelf height.
+        let p = shelf_place(0, 95, 20, 10, 12, SIZE);
+        assert_eq!((p.x, p.y), (0, 20));
+        assert_eq!(p.shelf_cursor_x, 10);
+        assert_eq!(p.shelf_y, 20);
+        assert_eq!(p.shelf_h, 12);
+        assert!(!p.needs_reset);
+
+        // Over the atlas height: the new shelf would exceed `size`, so the packer
+        // resets to the origin and the glyph is placed at (0, 0).
+        let p = shelf_place(90, 0, 5, 10, 20, SIZE);
+        assert_eq!((p.x, p.y), (0, 0));
+        assert_eq!(p.shelf_cursor_x, 10);
+        assert_eq!(p.shelf_y, 0);
+        assert_eq!(p.shelf_h, 20);
+        assert!(p.needs_reset);
+
+        // Wrap THEN reset: cursor overflow bumps to a new shelf whose top already
+        // exceeds the atlas, forcing a reset to the origin in the same call.
+        let p = shelf_place(80, 95, 30, 10, 20, SIZE);
+        assert_eq!((p.x, p.y), (0, 0));
+        assert!(p.needs_reset);
+        assert_eq!(p.shelf_y, 0);
+        assert_eq!(p.shelf_cursor_x, 10);
+        assert_eq!(p.shelf_h, 20);
+
+        // Every placement must stay inside the atlas bounds across a sweep of
+        // shelf states and glyph sizes.
+        for &cursor_x in &[0, 50, 95, 100] {
+            for &shelf_y in &[0, 50, 95, 100] {
+                for &shelf_h in &[0, 10, 30] {
+                    for &w in &[1, 10, 100] {
+                        for &h in &[1, 10, 100] {
+                            let p = shelf_place(shelf_y, cursor_x, shelf_h, w, h, SIZE);
+                            assert!(
+                                p.x + w <= SIZE,
+                                "x overflow: x={} w={} for cx={cursor_x} sy={shelf_y} sh={shelf_h}",
+                                p.x,
+                                w
+                            );
+                            assert!(
+                                p.y + h <= SIZE,
+                                "y overflow: y={} h={} for cx={cursor_x} sy={shelf_y} sh={shelf_h}",
+                                p.y,
+                                h
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

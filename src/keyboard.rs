@@ -17,13 +17,21 @@ pub fn encode(key: egui::Key, mods: egui::Modifiers, term_mode: TermMode) -> Opt
     let code = kitty_keycode(key)?;
     let mod_byte = encode_mods(mods);
     let has_mod = mod_byte > 1;
+    // A non-Shift modifier (Ctrl/Alt/Super) makes any key ambiguous.
+    let has_non_shift_mod = mods.ctrl || mods.alt || mods.mac_cmd;
+    // Text-producing keys map to printable ASCII (space..'~'). Shift on these
+    // yields literal text (e.g. "A"), so Shift alone must NOT be CSI-u encoded.
+    // Functional/named keys (Esc, Enter, Tab, arrows, F-keys, ...) are not
+    // text-producing and stay CSI-u under any modifier.
+    let is_text_producing = (32..127).contains(&code);
 
     let emit_csi_u = if term_mode.contains(TermMode::REPORT_ALL_KEYS_AS_ESC) {
         true
     } else if term_mode.contains(TermMode::DISAMBIGUATE_ESC_CODES) {
-        // Modified keys are always ambiguous enough to warrant CSI u.
-        // Unmodified Esc is also ambiguous (Esc vs. Alt+key prefix).
-        has_mod || key == egui::Key::Escape
+        // Keys with a non-Shift modifier are ambiguous; functional keys with any
+        // modifier are too; unmodified Esc is ambiguous (Esc vs. Alt+key prefix).
+        // Shift-only text keys fall through to legacy text bytes.
+        has_non_shift_mod || (has_mod && !is_text_producing) || key == egui::Key::Escape
     } else {
         // Report event types alone doesn't enable CSI u; we'd need to track
         // key press/release events, which egui already conflates. Skip.
@@ -373,5 +381,23 @@ mod tests {
     fn unmodified_arrow_no_csi_u_in_disambiguate() {
         let mods = egui::Modifiers::default();
         assert_eq!(encode(egui::Key::ArrowUp, mods, disambiguate()), None);
+    }
+
+    #[test]
+    fn disambiguate_shift_only_printable_is_text() {
+        // Shift+A yields literal "A"; it must fall through to text, not CSI u.
+        let shift = egui::Modifiers { shift: true, ..Default::default() };
+        assert_eq!(encode(egui::Key::A, shift, disambiguate()), None);
+        // Shift+2 yields "@"; same rule for shifted symbols.
+        assert_eq!(encode(egui::Key::Num2, shift, disambiguate()), None);
+    }
+
+    #[test]
+    fn disambiguate_ctrl_still_csi_u() {
+        // A non-Shift modifier keeps printable keys CSI-u encoded.
+        let ctrl = egui::Modifiers { ctrl: true, ..Default::default() };
+        // Ctrl+A: key=97 (a), modifier byte = 1 + ctrl(4) = 5.
+        let bytes = encode(egui::Key::A, ctrl, disambiguate()).unwrap();
+        assert_eq!(bytes, b"\x1b[97;5u");
     }
 }

@@ -9,6 +9,12 @@ use crate::layout::LayoutTemplate;
 pub struct Config {
     pub global: GlobalConfig,
     pub active_profile: String,
+    // Field-level default (empty Vec) overrides the container `serde(default)`
+    // so that a config file with no `[[profiles]]` deserializes to an empty
+    // list. `migrate_legacy`/`ensure_consistent` then populate it. This lets
+    // `migrate_legacy` distinguish "no profiles supplied" from "profiles
+    // supplied" and avoid clobbering user `[[profiles]]` during legacy migration.
+    #[serde(default)]
     pub profiles: Vec<Profile>,
 
     #[serde(default)]
@@ -40,6 +46,25 @@ pub struct KeyBinding {
 pub struct SavedLayout {
     pub name: String,
     pub template: LayoutTemplate,
+    /// Per-leaf metadata sidecar, in `leaves_in_order` order. Empty for old
+    /// layouts (which had no per-pane metadata), giving identical restore.
+    /// Kept as a sidecar so `LayoutTemplate::Terminal` stays a unit variant
+    /// and old layouts deserialize unchanged.
+    #[serde(default)]
+    pub terminals: Vec<TerminalMeta>,
+}
+
+/// Per-pane metadata persisted alongside a `SavedLayout`. Every field is
+/// optional so missing entries (or a missing sidecar entirely) restore to
+/// today's behavior.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct TerminalMeta {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -48,6 +73,39 @@ pub struct GlobalConfig {
     pub confirm_on_close: bool,
     #[serde(default)]
     pub use_linux_keybindings: bool,
+    /// Where the tab bar is drawn. `Hidden` = panel not drawn (tabs reachable
+    /// only by keyboard). Defaults to `Top` to match current behavior.
+    #[serde(default)]
+    pub tab_position: TabPosition,
+    /// Equal-width tabs. Defaults true to match current behavior.
+    #[serde(default = "default_true")]
+    pub homogeneous: bool,
+    /// Show a close button on each tab. Defaults true to match current behavior.
+    #[serde(default = "default_true")]
+    pub close_button_on_tab: bool,
+    /// Insert a new tab immediately after the current one rather than appending.
+    #[serde(default)]
+    pub new_tab_after_current: bool,
+    /// Make the tab bar horizontally/vertically scrollable on overflow instead
+    /// of shrinking tabs. Defaults false (current behavior); opt-in (USER Q3).
+    #[serde(default)]
+    pub scroll_tabbar: bool,
+    /// Name of a saved layout to launch automatically on startup. `None`
+    /// (default) preserves today's behavior of opening a single default tab.
+    #[serde(default)]
+    pub startup_layout: Option<String>,
+}
+
+/// Where the tab bar is positioned. `Hidden` suppresses the panel entirely.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TabPosition {
+    #[default]
+    Top,
+    Bottom,
+    Left,
+    Right,
+    Hidden,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -79,6 +137,16 @@ pub struct Profile {
     /// value. (Analogous to terminator's inactive_color_offset.)
     #[serde(default = "default_inactive_dim_alpha")]
     pub inactive_dim_alpha: u8,
+    /// Run `custom_command` through the shell instead of an interactive shell.
+    #[serde(default)]
+    pub use_custom_command: bool,
+    /// The command to run when `use_custom_command` is set (via `$SHELL -c`).
+    #[serde(default)]
+    pub custom_command: String,
+    /// Spawn the shell as a login shell (passes `--login`). Defaults true so
+    /// the default profile reproduces today's spawn behavior.
+    #[serde(default = "default_true")]
+    pub login_shell: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
@@ -173,6 +241,12 @@ impl Default for GlobalConfig {
         Self {
             confirm_on_close: true,
             use_linux_keybindings: false,
+            tab_position: TabPosition::Top,
+            homogeneous: true,
+            close_button_on_tab: true,
+            new_tab_after_current: false,
+            scroll_tabbar: false,
+            startup_layout: None,
         }
     }
 }
@@ -200,6 +274,9 @@ impl Profile {
             word_chars: default_word_chars(),
             exit_action: ExitAction::Close,
             inactive_dim_alpha: default_inactive_dim_alpha(),
+            use_custom_command: false,
+            custom_command: String::new(),
+            login_shell: true,
         }
     }
 
@@ -390,8 +467,10 @@ impl Config {
 
     /// Promote legacy top-level font/colors/scrollback fields into a profile.
     ///
-    /// If any legacy field is present we rebuild the profiles list from it,
-    /// overriding the serde-supplied default profile.
+    /// If any legacy field is present and no `[[profiles]]` were supplied, we
+    /// synthesize a single "Default" profile from the legacy fields. If the
+    /// user already supplied `[[profiles]]`, those are kept and the legacy
+    /// fields are simply dropped.
     fn migrate_legacy(&mut self) {
         let has_legacy = self.font.is_some() || self.colors.is_some() || self.scrollback.is_some();
         if has_legacy {
@@ -410,8 +489,13 @@ impl Config {
                 word_chars: default_word_chars(),
                 exit_action: ExitAction::Close,
                 inactive_dim_alpha: default_inactive_dim_alpha(),
+                use_custom_command: false,
+                custom_command: String::new(),
+                login_shell: true,
             };
-            self.profiles = vec![profile];
+            if self.profiles.is_empty() {
+                self.profiles = vec![profile];
+            }
             if self.active_profile.is_empty() {
                 self.active_profile = "Default".into();
             }
@@ -601,16 +685,51 @@ mod tests {
 
     // Gap #22: custom shell command per profile
     #[test]
-    #[ignore = "gap #22: custom_command not yet in Profile"]
     fn config_profile_custom_command() {
-        panic!("add use_custom_command: bool and custom_command: Option<String> to Profile");
+        // Defaults: no custom command.
+        let p = Profile::default();
+        assert!(!p.use_custom_command);
+        assert_eq!(p.custom_command, "");
+
+        // Round-trips when set.
+        let mut cfg = Config::default();
+        cfg.active_mut().use_custom_command = true;
+        cfg.active_mut().custom_command = "htop".into();
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        let parsed: Config = toml::from_str(&text).unwrap();
+        assert!(parsed.active().use_custom_command);
+        assert_eq!(parsed.active().custom_command, "htop");
+
+        // Missing keys default for old configs.
+        let toml_text = r##"
+            [[profiles]]
+            name = "Test"
+        "##;
+        let cfg: Config = toml::from_str(toml_text).unwrap();
+        assert!(!cfg.profiles[0].use_custom_command);
+        assert_eq!(cfg.profiles[0].custom_command, "");
     }
 
     // Gap #24: login shell option
     #[test]
-    #[ignore = "gap #24: login_shell not yet in Profile"]
     fn config_profile_login_shell() {
-        panic!("add login_shell: bool to Profile");
+        // Defaults true so the default profile reproduces today's spawn.
+        assert!(Profile::default().login_shell);
+
+        // Round-trips when cleared.
+        let mut cfg = Config::default();
+        cfg.active_mut().login_shell = false;
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        let parsed: Config = toml::from_str(&text).unwrap();
+        assert!(!parsed.active().login_shell);
+
+        // Missing key defaults to true for old configs.
+        let toml_text = r##"
+            [[profiles]]
+            name = "Test"
+        "##;
+        let cfg: Config = toml::from_str(toml_text).unwrap();
+        assert!(cfg.profiles[0].login_shell);
     }
 
     #[test]
@@ -650,9 +769,60 @@ mod tests {
 
     // Gap #28: tab position config
     #[test]
-    #[ignore = "gap #28: tab_position not yet in GlobalConfig"]
     fn config_global_tab_position() {
-        panic!("add tab_position: String to GlobalConfig (values: top, bottom, left, right, hidden)");
+        // Default preserves current behavior: top.
+        assert_eq!(GlobalConfig::default().tab_position, TabPosition::Top);
+
+        // Each snake_case value deserializes to its variant.
+        for (s, want) in [
+            ("top", TabPosition::Top),
+            ("bottom", TabPosition::Bottom),
+            ("left", TabPosition::Left),
+            ("right", TabPosition::Right),
+            ("hidden", TabPosition::Hidden),
+        ] {
+            let toml_text = format!("[global]\ntab_position = \"{s}\"\n");
+            let cfg: Config = toml::from_str(&toml_text).unwrap();
+            assert_eq!(cfg.global.tab_position, want, "value {s}");
+        }
+    }
+
+    #[test]
+    fn config_global_tab_fields_round_trip_and_default() {
+        // Defaults equal current behavior.
+        let g = GlobalConfig::default();
+        assert_eq!(g.tab_position, TabPosition::Top);
+        assert!(g.homogeneous);
+        assert!(g.close_button_on_tab);
+        assert!(!g.new_tab_after_current);
+        assert!(!g.scroll_tabbar);
+
+        // Non-default values round-trip through serialize -> deserialize.
+        let mut cfg = Config::default();
+        cfg.global.tab_position = TabPosition::Bottom;
+        cfg.global.homogeneous = false;
+        cfg.global.close_button_on_tab = false;
+        cfg.global.new_tab_after_current = true;
+        cfg.global.scroll_tabbar = true;
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        let parsed: Config = toml::from_str(&text).unwrap();
+        assert_eq!(parsed.global.tab_position, TabPosition::Bottom);
+        assert!(!parsed.global.homogeneous);
+        assert!(!parsed.global.close_button_on_tab);
+        assert!(parsed.global.new_tab_after_current);
+        assert!(parsed.global.scroll_tabbar);
+
+        // Old config missing the new keys: each defaults to current behavior.
+        let toml_text = r##"
+            [global]
+            confirm_on_close = false
+        "##;
+        let cfg: Config = toml::from_str(toml_text).unwrap();
+        assert_eq!(cfg.global.tab_position, TabPosition::Top);
+        assert!(cfg.global.homogeneous);
+        assert!(cfg.global.close_button_on_tab);
+        assert!(!cfg.global.new_tab_after_current);
+        assert!(!cfg.global.scroll_tabbar);
     }
 
     // Gap #18: always on top
@@ -863,5 +1033,118 @@ mod tests {
     #[test]
     fn hex_parse_empty() {
         assert_eq!(parse_hex(""), None);
+    }
+
+    #[test]
+    fn ensure_consistent_repoints_active_to_first_when_name_missing() {
+        let mut cfg = Config {
+            active_profile: "Nonexistent".into(),
+            profiles: vec![
+                Profile::new_named("Solarized"),
+                Profile::new_named("Light"),
+            ],
+            ..Config::default()
+        };
+        cfg.ensure_consistent();
+        // active_profile named a profile that does not exist, so it should be
+        // repointed to the first profile's name, not left dangling.
+        assert_eq!(cfg.active_profile, "Solarized");
+        assert_eq!(cfg.active().name, "Solarized");
+    }
+
+    // Regression for M12: a config with a leftover legacy field AND multiple
+    // [[profiles]] must keep all parsed profiles, not collapse to one.
+    #[test]
+    fn migrate_legacy_keeps_existing_profiles() {
+        let toml_text = r##"
+            active_profile = "Two"
+
+            [colors]
+            background = "#002b36"
+
+            [[profiles]]
+            name = "One"
+
+            [[profiles]]
+            name = "Two"
+        "##;
+        let mut cfg: Config = toml::from_str(toml_text).unwrap();
+        cfg.migrate_legacy();
+        cfg.ensure_consistent();
+
+        let names: Vec<&str> = cfg.profiles.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["One", "Two"]);
+        assert_eq!(cfg.active_profile, "Two");
+        // Legacy field is dropped, not merged into the user's profiles.
+        assert!(cfg.colors.is_none());
+    }
+
+    // ---- SavedLayout per-pane sidecar (profile-on-spawn §8) ----
+
+    #[test]
+    fn saved_layout_terminals_sidecar_round_trips() {
+        let mut cfg = Config::default();
+        cfg.layouts.push(SavedLayout {
+            name: "Work".into(),
+            template: LayoutTemplate::Terminal,
+            terminals: vec![
+                TerminalMeta {
+                    profile: Some("Dark".into()),
+                    cwd: Some(PathBuf::from("/home/aub/src")),
+                    command: Some("vim".into()),
+                },
+                TerminalMeta::default(),
+            ],
+        });
+
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        let parsed: Config = toml::from_str(&text).unwrap();
+        let layout = &parsed.layouts[0];
+        assert_eq!(layout.terminals.len(), 2);
+        assert_eq!(layout.terminals[0].profile.as_deref(), Some("Dark"));
+        assert_eq!(layout.terminals[0].cwd, Some(PathBuf::from("/home/aub/src")));
+        assert_eq!(layout.terminals[0].command.as_deref(), Some("vim"));
+        // Second entry round-trips as all-None (today's behavior for a pane
+        // with no captured metadata).
+        assert_eq!(layout.terminals[1].profile, None);
+        assert_eq!(layout.terminals[1].cwd, None);
+        assert_eq!(layout.terminals[1].command, None);
+    }
+
+    #[test]
+    fn saved_layout_missing_terminals_defaults_empty() {
+        // An old layout serialized before the sidecar existed: name + template
+        // only, no `terminals` array.
+        let toml_text = r##"
+            [[layouts]]
+            name = "Old"
+            template = "Terminal"
+        "##;
+        let cfg: Config = toml::from_str(toml_text).unwrap();
+        assert_eq!(cfg.layouts.len(), 1);
+        assert_eq!(cfg.layouts[0].name, "Old");
+        assert!(cfg.layouts[0].terminals.is_empty());
+    }
+
+    #[test]
+    fn startup_layout_round_trips_and_defaults_none() {
+        // Default config: no startup layout.
+        assert_eq!(Config::default().global.startup_layout, None);
+        assert_eq!(GlobalConfig::default().startup_layout, None);
+
+        // Round-trips when set.
+        let mut cfg = Config::default();
+        cfg.global.startup_layout = Some("Work".into());
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        let parsed: Config = toml::from_str(&text).unwrap();
+        assert_eq!(parsed.global.startup_layout.as_deref(), Some("Work"));
+
+        // Old config missing the key defaults to None.
+        let toml_text = r##"
+            [global]
+            confirm_on_close = false
+        "##;
+        let cfg: Config = toml::from_str(toml_text).unwrap();
+        assert_eq!(cfg.global.startup_layout, None);
     }
 }
