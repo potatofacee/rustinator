@@ -7,6 +7,13 @@ stable enough to be a primary terminal emulator on macOS and Linux.
 
 ## Current State Assessment
 
+> **Status update (2026-06-29):** The structural refactor this roadmap is built
+> around is largely DONE. Phases 0, 1, 2 complete; Phase 3 mostly complete.
+> Phase 4 is mixed (4b/4c/4e done; 4a resize debounce NOT started). Phase 5 is
+> mostly config-stubs, not behavior. The line counts in the table below are
+> stale post-refactor — current: main.rs ~829, window.rs ~911 (was 2,140),
+> pane_ui.rs ~1,237, pane.rs ~2,124. See per-phase tags below.
+
 ### What works and should not be touched unnecessarily
 
 | Component | File | Lines | Verdict |
@@ -98,7 +105,11 @@ mutable state within the same giant function.
 
 ---
 
-### Phase 0: Unify Action Dispatch
+### Phase 0: Unify Action Dispatch — DONE (2026-06-29)
+
+> `PaneAction` merged into a single `Action` enum (0 refs remain); `draw_panes`
+> returns `Vec<Action>` (pane_ui.rs); `execute_pane_actions` is the sole sink.
+
 
 **Goal:** One codepath for all actions, regardless of whether they come from
 keyboard, context menu, or any future source.
@@ -127,7 +138,11 @@ new action means adding one enum variant and one match arm.
 
 ---
 
-### Phase 1: Break Up the God Object
+### Phase 1: Break Up the God Object — DONE (2026-06-29)
+
+> `FontState`, `RendererState`, `InputState` extracted; `App` flattened to hold
+> them as sub-structs (main.rs).
+
 
 **Goal:** `App` becomes a thin coordinator, not a state bag.
 
@@ -192,7 +207,11 @@ know about TabManager. Adding a font feature doesn't risk breaking tab logic.
 
 ---
 
-### Phase 2: Collapse Window Duplication
+### Phase 2: Collapse Window Duplication — DONE (2026-06-29)
+
+> `GlWindow` extracted (gl_window.rs); window.rs 2,140 → ~911 lines;
+> `encode_raw_key`/`encode_named_key` moved to input.rs.
+
 
 **Goal:** One reusable window/surface type, three instances with different
 behavior.
@@ -220,7 +239,12 @@ macOS (CGL) and Linux (GLX/EGL) after this phase.
 
 ---
 
-### Phase 3: Untangle pane_ui.rs
+### Phase 3: Untangle pane_ui.rs — PARTIAL (2026-06-29)
+
+> `handle_pane_mouse`, `paint_scrollbar`, `build_context_menu`, `handle_drag_drop`
+> extracted; `draw_panes` ~488 → ~206 lines. `handle_pane_scroll` was NOT split
+> out separately — scroll handling lives inside `handle_pane_mouse`.
+
 
 **Goal:** The 488-line `draw_panes` function becomes a series of focused,
 testable functions.
@@ -249,12 +273,17 @@ they're in different functions with explicit inputs and outputs.
 
 ---
 
-### Phase 4: Daily-Driver Hardening
+### Phase 4: Daily-Driver Hardening — MIXED (2026-06-29)
 
 This is where we stop refactoring structure and fix the things that make a
 terminal annoying to use as your daily driver.
 
-**4a. Resize correctness**
+> Status: 4b (respawn reuse PaneId, pane.rs:765), 4c (force_pty_resize, no 0x0
+> flash, main.rs:452), and 4e (focus tracking) are DONE. **4a resize debounce is
+> NOT started** — no `pending_resize` field exists. 4d (macOS large-paste
+> hardening) unverified.
+
+**4a. Resize correctness** — NOT STARTED
 
 The current resize path: `pane_ui` computes new cols/lines from the rect,
 calls `pane.resize()`, which locks the terminal, resizes the grid, and sends
@@ -299,7 +328,17 @@ routes through `TabManager::set_focused_pane`, which emits paired events.
 
 ---
 
-### Phase 5: Missing Features for Daily Use
+### Phase 5: Missing Features for Daily Use — PARTIAL (2026-06-30)
+
+> Update (2026-06-30): custom shell command per profile, tab reorder by drag, and
+> session/layout restore (per-pane cwd/cmd/profile in the `SavedLayout.terminals`
+> sidecar + `startup_layout`) are DONE this session. Still open: inactive dimming
+> (slider only), bell (event handled, no config/feedback), OSC 52 (store plumbed,
+> clipboard write not wired), clickable file:line paths, per-pane scrollbar
+> position, sixel/kitty images. Multi-window-dependent features
+> (detach-tab-to-window, multi-window layouts) are DEFERRED to v2 — design in
+> `20260630-design-multi-window.md`.
+
 
 Only after phases 0-4 are complete. These are the features you'll miss within
 the first week of daily driving.
@@ -308,13 +347,13 @@ the first week of daily driving.
 |---------|--------|-------|
 | Inactive pane dimming | Small | Already have `focused` flag; apply alpha overlay |
 | Audible/visual bell | Small | alacritty_terminal sends Bell event; play sound or flash |
-| Custom shell command per profile | Small | Add to Profile, pass to Pane::spawn |
+| Custom shell command per profile | Small | DONE (2026-06-30): `Profile.custom_command` + `profile::spawn_command` |
 | Working OSC 52 (clipboard set from shell) | Small | alacritty_terminal parses it; wire to arboard |
 | Clickable file paths (not just URLs) | Medium | Extend scan_urls with regex for file:line patterns |
 | Selection text highlight rendering | Small | Already works via selection in snapshot, but verify edge cases |
 | Per-pane scrollbar position config | Small | Config field, already have scrollbar_visible |
-| Tab reorder by drag | Medium | Already have tab bar; add drag interaction |
-| Session restore on restart | Medium | Serialize layout + cwds to config on exit, restore on launch |
+| Tab reorder by drag | Medium | DONE (2026-06-30): `tabs::reorder_tab` + `tab_bar.rs` |
+| Session restore on restart | Medium | DONE (2026-06-30): per-pane cwd/cmd/profile in `SavedLayout.terminals` sidecar + `startup_layout` |
 | Sixel/Kitty image protocol | Large | Would need a texture-per-image approach in the renderer |
 
 ---
