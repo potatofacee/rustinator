@@ -735,9 +735,16 @@ impl WinitApp {
                 hk.repaint_at = Some(Instant::now());
             }
             WindowEvent::Focused(focused) => {
-                // See main-window note: clear any phantom modifier
-                // latched while unfocused so typing isn't swallowed.
-                hk.current_modifiers = winit::event::Modifiers::default();
+                // See main-window note: macOS-only resync to empty (AppKit
+                // sends no flagsChanged for releases while unfocused). On
+                // Linux the wipe must NOT run: winit X11 re-issues Focused
+                // from map_notify with no following ModifiersChanged, and
+                // winit dedups ModifiersChanged against its internal state,
+                // leaving the mirror stuck empty.
+                #[cfg(target_os = "macos")]
+                {
+                    hk.current_modifiers = winit::event::Modifiers::default();
+                }
                 self.main_window_id
                     .and_then(|id| self.windows.get_mut(&id))
                     .unwrap()
@@ -864,12 +871,20 @@ impl WinitApp {
             }
             WindowEvent::Focused(focused) => {
                 self.main_focused = focused;
-                // A modifier released while we were unfocused (e.g. Cmd let go
-                // mid Cmd+Tab) never reaches us as a ModifiersChanged, leaving a
-                // phantom modifier latched — after which every keystroke encodes
-                // as Cmd+key and produces no bytes. Resync to empty on any focus
-                // change; the next real ModifiersChanged repopulates it.
-                self.current_modifiers = winit::event::Modifiers::default();
+                // macOS only: a modifier released while we were unfocused
+                // (e.g. Cmd let go mid Cmd+Tab) never reaches us as a
+                // ModifiersChanged (AppKit sends no flagsChanged for releases
+                // while unfocused), leaving a phantom modifier latched — after
+                // which every keystroke encodes as Cmd+key and produces no
+                // bytes. Resync to empty on any focus change; the next real
+                // ModifiersChanged repopulates it. On Linux this wipe must NOT
+                // run: winit X11 re-issues Focused from map_notify with no
+                // following ModifiersChanged, and winit dedups ModifiersChanged
+                // against its internal state, leaving the mirror stuck empty.
+                #[cfg(target_os = "macos")]
+                {
+                    self.current_modifiers = winit::event::Modifiers::default();
+                }
                 win.notify_focus(focused);
             }
             WindowEvent::CursorMoved { position, .. } => {
