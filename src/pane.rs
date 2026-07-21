@@ -1401,6 +1401,7 @@ impl Pane {
         };
 
         let mut cells = Vec::with_capacity(term.columns() * term.screen_lines());
+        let mut sel_marked: usize = 0;
         for indexed in content.display_iter {
             let row = indexed.point.line.0 + display_offset;
             if row < 0 || row >= lines {
@@ -1414,6 +1415,9 @@ impl Pane {
             let is_selected = selection
                 .map(|s| s.contains(indexed.point))
                 .unwrap_or(false);
+            if is_selected {
+                sel_marked += 1;
+            }
             let (fg, bg) = apply_cell_attrs(
                 fg_base,
                 bg_base,
@@ -1463,6 +1467,13 @@ impl Pane {
                 zerowidth: extract_zerowidth(indexed.cell.zerowidth()),
                 hyperlink: indexed.cell.hyperlink().map(|h| h.uri().to_string()),
             });
+        }
+
+        if std::env::var_os("RUSTINATOR_SEL_DEBUG").is_some() && selection.is_some() {
+            eprintln!(
+                "SEL_DEBUG snapshot: range={:?} marked={} display_offset={} lines={}",
+                selection, sel_marked, display_offset, lines
+            );
         }
 
         Frame {
