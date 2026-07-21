@@ -553,6 +553,9 @@ fn handle_pane_mouse(
                 } else if response.double_clicked() {
                     pane.begin_selection(col, row, side, SelectionType::Semantic);
                 } else if just_pressed {
+                    if std::env::var_os("RUSTINATOR_SEL_DEBUG").is_some() {
+                        eprintln!("SEL_DEBUG gesture: begin col={} row={} side={:?}", col, row, side);
+                    }
                     pane.begin_selection(col, row, side, SelectionType::Simple);
                 } else if primary_down {
                     if let Some(p) = pointer {
@@ -574,6 +577,9 @@ fn handle_pane_mouse(
                             false
                         };
                         if !scrolled {
+                            if std::env::var_os("RUSTINATOR_SEL_DEBUG").is_some() {
+                                eprintln!("SEL_DEBUG gesture: update col={} row={} side={:?}", col, row, side);
+                            }
                             pane.update_selection(col, row, side);
                         }
                     }
@@ -1045,10 +1051,18 @@ fn paint_pane(
             offset_cells: [0.0, 0.0],
             size_cells: [cols_cover as f32, rows_cover as f32],
         });
+        let mut cell_bg_quads: usize = 0;
         for cell in &frame.cells {
             if cell.bg[..3] != frame.default_bg[..3] {
                 bg.push(BgInstance::full(cell.col, cell.row, cell.bg));
+                cell_bg_quads += 1;
             }
+        }
+        if std::env::var_os("RUSTINATOR_SEL_DEBUG").is_some() {
+            eprintln!(
+                "SEL_DEBUG paint: cell_bg_quads={} ppp={} cell_w={} cell_h={}",
+                cell_bg_quads, ppp, renderer.cell_w, renderer.cell_h
+            );
         }
 
         let effective_cursor = cursor_override.unwrap_or(frame.cursor);
