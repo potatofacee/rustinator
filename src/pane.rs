@@ -795,6 +795,47 @@ fn apply_spawn_command(opts: &mut tty::Options, cmd: &SpawnCommand) {
     opts.shell = Some(tty::Shell::new(shell, cmd.args.clone()));
 }
 
+/// Environment variables that identify a specific terminal emulator. A child
+/// spawned by us must not inherit another terminal's identity, or shell
+/// tooling will enable that terminal's behaviors (e.g. VTE-style mouse
+/// reporting because VTE_VERSION leaked from a parent gnome-terminal).
+const FOREIGN_TERM_VARS: &[&str] = &[
+    "VTE_VERSION",
+    "GNOME_TERMINAL_SCREEN",
+    "GNOME_TERMINAL_SERVICE",
+    "TERM_PROGRAM",
+    "TERM_PROGRAM_VERSION",
+    "KONSOLE_VERSION",
+    "KONSOLE_DBUS_SESSION",
+    "KONSOLE_DBUS_WINDOW",
+    "ITERM_SESSION_ID",
+    "ITERM_PROFILE",
+    "WEZTERM_EXECUTABLE",
+    "WEZTERM_PANE",
+    "WEZTERM_UNIX_SOCKET",
+    "KITTY_WINDOW_ID",
+    "KITTY_PID",
+    "ALACRITTY_SOCKET",
+    "ALACRITTY_LOG",
+    "ALACRITTY_WINDOW_ID",
+    "TERMINATOR_UUID",
+    "TERMINATOR_DBUS_NAME",
+    "TERMINATOR_DBUS_PATH",
+];
+
+/// Neutralize inherited terminal-identity vars for the child. `tty::Options`
+/// env is extra vars layered per-key over the inherited process environment
+/// (`Command::env`, see alacritty_terminal tty/unix.rs) with no unset
+/// mechanism, so removing keys from this map does nothing; instead override
+/// each var with an empty value, which value-based terminal detection treats
+/// as unset. Must run before the identity inserts so our own TERM_PROGRAM
+/// etc. win.
+fn scrub_foreign_term_vars(env: &mut std::collections::HashMap<String, String>) {
+    for k in FOREIGN_TERM_VARS {
+        env.insert((*k).to_string(), String::new());
+    }
+}
+
 pub struct Pane {
     pub id: PaneId,
     pub terminal: Arc<FairMutex<Term<EventProxy>>>,
@@ -889,6 +930,7 @@ impl Pane {
 
         let mut pty_opts = tty::Options::default();
         apply_spawn_command(&mut pty_opts, &spawn_command);
+        scrub_foreign_term_vars(&mut pty_opts.env);
         pty_opts.env.insert("TERM".into(), "xterm-256color".into());
         pty_opts.env.insert("COLORTERM".into(), "truecolor".into());
         pty_opts.env.insert("TERM_PROGRAM".into(), "rustinator".into());
@@ -990,6 +1032,7 @@ impl Pane {
         // Config, and a dead pane may carry a different profile than the active
         // one, so re-resolving here would risk the wrong command. (§5/§6)
         apply_spawn_command(&mut pty_opts, &self.spawn_command);
+        scrub_foreign_term_vars(&mut pty_opts.env);
         pty_opts.env.insert("TERM".into(), "xterm-256color".into());
         pty_opts.env.insert("COLORTERM".into(), "truecolor".into());
         pty_opts.env.insert("TERM_PROGRAM".into(), "rustinator".into());
@@ -2648,6 +2691,25 @@ mod tests {
             ),
             Err(_) => assert_eq!(resolve_working_dir(None), None),
         }
+    }
+
+    #[test]
+    fn scrub_foreign_term_vars_blanks_foreign_identity_and_keeps_term() {
+        // Simulate a launch from gnome-terminal: its identity vars leaked in.
+        let mut env = std::collections::HashMap::new();
+        env.insert("VTE_VERSION".to_string(), "7802".to_string());
+        env.insert(
+            "GNOME_TERMINAL_SCREEN".to_string(),
+            "/org/gnome/Terminal/screen/x".to_string(),
+        );
+        scrub_foreign_term_vars(&mut env);
+        // Same order as the spawn sites: identity inserts run after the scrub.
+        env.insert("TERM".to_string(), "xterm-256color".to_string());
+        // Foreign identity is overridden to empty for the child (the map has
+        // no unset mechanism; empty is what detection treats as absent).
+        assert_eq!(env.get("VTE_VERSION").map(String::as_str), Some(""));
+        assert_eq!(env.get("GNOME_TERMINAL_SCREEN").map(String::as_str), Some(""));
+        assert_eq!(env.get("TERM").map(String::as_str), Some("xterm-256color"));
     }
 
     // ---- apply_spawn_command: profile-resolved child command ----
