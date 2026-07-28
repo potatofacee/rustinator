@@ -2,7 +2,7 @@
 
 use alacritty_terminal::term::TermMode;
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum MouseButton {
     Left,
     Middle,
@@ -23,7 +23,7 @@ impl MouseButton {
     }
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum MouseKind {
     Press,
     Release,

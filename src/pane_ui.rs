@@ -487,62 +487,9 @@ fn handle_pane_mouse(
     let just_pressed = primary_down && !was_down;
 
     if mouse_to_app && !handled_by_url {
-        if let Some((col, row)) = pointer_cell {
-            if let Some(pane) = tab.panes.get(&pane_id) {
-                let mm = MouseMods { shift: shift_held, alt: alt_held, ctrl: ctrl_held };
-                let send_click = |btn| {
-                    pane.send_mouse(MouseKind::Press, btn, col, row, mm);
-                    pane.send_mouse(MouseKind::Release, btn, col, row, mm);
-                };
-                if response.clicked() {
-                    send_click(MouseButton::Left);
-                }
-                if response.secondary_clicked() {
-                    send_click(MouseButton::Right);
-                }
-                if response.middle_clicked() {
-                    send_click(MouseButton::Middle);
-                }
-                if response.hovered() {
-                    let scroll_y = ui.ctx().input(|i| i.smooth_scroll_delta.y);
-                    if scroll_y.abs() > 1.0 {
-                        let steps = (scroll_y.abs() / cell_h.max(1.0)).ceil() as i32;
-                        let btn = if scroll_y > 0.0 { MouseButton::WheelUp } else { MouseButton::WheelDown };
-                        for _ in 0..steps.min(8) {
-                            pane.send_mouse(MouseKind::Press, btn, col, row, mm);
-                        }
-                    }
-                }
-
-                // Cell-motion / drag reporting (modes 1002/1003). The pointer moves
-                // at frame rate, but a terminal only cares about cell transitions, so
-                // we coalesce by reporting only when the resolved cell changes from the
-                // last one reported for this pane (tracked in egui temp data).
-                if response.hovered() {
-                    let (held_button, button_held) = ui.input(|i| {
-                        if i.pointer.primary_down() {
-                            (MouseButton::Left, true)
-                        } else if i.pointer.secondary_down() {
-                            (MouseButton::Right, true)
-                        } else if i.pointer.middle_down() {
-                            (MouseButton::Middle, true)
-                        } else {
-                            (MouseButton::Left, false)
-                        }
-                    });
-                    let motion_id = egui::Id::new(("pane_motion_cell", tab_idx, pane_id));
-                    let last_cell: Option<(i32, i32)> =
-                        ui.ctx().data(|d| d.get_temp(motion_id));
-                    let (should_send, new_last) =
-                        motion_report(pane.term_mode(), button_held, last_cell, (col, row));
-                    if should_send {
-                        pane.send_mouse(MouseKind::Motion, held_button, col, row, mm);
-                    }
-                    if new_last != last_cell {
-                        ui.ctx().data_mut(|d| d.insert_temp(motion_id, (col, row)));
-                    }
-                }
-            }
+        if let Some(pane) = tab.panes.get(&pane_id) {
+            let mm = MouseMods { shift: shift_held, alt: alt_held, ctrl: ctrl_held };
+            forward_mouse_to_app(pane, response, ui, pointer_cell, tab_idx, pane_id, cell_h, mm);
         }
     } else if !handled_by_url {
         if let Some((col, row)) = pointer_cell {
@@ -1504,6 +1451,141 @@ fn motion_report(
     (should_send, new_last)
 }
 
+/// Forward mouse activity to the application while a mouse-reporting mode is
+/// active (the `mouse_to_app` branch of `handle_pane_mouse`).
+///
+/// Real terminals send Press when a button goes down, Motion while it drags,
+/// and Release when it comes back up. egui's click events never fire once the
+/// pointer has moved, so a synthetic Press+Release pair on `clicked()` left
+/// drags with no Press before and no Release after their Motion stream. The
+/// forwarded button is tracked in temp data (same pattern as `motion_id`) and
+/// the transitions are emitted directly by `button_forward`.
+fn forward_mouse_to_app(
+    pane: &crate::pane::Pane,
+    response: &egui::Response,
+    ui: &egui::Ui,
+    pointer_cell: Option<(i32, i32)>,
+    tab_idx: usize,
+    pane_id: PaneId,
+    cell_h: f32,
+    mm: MouseMods,
+) {
+    let motion_id = egui::Id::new(("pane_motion_cell", tab_idx, pane_id));
+
+    // Button state machine. Runs before the pointer_cell gate so the Release
+    // still fires when the button comes up after the pointer left the pane.
+    let btn_id = egui::Id::new(("pane_mouse_btn", tab_idx, pane_id));
+    let recorded: Option<MouseButton> = ui.ctx().data(|d| d.get_temp(btn_id));
+    let (just_pressed, down) = ui.input(|i| {
+        let pressed = if i.pointer.button_pressed(egui::PointerButton::Primary) {
+            Some(MouseButton::Left)
+        } else if i.pointer.button_pressed(egui::PointerButton::Secondary) {
+            Some(MouseButton::Right)
+        } else if i.pointer.button_pressed(egui::PointerButton::Middle) {
+            Some(MouseButton::Middle)
+        } else {
+            None
+        };
+        let down = (i.pointer.primary_down(), i.pointer.secondary_down(), i.pointer.middle_down());
+        (pressed, down)
+    });
+    let (event, new_recorded) =
+        button_forward(recorded, just_pressed, pointer_cell.is_some(), down);
+    if let Some((kind, btn)) = event {
+        // A Press always has a pointer cell (the over-pane gate); a Release
+        // uses the last motion-reported cell when the pointer is gone.
+        let cell = match kind {
+            MouseKind::Press => pointer_cell,
+            _ => ui.ctx().data(|d| d.get_temp(motion_id)).or(pointer_cell),
+        };
+        if let Some((col, row)) = cell {
+            pane.send_mouse(kind, btn, col, row, mm);
+        }
+    }
+    if new_recorded != recorded {
+        ui.ctx().data_mut(|d| match new_recorded {
+            Some(btn) => {
+                d.insert_temp(btn_id, btn);
+            }
+            None => d.remove::<MouseButton>(btn_id),
+        });
+    }
+
+    if let Some((col, row)) = pointer_cell {
+        if response.hovered() {
+            let scroll_y = ui.ctx().input(|i| i.smooth_scroll_delta.y);
+            if scroll_y.abs() > 1.0 {
+                let steps = (scroll_y.abs() / cell_h.max(1.0)).ceil() as i32;
+                let btn = if scroll_y > 0.0 { MouseButton::WheelUp } else { MouseButton::WheelDown };
+                for _ in 0..steps.min(8) {
+                    pane.send_mouse(MouseKind::Press, btn, col, row, mm);
+                }
+            }
+        }
+
+        // Cell-motion / drag reporting (modes 1002/1003). The pointer moves
+        // at frame rate, but a terminal only cares about cell transitions, so
+        // we coalesce by reporting only when the resolved cell changes from the
+        // last one reported for this pane (tracked in egui temp data).
+        if response.hovered() {
+            let (held_button, button_held) = ui.input(|i| {
+                if i.pointer.primary_down() {
+                    (MouseButton::Left, true)
+                } else if i.pointer.secondary_down() {
+                    (MouseButton::Right, true)
+                } else if i.pointer.middle_down() {
+                    (MouseButton::Middle, true)
+                } else {
+                    (MouseButton::Left, false)
+                }
+            });
+            let last_cell: Option<(i32, i32)> = ui.ctx().data(|d| d.get_temp(motion_id));
+            let (should_send, new_last) =
+                motion_report(pane.term_mode(), button_held, last_cell, (col, row));
+            if should_send {
+                pane.send_mouse(MouseKind::Motion, held_button, col, row, mm);
+            }
+            if new_last != last_cell {
+                ui.ctx().data_mut(|d| d.insert_temp(motion_id, (col, row)));
+            }
+        }
+    }
+}
+
+/// Per-frame step of the forwarded-button state machine. Given which button a
+/// Press was already forwarded for, which button (if any) went down this frame,
+/// whether the pointer resolves to a cell in this pane, and the current
+/// down-state of (left, right, middle), decide what to send and the new record.
+/// A Press is only emitted over the pane with no button recorded (first
+/// recorded wins until released); a Release is emitted as soon as the recorded
+/// button is no longer down, wherever the pointer is. Pure so it is testable.
+fn button_forward(
+    recorded: Option<MouseButton>,
+    just_pressed: Option<MouseButton>,
+    over_pane: bool,
+    (left, right, middle): (bool, bool, bool),
+) -> (Option<(MouseKind, MouseButton)>, Option<MouseButton>) {
+    match recorded {
+        Some(btn) => {
+            let still_down = match btn {
+                MouseButton::Left => left,
+                MouseButton::Right => right,
+                MouseButton::Middle => middle,
+                _ => false,
+            };
+            if still_down {
+                (None, Some(btn))
+            } else {
+                (Some((MouseKind::Release, btn)), None)
+            }
+        }
+        None => match just_pressed {
+            Some(btn) if over_pane => (Some((MouseKind::Press, btn)), Some(btn)),
+            _ => (None, None),
+        },
+    }
+}
+
 /// Resolve a raw pixel-derived click column to the wide-glyph base column and
 /// then hit-test for a URL at that cell. Composing the spacer resolution with
 /// the scan keeps a click on the right half of a double-width glyph (its
@@ -1566,6 +1648,39 @@ mod tests {
         assert_eq!(
             motion_report(drag, false, Some((5, 5)), (6, 5)),
             (false, Some((6, 5)))
+        );
+    }
+
+    #[test]
+    fn button_forward_press_drag_release() {
+        use MouseButton::{Left, Right};
+        use MouseKind::{Press, Release};
+        // Idle with nothing pressed: nothing to send, nothing recorded.
+        assert_eq!(button_forward(None, None, true, (false, false, false)), (None, None));
+        // Left goes down over the pane: Press sent and recorded.
+        assert_eq!(
+            button_forward(None, Some(Left), true, (true, false, false)),
+            (Some((Press, Left)), Some(Left))
+        );
+        // A press with the pointer off the pane is ignored.
+        assert_eq!(
+            button_forward(None, Some(Left), false, (true, false, false)),
+            (None, None)
+        );
+        // Held during a drag: silent (motion is reported elsewhere), record kept.
+        assert_eq!(
+            button_forward(Some(Left), None, true, (true, false, false)),
+            (None, Some(Left))
+        );
+        // A second button pressed while one is recorded: first recorded wins.
+        assert_eq!(
+            button_forward(Some(Left), Some(Right), true, (true, true, false)),
+            (None, Some(Left))
+        );
+        // Button up, even with the pointer off the pane: Release, record cleared.
+        assert_eq!(
+            button_forward(Some(Left), None, false, (false, false, false)),
+            (Some((Release, Left)), None)
         );
     }
 
