@@ -462,6 +462,36 @@ fn profile_tab_colors(
         hex_color_row(ui, "Selection background", &mut profile.colors.selection_background);
         hex_color_row(ui, "Selection foreground", &mut profile.colors.selection_foreground);
     }
+
+    ui.checkbox(&mut profile.bold_is_bright, "Bold text is also bright");
+
+    ui.add_space(4.0);
+    ui.label(egui::RichText::new("Title bar").strong());
+    let t = &mut profile.colors.title;
+    hex_color_row(ui, "Transmit foreground", &mut t.transmit_fg);
+    hex_color_row(ui, "Transmit background", &mut t.transmit_bg);
+    hex_color_row(ui, "Receive foreground", &mut t.receive_fg);
+    hex_color_row(ui, "Receive background", &mut t.receive_bg);
+    hex_color_row(ui, "Inactive foreground", &mut t.inactive_fg);
+    hex_color_row(ui, "Inactive background", &mut t.inactive_bg);
+
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.label("Unfocused text dim");
+        ui.add(
+            egui::Slider::new(&mut profile.inactive_color_offset, 0.0..=1.0)
+                .step_by(0.05)
+                .fixed_decimals(2),
+        );
+    });
+    ui.horizontal(|ui| {
+        ui.label("Unfocused background dim");
+        ui.add(
+            egui::Slider::new(&mut profile.inactive_bg_color_offset, 0.0..=1.0)
+                .step_by(0.05)
+                .fixed_decimals(2),
+        );
+    });
 }
 
 fn profile_tab_behavior(ui: &mut egui::Ui, profile: &mut config::Profile) {
@@ -509,7 +539,21 @@ fn profile_tab_behavior(ui: &mut egui::Ui, profile: &mut config::Profile) {
 
     ui.add_space(8.0);
     ui.label(egui::RichText::new("Cursor").strong());
-    ui.checkbox(&mut profile.cursor_blink, "Cursor blink");
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut profile.cursor_blink, "Cursor blink");
+        ui.label("Shape");
+        egui::ComboBox::from_id_salt("cursor_shape")
+            .selected_text(match profile.cursor_shape {
+                config::CursorShape::Block => "Block",
+                config::CursorShape::Beam => "I-beam",
+                config::CursorShape::Underline => "Underline",
+            })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut profile.cursor_shape, config::CursorShape::Block, "Block");
+                ui.selectable_value(&mut profile.cursor_shape, config::CursorShape::Beam, "I-beam");
+                ui.selectable_value(&mut profile.cursor_shape, config::CursorShape::Underline, "Underline");
+            });
+    });
 
     ui.add_space(8.0);
     ui.label(egui::RichText::new("Clipboard").strong());

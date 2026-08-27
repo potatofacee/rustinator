@@ -65,6 +65,12 @@ pub struct PaneDefaults {
     /// Whether clearing the screen (ED 2 on the primary screen) also wipes
     /// scrollback history. Mirrored into the pane's atomic for the PTY thread.
     pub clear_wipes_scrollback: bool,
+    /// Bold cells in ANSI colors 0-7 render with the bright variant 8-15.
+    pub bold_is_bright: bool,
+    /// Unfocused-pane color factors (Terminator inactive_color_offset /
+    /// inactive_bg_color_offset), both 0.0..=1.0. Applied in `snapshot`.
+    pub inactive_color_offset: f32,
+    pub inactive_bg_color_offset: f32,
 }
 
 impl Default for PaneDefaults {
@@ -78,12 +84,39 @@ impl Default for PaneDefaults {
             selection_fg: None,
             bg_opacity: 1.0,
             clear_wipes_scrollback: false,
+            bold_is_bright: false,
+            inactive_color_offset: 0.8,
+            inactive_bg_color_offset: 1.0,
         }
     }
 }
 
 fn rgb_to_f32(r: u8, g: u8, b: u8) -> [f32; 4] {
     [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0]
+}
+
+/// Multiply the RGB channels by `factor`, leaving alpha alone.
+fn scale_rgb(c: [f32; 4], factor: f32) -> [f32; 4] {
+    [c[0] * factor, c[1] * factor, c[2] * factor, c[3]]
+}
+
+/// A cell background that resolves to the terminal's default background.
+fn is_default_bg(color: Color) -> bool {
+    matches!(color, Color::Named(NamedColor::Background))
+}
+
+/// bold_is_bright: a bold cell whose fg is one of the eight normal ANSI colors
+/// (named Black..White or indexed 0-7) takes the bright variant (index + 8).
+/// Everything else (default fg, indexed 8-255, truecolor) is unchanged.
+fn bright_variant(color: Color, bold: bool) -> Color {
+    if !bold {
+        return color;
+    }
+    match color {
+        Color::Named(n) if (n as usize) < 8 => Color::Indexed(n as u8 + 8),
+        Color::Indexed(i) if i < 8 => Color::Indexed(i + 8),
+        other => other,
+    }
 }
 
 fn named_default(n: NamedColor, defaults: &PaneDefaults) -> [u8; 3] {
@@ -830,6 +863,14 @@ const FOREIGN_TERM_VARS: &[&str] = &[
 /// each var with an empty value, which value-based terminal detection treats
 /// as unset. Must run before the identity inserts so our own TERM_PROGRAM
 /// etc. win.
+/// rxvt/iTerm2-style `COLORFGBG` ("fg;bg" ANSI indices) derived from the
+/// profile background, so tools that read it (instead of querying OSC 11)
+/// pick a dark or light palette without a terminal round trip.
+fn colorfgbg_for(bg: [u8; 3]) -> &'static str {
+    let luma = 0.299 * bg[0] as f32 + 0.587 * bg[1] as f32 + 0.114 * bg[2] as f32;
+    if luma < 128.0 { "15;0" } else { "0;15" }
+}
+
 fn scrub_foreign_term_vars(env: &mut std::collections::HashMap<String, String>) {
     for k in FOREIGN_TERM_VARS {
         env.insert((*k).to_string(), String::new());
@@ -850,6 +891,9 @@ pub struct Pane {
     pub title: Arc<Mutex<Option<String>>>,
     pub visible: Arc<AtomicBool>,
     pub cached: Option<Arc<Frame>>,
+    /// Focus state the cached frame was rendered with; a change forces a
+    /// re-snapshot so the inactive color factors are (un)applied.
+    last_focused: bool,
     /// Read by the PTY event loop on every parse: when true, ED 2 (clear all)
     /// on the primary screen also wipes scrollback. Nothing sets it yet; the
     /// preference UI will. Shared with the loop, so it survives respawn.
@@ -936,6 +980,7 @@ impl Pane {
         pty_opts.env.insert("TERM_PROGRAM".into(), "rustinator".into());
         pty_opts.env.insert("CLICOLOR".into(), "1".into());
         pty_opts.env.insert("CLICOLOR_FORCE".into(), "1".into());
+        pty_opts.env.insert("COLORFGBG".into(), colorfgbg_for(defaults.bg).into());
         crate::shell_integration::inject_env(&mut pty_opts.env);
         ensure_utf8_locale(&mut pty_opts.env);
         pty_opts.working_directory = resolve_working_dir(working_dir);
@@ -974,6 +1019,7 @@ impl Pane {
             title,
             visible,
             cached: None,
+            last_focused: false,
             clear_wipes_scrollback,
             defaults,
             shared_defaults,
@@ -1038,6 +1084,7 @@ impl Pane {
         pty_opts.env.insert("TERM_PROGRAM".into(), "rustinator".into());
         pty_opts.env.insert("CLICOLOR".into(), "1".into());
         pty_opts.env.insert("CLICOLOR_FORCE".into(), "1".into());
+        pty_opts.env.insert("COLORFGBG".into(), colorfgbg_for(self.defaults.bg).into());
         crate::shell_integration::inject_env(&mut pty_opts.env);
         ensure_utf8_locale(&mut pty_opts.env);
         // Same cwd resolution as spawn: requested dir -> $HOME fallback. Without
@@ -1147,14 +1194,16 @@ impl Pane {
         let _ = self.pty_tx.send(Msg::Resize(ws));
     }
 
-    pub fn frame(&mut self) -> Arc<Frame> {
+    pub fn frame(&mut self, focused: bool) -> Arc<Frame> {
         // Re-arm the PTY wake before reading the terminal: output that lands
         // mid-snapshot must send a fresh Repaint event or it would be lost
         // until the next unrelated wake.
         self.wake_pending.store(false, Ordering::Release);
         let was_dirty = self.dirty.swap(false, Ordering::AcqRel);
-        if was_dirty || self.cached.is_none() {
-            self.cached = Some(Arc::new(self.snapshot()));
+        let focus_changed = focused != self.last_focused;
+        self.last_focused = focused;
+        if was_dirty || focus_changed || self.cached.is_none() {
+            self.cached = Some(Arc::new(self.snapshot(focused)));
         }
         Arc::clone(self.cached.as_ref().unwrap())
     }
@@ -1374,16 +1423,27 @@ impl Pane {
         self.send_bytes(crate::input::encode_paste(text, bracketed));
     }
 
-    pub fn snapshot(&self) -> Frame {
+    /// Snapshot the terminal for rendering. `focused == false` applies the
+    /// inactive color factors (Terminator terminal.py set_colors on focus-out):
+    /// `inactive_color_offset` scales the resolved foreground of every cell
+    /// regardless of its source (named, indexed 0-255, or truecolor), and
+    /// `inactive_bg_color_offset` scales only the default background. Cursor,
+    /// selection colors, and non-default cell backgrounds are left untouched.
+    pub fn snapshot(&self, focused: bool) -> Frame {
         let term = self.terminal.lock();
         let lines = term.screen_lines() as i32;
         let content = term.renderable_content();
         let palette = content.colors;
-        let mut default_bg = resolve_color(
-            Color::Named(NamedColor::Background),
-            palette,
-            false,
-            &self.defaults,
+        let fg_factor = if focused { 1.0 } else { self.defaults.inactive_color_offset };
+        let bg_factor = if focused { 1.0 } else { self.defaults.inactive_bg_color_offset };
+        let mut default_bg = scale_rgb(
+            resolve_color(
+                Color::Named(NamedColor::Background),
+                palette,
+                false,
+                &self.defaults,
+            ),
+            bg_factor,
         );
         default_bg[3] = self.defaults.bg_opacity.clamp(0.0, 1.0);
         let display_offset = content.display_offset as i32;
@@ -1451,9 +1511,21 @@ impl Pane {
                 continue;
             }
             let col = indexed.point.column.0 as i32;
-            let fg_base = resolve_color(indexed.cell.fg, palette, true, &self.defaults);
-            let bg_base = resolve_color(indexed.cell.bg, palette, false, &self.defaults);
             let flags = indexed.cell.flags;
+            let fg_color = bright_variant(
+                indexed.cell.fg,
+                self.defaults.bold_is_bright && flags.contains(Flags::BOLD),
+            );
+            let fg_base = scale_rgb(
+                resolve_color(fg_color, palette, true, &self.defaults),
+                fg_factor,
+            );
+            let bg_base = resolve_color(indexed.cell.bg, palette, false, &self.defaults);
+            let bg_base = if is_default_bg(indexed.cell.bg) {
+                scale_rgb(bg_base, bg_factor)
+            } else {
+                bg_base
+            };
             let is_cursor = cursor_invert_at_cell && col == cursor_col && row == cursor_row;
             let is_selected = selection
                 .map(|s| s.contains(indexed.point))
@@ -2366,6 +2438,21 @@ mod tests {
         assert!(scan_urls(&[]).is_empty());
     }
 
+    // ---- bright_variant (bold_is_bright) ----
+
+    #[test]
+    fn bright_variant_maps_normal_ansi_to_bright_when_bold() {
+        assert_eq!(bright_variant(Color::Named(NamedColor::Red), true), Color::Indexed(9));
+        assert_eq!(bright_variant(Color::Indexed(7), true), Color::Indexed(15));
+        assert_eq!(bright_variant(Color::Indexed(9), true), Color::Indexed(9));
+        assert_eq!(bright_variant(Color::Indexed(200), true), Color::Indexed(200));
+        assert_eq!(
+            bright_variant(Color::Named(NamedColor::Foreground), true),
+            Color::Named(NamedColor::Foreground)
+        );
+        assert_eq!(bright_variant(Color::Named(NamedColor::Red), false), Color::Named(NamedColor::Red));
+    }
+
     // ---- indexed_default (256-color palette) ----
 
     #[test]
@@ -2691,6 +2778,14 @@ mod tests {
             ),
             Err(_) => assert_eq!(resolve_working_dir(None), None),
         }
+    }
+
+    #[test]
+    fn colorfgbg_follows_background_luminance() {
+        assert_eq!(colorfgbg_for([0x00, 0x00, 0x00]), "15;0");
+        assert_eq!(colorfgbg_for([0x1a, 0x1a, 0x1a]), "15;0");
+        assert_eq!(colorfgbg_for([0xff, 0xff, 0xff]), "0;15");
+        assert_eq!(colorfgbg_for([0xfd, 0xf6, 0xe3]), "0;15");
     }
 
     #[test]

@@ -38,6 +38,8 @@ pub struct ResolvedProfile {
     pub scrolling_history: usize,
     /// `Config.semantic_escape_chars` derived from the profile's `word_chars`.
     pub semantic_escape_chars: String,
+    /// `Config.default_cursor_style` from the profile's `cursor_shape`.
+    pub cursor_style: alacritty_terminal::vte::ansi::CursorStyle,
     /// The child command/shell to spawn.
     pub command: SpawnCommand,
 }
@@ -59,6 +61,7 @@ pub fn resolved(cfg: &Config, name: &str) -> ResolvedProfile {
         defaults: defaults_from_profile(p),
         scrolling_history: p.scrollback.effective_history(),
         semantic_escape_chars: word_chars_to_semantic_escape(&p.word_chars),
+        cursor_style: p.cursor_shape.term_style(),
         command: spawn_command(p),
     }
 }
@@ -130,6 +133,9 @@ pub fn defaults_from_profile(profile: &Profile) -> PaneDefaults {
         selection_bg: profile.selection_bg_rgb(),
         selection_fg: profile.selection_fg_rgb(),
         clear_wipes_scrollback: profile.clear_wipes_scrollback,
+        bold_is_bright: profile.bold_is_bright,
+        inactive_color_offset: profile.inactive_color_offset.clamp(0.0, 1.0),
+        inactive_bg_color_offset: profile.inactive_bg_color_offset.clamp(0.0, 1.0),
     }
 }
 
@@ -259,5 +265,15 @@ mod tests {
         assert_eq!(pd.selection_bg, None);
         assert_eq!(pd.fg, [0xe5, 0xe5, 0xe5]);
         assert_eq!(pd.bg, [0x1a, 0x1a, 0x1a]);
+    }
+
+    #[test]
+    fn defaults_from_profile_clamps_inactive_offsets() {
+        let mut p = Profile::new_named("X");
+        p.inactive_color_offset = 1.7;
+        p.inactive_bg_color_offset = -0.2;
+        let pd = defaults_from_profile(&p);
+        assert!((pd.inactive_color_offset - 1.0).abs() < f32::EPSILON);
+        assert!(pd.inactive_bg_color_offset.abs() < f32::EPSILON);
     }
 }

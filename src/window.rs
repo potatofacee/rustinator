@@ -296,6 +296,25 @@ fn governor_next_wake(
     }
 }
 
+/// True when pointer motion at `pos` (egui points) cannot change anything
+/// visible: no button held (no selection/divider/tab drag), Ctrl not held (no
+/// URL hover underline), no egui overlay (menu, dialog, tooltip) under the
+/// pointer, and the pointer inside one of last frame's quiet terminal rects.
+fn cursor_motion_is_quiet(
+    ctx: &egui::Context,
+    quiet_rects: &[egui::Rect],
+    pos: egui::Pos2,
+    ctrl_held: bool,
+) -> bool {
+    if ctrl_held || ctx.input(|i| i.pointer.any_down()) {
+        return false;
+    }
+    let over_overlay = ctx
+        .layer_id_at(pos)
+        .is_some_and(|l| l.order != egui::Order::Background);
+    !over_overlay && quiet_rects.iter().any(|r| r.contains(pos))
+}
+
 // --- Main application handler ---
 
 struct WinitApp {
@@ -341,6 +360,10 @@ struct WinitApp {
     // event carries no coordinates, so we use the most recent CursorMoved to
     // resolve which pane an external drop lands on.
     last_cursor_pos: Option<winit::dpi::PhysicalPosition<f64>>,
+    // Whether the last CursorMoved landed in a quiet terminal region (see
+    // `cursor_motion_is_quiet`); a transition out of or into one must
+    // repaint so hover state outside the terminal updates.
+    cursor_in_quiet_rect: bool,
 }
 
 impl WinitApp {
@@ -368,6 +391,7 @@ impl WinitApp {
             last_paint_cost: None,
             main_focused: true,
             last_cursor_pos: None,
+            cursor_in_quiet_rect: false,
         }
     }
 }
@@ -828,12 +852,37 @@ impl WinitApp {
             }
         }
 
+        // CursorMoved is special-cased: egui_winit reports `repaint: true` for
+        // every pointer motion, which would turn mouse waving over the terminal
+        // into a stream of full frames (egui pass + every pane's GL draw + swap,
+        // tens of ms each under software rasterization). Motion over terminal
+        // cells has no visual effect, so a cheap hit-test against last frame's
+        // pane rects decides instead; everything pointer-dependent (drags,
+        // Ctrl URL hover, egui overlays, hover on tab bar/dividers/scrollbar,
+        // any-motion mouse reporting) falls outside the quiet regions.
+        let motion_repaint = match &event {
+            WindowEvent::CursorMoved { position, .. } => {
+                let ppp = win.gl_window.egui_ctx.pixels_per_point();
+                let pos = egui::pos2((position.x as f32) / ppp, (position.y as f32) / ppp);
+                let quiet = cursor_motion_is_quiet(
+                    &win.gl_window.egui_ctx,
+                    &win.pane_view.quiet_rects,
+                    pos,
+                    self.current_modifiers.state().control_key(),
+                );
+                let needs = !(quiet && self.cursor_in_quiet_rect);
+                self.cursor_in_quiet_rect = quiet;
+                Some(needs)
+            }
+            _ => None,
+        };
+
         let response = win
             .gl_window
             .egui_winit
             .on_window_event(&win.gl_window.window, &event);
 
-        if response.repaint {
+        if motion_repaint.unwrap_or(response.repaint) {
             self.repaint_pending = true;
         }
         if response.consumed {

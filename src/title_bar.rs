@@ -27,6 +27,9 @@ pub struct TitleBarModel {
     /// Broadcast role of this pane relative to the focused pane.
     pub indicator: Indicator,
     pub focused: bool,
+    /// Whether the window itself has focus; an unfocused window paints every
+    /// title bar with the inactive colors (Terminator 'window-focus-out').
+    pub window_focused: bool,
 }
 
 /// Split a pane rect into its (title, terminal) sub-rects via `PANE_TITLE_HEIGHT`.
@@ -45,18 +48,8 @@ pub fn split_rect(pane_rect: egui::Rect) -> (egui::Rect, egui::Rect) {
 /// Paint the title strip: background, centered title+dimensions text, the
 /// left-aligned group-name label, and the right-aligned broadcast dot.
 pub fn paint(ui: &mut egui::Ui, title_rect: egui::Rect, model: &TitleBarModel, cfg: &Config) {
-    let bg = if model.focused {
-        Color32::from_gray(50)
-    } else {
-        Color32::from_gray(30)
-    };
+    let (text_color, bg) = state_colors(model, cfg);
     ui.painter().rect_filled(title_rect, 0.0, bg);
-
-    let text_color = if model.focused {
-        Color32::from_gray(220)
-    } else {
-        Color32::from_gray(140)
-    };
 
     // Centered: "<name>  <cols>x<lines>", or just the dims when unnamed.
     let dims = format!("{}x{}", model.cols, model.lines);
@@ -91,6 +84,25 @@ pub fn paint(ui: &mut egui::Ui, title_rect: egui::Rect, model: &TitleBarModel, c
         let center = egui::pos2(title_rect.right() - r - 6.0, title_rect.center().y);
         ui.painter().circle_filled(center, r, color);
     }
+}
+
+/// (fg, bg) for the title bar, keyed exactly as Terminator titlebar.py
+/// set_from_terminal: the focused pane transmits (whatever the broadcast
+/// scope), a receiving pane gets the receive colors, everything else (and every
+/// pane of an unfocused window) is inactive.
+fn state_colors(model: &TitleBarModel, cfg: &Config) -> (Color32, Color32) {
+    let t = &cfg.active().colors.title;
+    let (fg, bg) = if !model.window_focused {
+        (t.inactive_fg_rgb(), t.inactive_bg_rgb())
+    } else if model.focused {
+        (t.transmit_fg_rgb(), t.transmit_bg_rgb())
+    } else if model.indicator == Indicator::ReceiveOn {
+        (t.receive_fg_rgb(), t.receive_bg_rgb())
+    } else {
+        (t.inactive_fg_rgb(), t.inactive_bg_rgb())
+    };
+    let to32 = |[r, g, b]: [u8; 3]| Color32::from_rgb(r, g, b);
+    (to32(fg), to32(bg))
 }
 
 /// Map a broadcast indicator to its dot color, reusing `broadcast_border_rgb`.

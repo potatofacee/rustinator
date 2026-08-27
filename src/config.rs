@@ -122,6 +122,10 @@ pub struct Profile {
     pub smart_copy: bool,
     #[serde(default = "default_true")]
     pub cursor_blink: bool,
+    /// Cursor shape used until an application picks one with DECSCUSR (and
+    /// again after it resets). Terminator: Profiles > General cursor_shape.
+    #[serde(default)]
+    pub cursor_shape: CursorShape,
     #[serde(default)]
     pub scroll_on_output: bool,
     #[serde(default = "default_true")]
@@ -132,11 +136,18 @@ pub struct Profile {
     pub word_chars: String,
     #[serde(default)]
     pub exit_action: ExitAction,
-    /// Alpha (0-255) of the black overlay drawn over unfocused panes to dim
-    /// them. Higher = darker. Defaults to 50 to match the previous hardcoded
-    /// value. (Analogous to terminator's inactive_color_offset.)
-    #[serde(default = "default_inactive_dim_alpha")]
-    pub inactive_dim_alpha: u8,
+    /// Factor (0.0-1.0) multiplied into the foreground and the 16 ANSI palette
+    /// colors of unfocused panes (Terminator's inactive_color_offset).
+    /// Render bold text in ANSI colors 0-7 with the bright variant 8-15
+    /// (Terminator Profiles > Colors bold_is_bright). Default off.
+    #[serde(default)]
+    pub bold_is_bright: bool,
+    #[serde(default = "default_inactive_color_offset")]
+    pub inactive_color_offset: f32,
+    /// Factor (0.0-1.0) multiplied into the default background of unfocused
+    /// panes (Terminator's inactive_bg_color_offset). 1.0 = unchanged.
+    #[serde(default = "default_inactive_bg_color_offset")]
+    pub inactive_bg_color_offset: f32,
     /// Run `custom_command` through the shell instead of an interactive shell.
     #[serde(default)]
     pub use_custom_command: bool,
@@ -147,6 +158,30 @@ pub struct Profile {
     /// the default profile reproduces today's spawn behavior.
     #[serde(default = "default_true")]
     pub login_shell: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum CursorShape {
+    #[default]
+    Block,
+    Beam,
+    Underline,
+}
+
+impl CursorShape {
+    /// The alacritty default cursor style for this shape. `blinking` stays
+    /// false: blink is driven by `Profile.cursor_blink` in the renderer, so an
+    /// app's DECSCUSR reset lands on the same non-blinking default as before.
+    pub fn term_style(self) -> alacritty_terminal::vte::ansi::CursorStyle {
+        use alacritty_terminal::vte::ansi::CursorShape as Shape;
+        let shape = match self {
+            CursorShape::Block => Shape::Block,
+            CursorShape::Beam => Shape::Beam,
+            CursorShape::Underline => Shape::Underline,
+        };
+        alacritty_terminal::vte::ansi::CursorStyle { shape, blinking: false }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
@@ -166,8 +201,12 @@ fn default_word_chars() -> String {
     "-A-Za-z0-9,./?%&#:_=+@~".into()
 }
 
-fn default_inactive_dim_alpha() -> u8 {
-    50
+fn default_inactive_color_offset() -> f32 {
+    0.8
+}
+
+fn default_inactive_bg_color_offset() -> f32 {
+    1.0
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -192,6 +231,56 @@ pub struct ColorsConfig {
     /// Selection colors. Empty string = invert the cell's fg/bg (default).
     pub selection_background: String,
     pub selection_foreground: String,
+    /// Per-state title bar colors (Terminator Profiles > Titlebar).
+    pub title: TitleColors,
+}
+
+/// Title bar fg/bg per broadcast state: transmit = the focused pane, receive
+/// = an unfocused pane receiving broadcast input, inactive = everything else
+/// (including every pane while the window is unfocused). Terminator defaults.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct TitleColors {
+    pub transmit_fg: String,
+    pub transmit_bg: String,
+    pub receive_fg: String,
+    pub receive_bg: String,
+    pub inactive_fg: String,
+    pub inactive_bg: String,
+}
+
+impl Default for TitleColors {
+    fn default() -> Self {
+        Self {
+            transmit_fg: "#ffffff".into(),
+            transmit_bg: "#c80003".into(),
+            receive_fg: "#ffffff".into(),
+            receive_bg: "#0076c9".into(),
+            inactive_fg: "#000000".into(),
+            inactive_bg: "#c0bebf".into(),
+        }
+    }
+}
+
+impl TitleColors {
+    pub fn transmit_fg_rgb(&self) -> [u8; 3] {
+        parse_hex(&self.transmit_fg).unwrap_or([0xff, 0xff, 0xff])
+    }
+    pub fn transmit_bg_rgb(&self) -> [u8; 3] {
+        parse_hex(&self.transmit_bg).unwrap_or([0xc8, 0x00, 0x03])
+    }
+    pub fn receive_fg_rgb(&self) -> [u8; 3] {
+        parse_hex(&self.receive_fg).unwrap_or([0xff, 0xff, 0xff])
+    }
+    pub fn receive_bg_rgb(&self) -> [u8; 3] {
+        parse_hex(&self.receive_bg).unwrap_or([0x00, 0x76, 0xc9])
+    }
+    pub fn inactive_fg_rgb(&self) -> [u8; 3] {
+        parse_hex(&self.inactive_fg).unwrap_or([0x00, 0x00, 0x00])
+    }
+    pub fn inactive_bg_rgb(&self) -> [u8; 3] {
+        parse_hex(&self.inactive_bg).unwrap_or([0xc0, 0xbe, 0xbf])
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -268,12 +357,15 @@ impl Profile {
             copy_on_selection: false,
             smart_copy: false,
             cursor_blink: true,
+            cursor_shape: CursorShape::Block,
             scroll_on_output: false,
             scroll_on_keystroke: true,
             clear_wipes_scrollback: false,
             word_chars: default_word_chars(),
             exit_action: ExitAction::Close,
-            inactive_dim_alpha: default_inactive_dim_alpha(),
+            bold_is_bright: false,
+            inactive_color_offset: default_inactive_color_offset(),
+            inactive_bg_color_offset: default_inactive_bg_color_offset(),
             use_custom_command: false,
             custom_command: String::new(),
             login_shell: true,
@@ -349,6 +441,7 @@ impl Default for ColorsConfig {
             broadcast_border: "#c05050".into(),
             selection_background: String::new(),
             selection_foreground: String::new(),
+            title: TitleColors::default(),
         }
     }
 }
@@ -483,12 +576,15 @@ impl Config {
                 copy_on_selection: false,
                 smart_copy: false,
                 cursor_blink: true,
+                cursor_shape: CursorShape::Block,
                 scroll_on_output: false,
                 scroll_on_keystroke: true,
                 clear_wipes_scrollback: false,
                 word_chars: default_word_chars(),
                 exit_action: ExitAction::Close,
-                inactive_dim_alpha: default_inactive_dim_alpha(),
+                bold_is_bright: false,
+                inactive_color_offset: default_inactive_color_offset(),
+            inactive_bg_color_offset: default_inactive_bg_color_offset(),
                 use_custom_command: false,
                 custom_command: String::new(),
                 login_shell: true,
@@ -848,9 +944,27 @@ mod tests {
 
     // Gap #43: inactive terminal dimming
     #[test]
-    #[ignore = "gap #43: inactive_color_offset not yet in Profile"]
     fn config_profile_inactive_dimming() {
-        panic!("add inactive_color_offset: f32 to Profile (0.0-1.0, dims unfocused panes)");
+        let p = Profile::default();
+        assert!((p.inactive_color_offset - 0.8).abs() < f32::EPSILON);
+        assert!((p.inactive_bg_color_offset - 1.0).abs() < f32::EPSILON);
+
+        let mut cfg = Config::default();
+        cfg.active_mut().inactive_color_offset = 0.55;
+        cfg.active_mut().inactive_bg_color_offset = 0.9;
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        let parsed: Config = toml::from_str(&text).unwrap();
+        assert!((parsed.active().inactive_color_offset - 0.55).abs() < 1e-6);
+        assert!((parsed.active().inactive_bg_color_offset - 0.9).abs() < 1e-6);
+
+        // The retired overlay key is ignored, not an error.
+        let toml_text = r##"
+            [[profiles]]
+            name = "Test"
+            inactive_dim_alpha = 50
+        "##;
+        let cfg: Config = toml::from_str(toml_text).unwrap();
+        assert!((cfg.profiles[0].inactive_color_offset - 0.8).abs() < f32::EPSILON);
     }
 
     // Gap #33: cell height/width scaling
@@ -913,6 +1027,45 @@ mod tests {
         assert_eq!(parsed.active().colors.background, "#002b36");
         assert_eq!(parsed.active().scrollback.history, 25_000);
         assert!((parsed.active().transparency.opacity - 0.9).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn cursor_shape_round_trips_and_defaults_block() {
+        assert_eq!(Profile::default().cursor_shape, CursorShape::Block);
+        let mut cfg = Config::default();
+        cfg.active_mut().cursor_shape = CursorShape::Beam;
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        assert!(text.contains("cursor_shape = \"beam\""));
+        let parsed: Config = toml::from_str(&text).unwrap();
+        assert_eq!(parsed.active().cursor_shape, CursorShape::Beam);
+        assert_eq!(
+            CursorShape::Underline.term_style().shape,
+            alacritty_terminal::vte::ansi::CursorShape::Underline
+        );
+    }
+
+    #[test]
+    fn title_colors_round_trip_and_default() {
+        let t = TitleColors::default();
+        assert_eq!(t.transmit_bg_rgb(), [0xc8, 0x00, 0x03]);
+        assert_eq!(t.receive_bg_rgb(), [0x00, 0x76, 0xc9]);
+        assert_eq!(t.inactive_fg_rgb(), [0x00, 0x00, 0x00]);
+        let mut cfg = Config::default();
+        cfg.active_mut().colors.title.receive_fg = "#123456".into();
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        let parsed: Config = toml::from_str(&text).unwrap();
+        assert_eq!(parsed.active().colors.title.receive_fg_rgb(), [0x12, 0x34, 0x56]);
+        assert_eq!(parsed.active().colors.title.inactive_bg_rgb(), [0xc0, 0xbe, 0xbf]);
+    }
+
+    #[test]
+    fn bold_is_bright_round_trips_and_defaults_false() {
+        assert!(!Profile::default().bold_is_bright);
+        let mut cfg = Config::default();
+        cfg.active_mut().bold_is_bright = true;
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        let parsed: Config = toml::from_str(&text).unwrap();
+        assert!(parsed.active().bold_is_bright);
     }
 
     #[test]

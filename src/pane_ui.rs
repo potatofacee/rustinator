@@ -20,6 +20,14 @@ use crate::title_bar::{self, TitleBarModel};
 
 const FOCUS_BORDER: f32 = 1.0;
 const CURSOR_BLINK_INTERVAL_MS: u128 = 530;
+/// Blinking stops (cursor held in its visible phase, no wake timer armed) this
+/// long after the last keyboard input to the terminal. Mirrors alacritty's
+/// `cursor.blink_timeout`.
+const CURSOR_BLINK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Width of the scrollbar track painted along a pane's right edge (see
+/// `paint_scrollbar`); its hover tint is the one pointer-dependent visual
+/// inside a terminal rect.
+const SCROLLBAR_WIDTH: f32 = 8.0;
 
 /// A drag-and-drop payload originating outside the app (an OS file drop). winit's
 /// `DroppedFile` carries only a path and no coordinates, so window.rs records the
@@ -34,6 +42,12 @@ pub(crate) struct PaneViewState {
     pub drag_source_pane: Option<PaneId>,
     pub last_pane_rect: Option<egui::Rect>,
     pub last_root_rect: Option<egui::Rect>,
+    /// Terminal cell regions (from the last frame) in which plain pointer motion
+    /// changes nothing visible: the scrollbar strip is excluded, and a pane whose
+    /// app has requested any-motion mouse reporting (1003) is excluded since its
+    /// motion must reach the PTY through a frame. window.rs consults this to
+    /// decide whether a `CursorMoved` needs a repaint at all.
+    pub quiet_rects: Vec<egui::Rect>,
     pub layout_restore_pending: Option<SavedLayout>,
     pub pending_external_drop: Option<ExternalDrop>,
     /// A profile switch selected from the right-click "Profiles" submenu. The
@@ -49,6 +63,7 @@ impl PaneViewState {
             drag_source_pane: None,
             last_pane_rect: None,
             last_root_rect: None,
+            quiet_rects: Vec::new(),
             layout_restore_pending: None,
             pending_external_drop: None,
             profile_switch_pending: None,
@@ -63,6 +78,7 @@ pub(crate) struct PaneViewCtx<'a> {
     pub font: &'a Arc<Mutex<FontContext>>,
     pub renderer: &'a Arc<Mutex<Renderer>>,
     pub cursor_blink_epoch: Instant,
+    pub window_focused: bool,
     pub user_config: &'a Config,
     pub bindings: &'a BindingTable,
     pub egui_ctx: &'a egui::Context,
@@ -76,6 +92,7 @@ pub(crate) fn draw_panes(
 ) -> Vec<Action> {
     let root_rect = ui.available_rect_before_wrap();
     state.last_root_rect = Some(root_rect);
+    state.quiet_rects.clear();
     // Keep cell metrics on the tab manager fresh so keyboard split-resize can
     // enforce a minimum pane size (see TabManager::resize_split).
     ctx.tab_mgr.cell_w = ctx.cell_w;
@@ -177,6 +194,18 @@ fn draw_leaf(
     }
 
     pane_drop_rects.push((id, rect));
+
+    let reports_any_motion = ctx.tab_mgr.tabs[ctx.tab_mgr.active_tab]
+        .panes
+        .get(&id)
+        .is_some_and(|p| p.mode().contains(TermMode::MOUSE_MOTION));
+    if !reports_any_motion {
+        let quiet = egui::Rect::from_min_max(
+            terminal_rect.min,
+            egui::pos2(terminal_rect.right() - SCROLLBAR_WIDTH, terminal_rect.bottom()),
+        );
+        state.quiet_rects.push(quiet);
+    }
 
     let response = ui.interact(
         terminal_rect,
@@ -286,6 +315,7 @@ fn draw_title_bar(
         ctx.tab_mgr.tabs[ctx.tab_mgr.active_tab].panes.get(&id),
         scope,
         focused,
+        ctx.window_focused,
         cols,
         lines,
         focused_group,
@@ -300,6 +330,7 @@ fn title_bar_model(
     pane: Option<&crate::pane::Pane>,
     scope: BroadcastScope,
     focused: bool,
+    window_focused: bool,
     cols: usize,
     lines: usize,
     focused_group: Option<&str>,
@@ -312,6 +343,7 @@ fn title_bar_model(
         group: pane.and_then(|p| p.group.clone()),
         indicator: groups::indicator(scope, focused, this_group, focused_group),
         focused,
+        window_focused,
     }
 }
 
@@ -828,7 +860,7 @@ fn paint_scrollbar(
         let (offset, history, screen) = pane.scroll_info();
         if history > 0 && pane.scrollbar_visible {
             let total = history + screen;
-            let sb_width = 8.0;
+            let sb_width = SCROLLBAR_WIDTH;
             let track = egui::Rect::from_min_max(
                 egui::pos2(inner_rect.right() - sb_width, inner_rect.top()),
                 inner_rect.right_bottom(),
@@ -914,14 +946,19 @@ fn paint_pane(
     let new_lines = ((height_px / cell_h).floor() as usize).max(1);
     pane.resize(new_cols, new_lines, cell_w, cell_h);
 
-    let frame = pane.frame();
+    let frame = pane.frame(focused);
 
     let should_blink = cursor_blink_enabled || frame.cursor_blink_requested;
-    let blink_off = should_blink
+    // Blink only while the pane and the window are focused and keyboard input
+    // was recent; once timed out the cursor rests in its visible phase and no
+    // wake timer is armed, so an idle window issues zero frames.
+    let blinking = should_blink
         && focused
-        && (blink_elapsed.as_millis() / CURSOR_BLINK_INTERVAL_MS) % 2 == 1;
+        && ctx.window_focused
+        && blink_elapsed < CURSOR_BLINK_TIMEOUT;
+    let blink_off = blinking && (blink_elapsed.as_millis() / CURSOR_BLINK_INTERVAL_MS) % 2 == 1;
 
-    if focused && should_blink && frame.cursor.is_some() {
+    if blinking && frame.cursor.is_some() {
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(CURSOR_BLINK_INTERVAL_MS as u64));
     }
 
@@ -1243,15 +1280,6 @@ fn paint_pane(
         rect: inner_rect,
         callback: Arc::new(cb),
     });
-
-    if !focused {
-        let dim_alpha = ctx.user_config.active().inactive_dim_alpha;
-        ui.painter().rect_filled(
-            rect,
-            0.0,
-            egui::Color32::from_black_alpha(dim_alpha),
-        );
-    }
 
     paint_scrollbar(ui, ctx.tab_mgr.active_tab, &ctx.tab_mgr.tabs[ctx.tab_mgr.active_tab], pane_id, inner_rect);
 

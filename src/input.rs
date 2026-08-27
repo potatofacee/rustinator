@@ -18,9 +18,9 @@ pub(crate) fn process_keys(
     targets: &[&Pane],
     focused_alt_screen: bool,
     scroll_on_keystroke: bool,
-) -> Vec<Action> {
+) -> (Vec<Action>, bool) {
     if targets.is_empty() {
-        return Vec::new();
+        return (Vec::new(), false);
     }
 
     // When the focused pane is in alt-screen, the three default Linux bindings
@@ -89,7 +89,7 @@ pub(crate) fn process_keys(
         });
     });
 
-    actions
+    (actions, has_unconsumed)
 }
 
 /// True when a bound action is one of the three Linux navigation bindings that

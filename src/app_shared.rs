@@ -86,6 +86,7 @@ impl AppShared {
         term_config.kitty_keyboard = true;
         term_config.semantic_escape_chars =
             config::word_chars_to_semantic_escape(&profile.word_chars);
+        term_config.default_cursor_style = profile.cursor_shape.term_style();
 
         let pane_defaults = defaults_from_profile(profile);
 
@@ -131,6 +132,7 @@ impl AppShared {
         let mut term_config = self.term_config.clone();
         term_config.scrolling_history = resolved.scrolling_history;
         term_config.semantic_escape_chars = resolved.semantic_escape_chars;
+        term_config.default_cursor_style = resolved.cursor_style;
         PaneFactory {
             cell_w: font.cell_w,
             cell_h: font.cell_h,
@@ -195,6 +197,7 @@ impl AppShared {
         self.term_config.scrolling_history = profile.scrollback.effective_history();
         self.term_config.semantic_escape_chars =
             config::word_chars_to_semantic_escape(&profile.word_chars);
+        self.term_config.default_cursor_style = profile.cursor_shape.term_style();
 
         let size_changed = (profile.font.size - old_profile.font.size).abs() > 0.001;
         let font_changed = profile.font.family != old_profile.font.family || size_changed;

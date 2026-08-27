@@ -181,6 +181,9 @@ pub(crate) struct AppWindow {
     /// logic pass, stale egui keyboard focus is cleared so terminal input flows
     /// again without requiring a click. See `logic`.
     focus_regained: bool,
+    /// OS focus of this window, mirrored from `WindowEvent::Focused`. The
+    /// cursor only blinks (and only arms its wake timer) while this is true.
+    window_focused: bool,
     pub(crate) pending_raw_keys: Vec<RawTermKey>,
 }
 
@@ -275,6 +278,7 @@ impl AppWindow {
             fullscreen_pending: false,
             pending_zoom_steps: 0,
             focus_regained: false,
+            window_focused: true,
             pending_raw_keys: Vec::new(),
         };
         window.apply_startup_layout(shared);
@@ -466,6 +470,7 @@ impl AppWindow {
         let mut term_config = shared.term_config.clone();
         term_config.scrolling_history = resolved.scrolling_history;
         term_config.semantic_escape_chars = resolved.semantic_escape_chars;
+        term_config.default_cursor_style = resolved.cursor_style;
         let Some(pane) = self
             .tab_mgr
             .tabs
@@ -658,6 +663,7 @@ impl AppWindow {
     }
 
     pub(crate) fn notify_focus(&mut self, focused: bool) {
+        self.window_focused = focused;
         if focused {
             self.focus_regained = true;
         }
@@ -741,7 +747,12 @@ impl AppWindow {
                 .map(|p| p.mode().contains(alacritty_terminal::term::TermMode::ALT_SCREEN))
                 .unwrap_or(false);
             let scroll_on_keystroke = shared.user_config.active().scroll_on_keystroke;
-            let actions = input::process_keys(ctx, &shared.bindings, raw_keys, &targets, focused_alt_screen, scroll_on_keystroke);
+            let (actions, sent_input) = input::process_keys(ctx, &shared.bindings, raw_keys, &targets, focused_alt_screen, scroll_on_keystroke);
+            // Keyboard input to the terminal restarts the cursor blink in its
+            // visible phase and restarts the blink timeout (alacritty semantics).
+            if sent_input {
+                shared.cursor_blink_epoch = std::time::Instant::now();
+            }
             self.execute_pane_actions(shared, ctx, actions);
         }
     }
@@ -852,6 +863,7 @@ impl AppWindow {
                 font: &self.font.ctx,
                 renderer: &self.renderer,
                 cursor_blink_epoch: shared.cursor_blink_epoch,
+                window_focused: self.window_focused,
                 user_config: view_config,
                 bindings: &shared.bindings,
                 egui_ctx: &egui_ctx,
