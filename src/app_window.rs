@@ -17,7 +17,7 @@ use crate::dialogs::{DialogAction, DialogState};
 use crate::font::{self, FontContext};
 use crate::gl_window::GlWindow;
 use crate::groups::{self, BroadcastScope};
-use crate::input;
+use crate::input::{self, KeyBuiltin, ViewScroll};
 use crate::keybindings::Action;
 use crate::layout::Direction;
 use crate::pane::{Pane, PaneDefaults, PaneId};
@@ -165,6 +165,10 @@ impl FontView {
     }
 }
 
+/// Terminator's user manual, which documents the behaviour rustinator mirrors
+/// (`util.manual_lookup`, English being the only available language).
+const TERMINATOR_MANUAL_URL: &str = "http://gnome-terminator.readthedocs.io/en/latest/";
+
 pub(crate) struct AppWindow {
     pub(crate) gl_window: GlWindow,
     tab_mgr: TabManager,
@@ -175,7 +179,16 @@ pub(crate) struct AppWindow {
     /// Persistent tab-bar UI state (drag + inline-rename).
     tab_bar: TabBarState,
     current_title: String,
+    /// Title forced by "Rename Window" (Terminator `WindowTitle.forced`): while
+    /// set, the OS window title is exactly this text and the focused pane's
+    /// title no longer drives it.
+    window_title_override: Option<String>,
     pub(crate) fullscreen_pending: bool,
+    /// Ctrl+wheel notches since the last frame, applied as `zoom_in`/
+    /// `zoom_out` steps. Terminator sizes the font per terminal
+    /// (`custom_font_size`); the glyph atlas and cell metrics here are one
+    /// per window (`FontView`), so the wheel and the zoom bindings size every
+    /// pane of the window.
     pub(crate) pending_zoom_steps: i32,
     /// Set when this window regains OS focus (e.g. via Cmd+Tab). On the next
     /// logic pass, stale egui keyboard focus is cleared so terminal input flows
@@ -274,6 +287,7 @@ impl AppWindow {
             dialogs: DialogState::new(),
             pane_view: PaneViewState::new(),
             tab_bar: TabBarState::new(),
+            window_title_override: None,
             current_title: "rustinator".into(),
             fullscreen_pending: false,
             pending_zoom_steps: 0,
@@ -299,7 +313,9 @@ impl AppWindow {
             .get(&tab.focused)
             .and_then(|p| p.title())
             .unwrap_or_default();
-        let desired = if focused_title.is_empty() {
+        let desired = if let Some(forced) = &self.window_title_override {
+            forced.clone()
+        } else if focused_title.is_empty() {
             "rustinator".to_string()
         } else {
             format!("{} — rustinator", focused_title)
@@ -341,8 +357,23 @@ impl AppWindow {
                 Action::NextTab => self.tab_mgr.switch_tab(1),
                 Action::PrevTab => self.tab_mgr.switch_tab(-1),
                 Action::OpenPrefs => shared.open_prefs(),
-                Action::Copy => self.tab_mgr.copy_selection(&self.gl_window.egui_ctx, shared.user_config.active().smart_copy),
+                Action::Copy => self.tab_mgr.copy_selection(&self.gl_window.egui_ctx),
                 Action::Paste => self.tab_mgr.paste_from_clipboard(),
+                // `key_paste_selection` (terminal.py:2034-2035): PRIMARY into
+                // the same broadcast targets as Paste.
+                Action::PasteSelection => {
+                    let focused = self.tab_mgr.active_tab().focused;
+                    self.tab_mgr.paste_primary(focused);
+                }
+                // `key_send_newline` (terminal.py:2037-2038) feeds LF to the
+                // focused terminal alone — `feed` is vte.feed_child on self,
+                // not a broadcast — and VTE's input_enabled gate drops fed
+                // text on a read-only terminal.
+                Action::SendNewline => {
+                    if let Some(pane) = self.tab_mgr.active_pane().filter(|p| !p.read_only) {
+                        pane.send_bytes(b"\n".to_vec());
+                    }
+                }
                 Action::ToggleZoom => self.tab_mgr.toggle_zoom(),
                 Action::ScaledZoom => self.toggle_scaled_zoom(shared),
                 Action::ToggleBroadcast => self.tab_mgr.toggle_broadcast(),
@@ -402,6 +433,15 @@ impl AppWindow {
                         pane.scrollbar_visible = !pane.scrollbar_visible;
                     }
                 }
+                // `key_page_up` and friends (terminal.py:2284-2300) move the
+                // focused terminal's own view (`scroll_by_page`/`scroll_by_line`
+                // on self); a binding is never broadcast.
+                Action::PageUp => self.scroll_focused_view(ViewScroll::Pages(1.0)),
+                Action::PageDown => self.scroll_focused_view(ViewScroll::Pages(-1.0)),
+                Action::PageUpHalf => self.scroll_focused_view(ViewScroll::Pages(0.5)),
+                Action::PageDownHalf => self.scroll_focused_view(ViewScroll::Pages(-0.5)),
+                Action::LineUp => self.scroll_focused_view(ViewScroll::Lines(1)),
+                Action::LineDown => self.scroll_focused_view(ViewScroll::Lines(-1)),
                 Action::HideWindow => {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
                 }
@@ -420,8 +460,81 @@ impl AppWindow {
                 // Gap #4: open the Layout Launcher modal (Alt+L). The dialog is
                 // owned/drawn by dialogs.rs; this only flips its open flag.
                 Action::LayoutLauncher => self.dialogs.layout_launcher_dialog = true,
+                // Terminator's remaining default chords. They exist as actions
+                // so the chord is consumed like `on_keypress` does, instead of
+                // falling through to the shell as a control byte (R-013).
+                Action::EditWindowTitle => {
+                    self.dialogs.window_title_buf =
+                        self.window_title_override.clone().unwrap_or_default();
+                    self.dialogs.window_title_dialog = true;
+                }
+                Action::EditTabTitle => self.tab_bar.start_rename(
+                    &self.tab_mgr.tabs,
+                    self.tab_mgr.active_tab,
+                    shared.user_config.global.tab_position,
+                ),
+                // Per-pane custom titles do not exist yet (the pane title bar
+                // shows the terminal's own title), so there is no label to
+                // edit; the chord is still consumed as in Terminator.
+                Action::EditTerminalTitle => {}
+                // Detaching a tab needs a second window in this process; the
+                // tab strip reserves the seam (`tab_bar` Detach) for the
+                // multi-window block. Terminator likewise refuses outside a
+                // notebook; the chord is consumed either way.
+                Action::DetachTab => {}
+                Action::PrefsKeybindings => shared.open_prefs_keybindings(),
+                Action::Help => pane_ui::open_url(TERMINATOR_MANUAL_URL),
+                // `spawn_new_terminator`: a fresh process, which is also what
+                // NewWindow does until windows share one process.
+                Action::NewTerminator => {
+                    if let Ok(exe) = std::env::current_exe() {
+                        let _ = std::process::Command::new(exe).spawn();
+                    }
+                }
             }
         }
+    }
+
+    fn scroll_focused_view(&self, scroll: ViewScroll) {
+        if let Some(pane) = self.tab_mgr.active_pane() {
+            scroll.apply(pane);
+        }
+    }
+
+    /// What VTE does with a key press itself (`input::key_builtin`), on every
+    /// pane the press lands on (`select_key_targets`): each re-emitted VTE
+    /// decides for itself, so a scrollback key moves the view of a target on
+    /// its normal screen and is the child's on one showing the alternate
+    /// screen; an Insert chord pastes into (copies from) the input targets,
+    /// and VTE's scroll-on-keystroke jump follows it as after any key it did
+    /// not scroll on. Returns whether bytes reached a PTY.
+    fn run_key_builtin(&self, builtin: KeyBuiltin, rk: &RawTermKey, scroll_on_keystroke: bool) -> bool {
+        let scope = self.tab_mgr.broadcast_scope;
+        let tab = self.tab_mgr.active_tab();
+        match builtin {
+            KeyBuiltin::Scroll(scroll) => {
+                let mut to_child = Vec::new();
+                for pane in tab.select_key_targets(scope) {
+                    if pane.mode().contains(alacritty_terminal::term::TermMode::ALT_SCREEN) {
+                        if !pane.read_only {
+                            to_child.push(pane);
+                        }
+                    } else {
+                        scroll.apply(pane);
+                    }
+                }
+                return input::send_key(rk, &to_child, scroll_on_keystroke);
+            }
+            KeyBuiltin::PastePrimary => self.tab_mgr.paste_primary(tab.focused),
+            KeyBuiltin::Copy => self.tab_mgr.copy_selection(&self.gl_window.egui_ctx),
+            KeyBuiltin::PasteClipboard => self.tab_mgr.paste_from_clipboard(),
+        }
+        if scroll_on_keystroke {
+            for pane in tab.select_input_targets(scope) {
+                pane.scroll_to_bottom();
+            }
+        }
+        false
     }
 
     /// Routes the 10 group/broadcast actions out of `execute_pane_actions`. Each
@@ -679,7 +792,10 @@ impl AppWindow {
         self.font.set_scale_factor(scale_factor, &self.renderer, shared.base_size, &family, &mut self.tab_mgr);
     }
 
-    pub(crate) fn logic(&mut self, shared: &mut AppShared, ctx: &egui::Context) {
+    /// `egui_owns_keys` is the keyboard owner sampled by the caller before
+    /// egui's pass (see `paint`): true when an egui text field held focus as
+    /// this frame's keys arrived, so they are egui's and must not reach a PTY.
+    pub(crate) fn logic(&mut self, shared: &mut AppShared, ctx: &egui::Context, egui_owns_keys: bool) {
         // Prefs closed (Cancel or window close) with a color preview pushed:
         // restore the saved profile's colors. After Apply the saved config
         // equals the previewed draft, so this push is a visual no-op.
@@ -724,36 +840,96 @@ impl AppWindow {
         // still hold keyboard focus on a widget from before the switch, which
         // makes `egui_wants_keyboard_input()` true and silently drops terminal
         // keys until the user clicks. Clear that stale focus so typing resumes
-        // immediately — but only when no text-input dialog is open.
+        // immediately — but only when no text-input dialog is open. Keys that
+        // arrived under that stale focus belong to the terminal.
+        let mut egui_owns_keys = egui_owns_keys;
         if std::mem::take(&mut self.focus_regained)
             && !self.dialogs.wants_text_input()
             && !self.tab_bar.is_renaming()
         {
             if let Some(id) = ctx.memory(|m| m.focused()) {
                 ctx.memory_mut(|m| m.surrender_focus(id));
+                egui_owns_keys = false;
             }
         }
-        if self.tab_mgr.tabs.is_empty() || ctx.egui_wants_keyboard_input() {
+        // A modal dialog holds the keyboard for as long as it is open
+        // (Terminator's Gtk.Dialog MODAL), including the frame before its
+        // field first draws and takes egui focus; its key events stay in
+        // egui's input so the dialog itself still sees Escape.
+        if self.tab_mgr.tabs.is_empty() || self.dialogs.modal_open() {
             self.pending_raw_keys.clear();
+        } else if egui_owns_keys {
+            // An in-window text field (search bar, tab label) has the keys.
+            // Only the toplevel's own bindings still apply, as Terminator's
+            // `Window.on_key_press` runs ahead of the focus widget.
+            let raw_keys = std::mem::take(&mut self.pending_raw_keys);
+            let actions = input::process_window_keys(ctx, &shared.bindings, raw_keys);
+            self.execute_pane_actions(shared, ctx, actions);
         } else {
             let raw_keys = std::mem::take(&mut self.pending_raw_keys);
+            self.route_raw_keys(shared, ctx, raw_keys);
+        }
+    }
+
+    /// True while an in-window text field is up and will hold egui keyboard
+    /// focus: the search bar or the inline tab rename (the modal dialogs are
+    /// gated separately, before this is consulted).
+    fn text_field_open(&self) -> bool {
+        self.dialogs.wants_text_input() || self.tab_bar.is_renaming()
+    }
+
+    /// Route this frame's raw keys to bindings and PTYs one key at a time, in
+    /// arrival order. A binding runs before the next key is looked at, so a
+    /// key typed right after a focus-changing chord (split, tab switch,
+    /// Alt+arrow) reaches the pane focused *after* the chord — GTK delivers
+    /// each key event to the widget focused at that moment, and resolving the
+    /// targets once for the whole batch sent them to the previous pane.
+    fn route_raw_keys(&mut self, shared: &mut AppShared, ctx: &egui::Context, raw_keys: Vec<RawTermKey>) {
+        let scroll_on_keystroke = shared.user_config.active().scroll_on_keystroke;
+        let mut sent_input = false;
+        for rk in raw_keys {
+            // An earlier key may have closed the last tab (bug M1).
+            if !can_process_more_actions(self.tab_mgr.tabs.len()) {
+                break;
+            }
             let tab = self.tab_mgr.active_tab();
-            let targets = tab.select_input_targets(self.tab_mgr.broadcast_scope);
             // Alt-screen passthrough is decided by the FOCUSED pane alone, not by
-            // any broadcast target — see input::process_keys (bug M3).
-            let focused_alt_screen = tab
-                .panes
-                .get(&tab.focused)
+            // any broadcast target — see input::classify_key (bug M3).
+            let focused = tab.panes.get(&tab.focused);
+            let focused_alt_screen = focused
                 .map(|p| p.mode().contains(alacritty_terminal::term::TermMode::ALT_SCREEN))
                 .unwrap_or(false);
-            let scroll_on_keystroke = shared.user_config.active().scroll_on_keystroke;
-            let (actions, sent_input) = input::process_keys(ctx, &shared.bindings, raw_keys, &targets, focused_alt_screen, scroll_on_keystroke);
-            // Keyboard input to the terminal restarts the cursor blink in its
-            // visible phase and restarts the blink timeout (alacritty semantics).
-            if sent_input {
-                shared.cursor_blink_epoch = std::time::Instant::now();
+            // smart_copy: a Ctrl Copy chord with nothing selected falls through
+            // to the child as ^C (Terminator terminal.py:1081-1088).
+            let copy_fallthrough = shared.user_config.global.smart_copy
+                && !focused.is_some_and(|p| p.has_selection());
+            match input::classify_key(&shared.bindings, &rk, focused_alt_screen, copy_fallthrough) {
+                Some(action) => {
+                    let text_field_before = self.text_field_open();
+                    self.execute_pane_actions(shared, ctx, vec![action]);
+                    // A dialog or text field the binding just opened owns the
+                    // rest of the batch, exactly as the gate in `logic` would
+                    // from the next frame on: none of those keys reach a PTY.
+                    if self.dialogs.modal_open() || (!text_field_before && self.text_field_open()) {
+                        break;
+                    }
+                }
+                // What VTE does with the key itself comes between the
+                // bindings and the child.
+                None => match input::key_builtin(rk.key, rk.mods) {
+                    Some(builtin) => sent_input |= self.run_key_builtin(builtin, &rk, scroll_on_keystroke),
+                    None => {
+                        let targets = tab.select_input_targets(self.tab_mgr.broadcast_scope);
+                        sent_input |= input::send_key(&rk, &targets, scroll_on_keystroke);
+                    }
+                },
             }
-            self.execute_pane_actions(shared, ctx, actions);
+        }
+        input::strip_egui_key_events(ctx);
+        // Keyboard input to the terminal restarts the cursor blink in its
+        // visible phase and restarts the blink timeout (alacritty semantics).
+        if sent_input {
+            shared.cursor_blink_epoch = std::time::Instant::now();
         }
     }
 
@@ -778,6 +954,11 @@ impl AppWindow {
             DialogAction::ClearTitle => {
                 self.tab_mgr.tabs[self.tab_mgr.active_tab].custom_title = None;
             }
+            _ => {}
+        }
+        match self.dialogs.draw_window_title_dialog(ui.ctx()) {
+            DialogAction::SetWindowTitle(title) => self.window_title_override = Some(title),
+            DialogAction::ClearWindowTitle => self.window_title_override = None,
             _ => {}
         }
         match self.dialogs.draw_layout_save_dialog(ui.ctx()) {

@@ -17,6 +17,7 @@ use alacritty_terminal::tty;
 use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Rgb};
 use egui;
 
+use crate::config::EraseBinding;
 use crate::font::FontStyle;
 use crate::keyboard;
 use crate::mouse::{self, MouseButton, MouseKind, MouseMods};
@@ -71,6 +72,10 @@ pub struct PaneDefaults {
     /// inactive_bg_color_offset), both 0.0..=1.0. Applied in `snapshot`.
     pub inactive_color_offset: f32,
     pub inactive_bg_color_offset: f32,
+    /// What Backspace and Delete send (Terminator's per-profile
+    /// backspace_binding / delete_binding). Applied in `send_key`.
+    pub backspace_binding: EraseBinding,
+    pub delete_binding: EraseBinding,
 }
 
 impl Default for PaneDefaults {
@@ -87,6 +92,8 @@ impl Default for PaneDefaults {
             bold_is_bright: false,
             inactive_color_offset: 0.8,
             inactive_bg_color_offset: 1.0,
+            backspace_binding: EraseBinding::AsciiDel,
+            delete_binding: EraseBinding::EscapeSequence,
         }
     }
 }
@@ -1218,24 +1225,30 @@ impl Pane {
     /// Encode and send a key event, using Kitty keyboard protocol when the term
     /// has enabled it, otherwise sending the pre-encoded legacy bytes.
     /// When APP_CURSOR (DECCKM) is active, unmodified arrow keys are rewritten
-    /// from CSI to SS3 format.
+    /// from CSI to SS3 format; Backspace and Delete are re-encoded for this
+    /// pane's erase bindings. A key egui has no name for (`key` None: é, ß,
+    /// Cyrillic) has only its legacy bytes.
     pub fn send_key(
         &self,
-        key: egui::Key,
+        key: Option<egui::Key>,
         mods: egui::Modifiers,
         legacy_bytes: Option<Vec<u8>>,
     ) {
         let mode = *self.terminal.lock().mode();
-        if let Some(bytes) = keyboard::encode(key, mods, mode) {
+        if let Some(bytes) = key.and_then(|key| keyboard::encode(key, mods, mode)) {
             self.send_bytes(bytes);
             return;
         }
         if let Some(bytes) = legacy_bytes {
             if mode.contains(TermMode::APP_CURSOR) {
-                if let Some(app) = decckm_override(key, mods) {
+                if let Some(app) = key.and_then(|key| decckm_override(key, mods)) {
                     self.send_bytes(app);
                     return;
                 }
+            }
+            if let Some(erase) = key.and_then(|key| erase_override(key, mods, &self.defaults)) {
+                self.send_bytes(erase);
+                return;
             }
             self.send_bytes(bytes);
         }
@@ -1313,6 +1326,13 @@ impl Pane {
         term.selection_to_string()
     }
 
+    /// True while the terminal holds a non-empty selection (VTE's
+    /// `get_has_selection`).
+    pub fn has_selection(&self) -> bool {
+        let term = self.terminal.lock();
+        term.selection.as_ref().is_some_and(|s| !s.is_empty())
+    }
+
     pub fn mouse_reporting(&self) -> bool {
         self.terminal
             .lock()
@@ -1324,6 +1344,12 @@ impl Pane {
         *self.terminal.lock().mode()
     }
 
+    /// Encode and send a mouse report. A read-only pane sends nothing: VTE's
+    /// `feed_mouse_event` goes through `feed_child_binary`, whose
+    /// `input_enabled` gate is what Terminator's read-only toggle flips — the
+    /// same gate keys and pastes honour here. The press still counts as the
+    /// app's (VTE's `maybe_send_mouse_button` returns handled), so a middle
+    /// click on a read-only mouse-mode pane neither reports nor pastes.
     pub fn send_mouse(
         &self,
         kind: MouseKind,
@@ -1332,6 +1358,9 @@ impl Pane {
         row: i32,
         mods: MouseMods,
     ) {
+        if self.read_only {
+            return;
+        }
         let mode = *self.terminal.lock().mode();
         if let Some(bytes) = mouse::encode(kind, button, col, row, mods, mode) {
             self.send_bytes(bytes);
@@ -1356,6 +1385,7 @@ impl Pane {
         }
     }
 
+    /// Scroll the display by `lines`; positive is up into history.
     pub fn scroll_by(&self, lines: i32) {
         if lines == 0 {
             return;
@@ -1363,6 +1393,23 @@ impl Pane {
         let mut term = self.terminal.lock();
         term.scroll_display(Scroll::Delta(lines));
         self.dirty.store(true, Ordering::Release);
+    }
+
+    /// Scroll the display by `pages` screens — Terminator's `scroll_by_page`
+    /// (terminal.py:1987-1990), `int(pages * page_increment)` lines, so a
+    /// half page truncates. Positive is up into history, as `scroll_by`.
+    pub fn scroll_by_page(&self, pages: f32) {
+        let lines = (pages * self.terminal.lock().screen_lines() as f32) as i32;
+        self.scroll_by(lines);
+    }
+
+    /// VTE's `maybe_scroll_to_top`.
+    pub fn scroll_to_top(&self) {
+        let mut term = self.terminal.lock();
+        if term.grid().display_offset() != term.grid().history_size() {
+            term.scroll_display(Scroll::Top);
+            self.dirty.store(true, Ordering::Release);
+        }
     }
 
     pub fn scroll_to_bottom(&self) {
@@ -1804,9 +1851,11 @@ fn pane_cwd(_pid: u32) -> Option<std::path::PathBuf> {
 
 /// When DECCKM (application cursor mode) is active, unmodified cursor keys
 /// use SS3 format instead of CSI. Only applies without modifiers — modified
-/// keys always use CSI 1;{mod} format which is already correct.
+/// keys always use CSI 1;{mod} format which is already correct. An inert Cmd
+/// chord (macOS, `input::cmd_is_inert`) stays byte-less here too; Super on
+/// Linux is not a modifier to VTE's keymap, so Super+Up is still `\eOA`.
 fn decckm_override(key: egui::Key, mods: egui::Modifiers) -> Option<Vec<u8>> {
-    if mods.shift || mods.alt || mods.ctrl || mods.mac_cmd {
+    if mods.shift || mods.alt || mods.ctrl || crate::input::cmd_is_inert(mods) {
         return None;
     }
     let seq: &[u8] = match key {
@@ -1819,6 +1868,23 @@ fn decckm_override(key: egui::Key, mods: egui::Modifiers) -> Option<Vec<u8>> {
         _ => return None,
     };
     Some(seq.to_vec())
+}
+
+/// Backspace and Delete go out as this pane's profile says (Terminator's
+/// `backspace_binding` / `delete_binding`, terminal.py:730-772, set on each
+/// terminal's own VTE): the legacy bytes the key arrived with were encoded
+/// for the defaults. An inert Cmd chord stays byte-less here, as in
+/// `decckm_override`.
+fn erase_override(key: egui::Key, mods: egui::Modifiers, defaults: &PaneDefaults) -> Option<Vec<u8>> {
+    if crate::input::cmd_is_inert(mods) {
+        return None;
+    }
+    let (shift, alt, ctrl) = (mods.shift, mods.alt, mods.ctrl);
+    Some(match key {
+        egui::Key::Backspace => crate::input::encode_backspace(defaults.backspace_binding, alt, ctrl),
+        egui::Key::Delete => crate::input::encode_delete(defaults.delete_binding, shift, alt, ctrl),
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
@@ -2288,6 +2354,33 @@ mod tests {
         assert_eq!(decckm_override(egui::Key::A, no_mods()), None);
         assert_eq!(decckm_override(egui::Key::Enter, no_mods()), None);
         assert_eq!(decckm_override(egui::Key::F1, no_mods()), None);
+    }
+
+    // ---- erase bindings (R-088) ----
+
+    #[test]
+    fn erase_override_follows_the_pane_profile() {
+        // The pane's own backspace_binding / delete_binding decide the bytes,
+        // whatever the key arrived with (encoded for the defaults).
+        let mut defaults = PaneDefaults::default();
+        assert_eq!(erase_override(egui::Key::Backspace, no_mods(), &defaults), Some(b"\x7f".to_vec()));
+        assert_eq!(erase_override(egui::Key::Delete, no_mods(), &defaults), Some(b"\x1b[3~".to_vec()));
+        defaults.backspace_binding = EraseBinding::ControlH;
+        defaults.delete_binding = EraseBinding::AsciiDel;
+        assert_eq!(erase_override(egui::Key::Backspace, no_mods(), &defaults), Some(b"\x08".to_vec()));
+        assert_eq!(erase_override(egui::Key::Delete, no_mods(), &defaults), Some(b"\x7f".to_vec()));
+        let ctrl = egui::Modifiers { ctrl: true, ..Default::default() };
+        assert_eq!(erase_override(egui::Key::Backspace, ctrl, &defaults), Some(b"\x7f".to_vec()));
+        // Only the two erase keys are rewritten.
+        assert_eq!(erase_override(egui::Key::Enter, no_mods(), &defaults), None);
+        assert_eq!(erase_override(egui::Key::A, ctrl, &defaults), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn erase_override_keeps_cmd_chord_inert() {
+        let cmd = egui::Modifiers { mac_cmd: true, command: true, ..Default::default() };
+        assert_eq!(erase_override(egui::Key::Backspace, cmd, &PaneDefaults::default()), None);
     }
 
     // ---- escape_regex ----

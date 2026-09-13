@@ -50,6 +50,20 @@ fn is_receiver(scope: BroadcastScope, this_group: Option<&str>, focused_group: O
     }
 }
 
+/// Whether a key press lands on a pane: the focused pane and, under `scope`,
+/// the broadcast receivers — read-only ones included. Terminator re-emits
+/// the event to each receiver's VTE (`group_emit`/`all_emit`), whose
+/// `input_enabled` gate stops only what would reach the child, so a key VTE
+/// handles itself (a scrollback key) still acts on a read-only terminal.
+pub fn pane_receives_key(
+    scope: BroadcastScope,
+    is_focused: bool,
+    this_group: Option<&str>,
+    focused_group: Option<&str>,
+) -> bool {
+    is_focused || is_receiver(scope, this_group, focused_group)
+}
+
 /// Whether a pane should receive user input (keystrokes/pastes/insert-number).
 /// read_only panes never are — terminal RESPONSES bypass this and write to the
 /// PTY directly via `send_bytes`, so they stay ungated. Generalizes the old
@@ -62,7 +76,7 @@ pub fn pane_receives_input(
     this_group: Option<&str>,
     focused_group: Option<&str>,
 ) -> bool {
-    !read_only && (is_focused || is_receiver(scope, this_group, focused_group))
+    !read_only && pane_receives_key(scope, is_focused, this_group, focused_group)
 }
 
 /// Visual classification for a pane's titlebar/border: the focused pane
@@ -269,6 +283,23 @@ mod tests {
             !pane_receives_input(Off, false, false, None, None),
             "an unfocused pane is not a target when not broadcasting"
         );
+    }
+
+    // R-009: a key VTE handles itself lands on read-only panes too — the
+    // focused one and the broadcast receivers alike — while the child-bound
+    // routing above still leaves them out.
+    #[test]
+    fn key_targets_keep_read_only_panes() {
+        use BroadcastScope::{All, Group, Off};
+        assert!(pane_receives_key(Off, true, None, None), "the focused pane, read-only or not");
+        assert!(!pane_receives_key(Off, false, None, None), "nobody else when not broadcasting");
+        assert!(pane_receives_key(All, false, None, None), "every pane under All");
+        assert!(pane_receives_key(Group, false, Some("A"), Some("A")), "group siblings under Group");
+        assert!(!pane_receives_key(Group, false, Some("B"), Some("A")));
+        assert!(!pane_receives_key(Group, false, None, None));
+        // `pane_receives_input` is exactly this minus the read-only panes.
+        assert_eq!(pane_receives_input(All, false, false, None, None), pane_receives_key(All, false, None, None));
+        assert!(!pane_receives_input(All, true, false, None, None));
     }
 
     // --- new: Group-scope routing --------------------------------------------

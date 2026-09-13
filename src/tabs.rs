@@ -51,6 +51,13 @@ impl Tab {
     /// `groups::pane_receives_input`, the single source of truth it shares with
     /// the title-bar indicator.
     pub(crate) fn select_input_targets(&self, scope: BroadcastScope) -> Vec<&Pane> {
+        self.input_targets_from(self.focused, scope)
+    }
+
+    /// The panes a key press lands on under `scope`: `select_input_targets`
+    /// with the read-only panes kept, for a key VTE handles itself
+    /// (`groups::pane_receives_key`, `input::key_builtin`).
+    pub(crate) fn select_key_targets(&self, scope: BroadcastScope) -> Vec<&Pane> {
         let focused_group = self
             .panes
             .get(&self.focused)
@@ -58,12 +65,30 @@ impl Tab {
         self.panes
             .iter()
             .filter(|&(&id, pane)| {
+                groups::pane_receives_key(scope, id == self.focused, pane.group.as_deref(), focused_group)
+            })
+            .map(|(_, pane)| pane)
+            .collect()
+    }
+
+    /// `select_input_targets` measured from `origin` instead of the focused
+    /// pane. Terminator's `get_target_terms(widget)` (terminator.py:613-620)
+    /// fans out from the terminal an event landed on, which for a middle-click
+    /// paste or a text drop is the pane under the pointer.
+    pub(crate) fn input_targets_from(&self, origin: PaneId, scope: BroadcastScope) -> Vec<&Pane> {
+        let origin_group = self
+            .panes
+            .get(&origin)
+            .and_then(|p| p.group.as_deref());
+        self.panes
+            .iter()
+            .filter(|&(&id, pane)| {
                 groups::pane_receives_input(
                     scope,
                     pane.read_only,
-                    id == self.focused,
+                    id == origin,
                     pane.group.as_deref(),
-                    focused_group,
+                    origin_group,
                 )
             })
             .map(|(_, pane)| pane)
@@ -455,7 +480,9 @@ impl TabManager {
         if !active.layout.split_leaf(active.focused, new_id, dir) {
             eprintln!("split: focused leaf {} not found in layout", active.focused);
         }
-        active.focused = new_id;
+        // `sibling.grab_focus()` (paned.py:72): the parent gets its focus-out
+        // as the new pane takes focus.
+        self.set_focused_pane(self.active_tab, new_id);
     }
 
     pub(crate) fn split_here(&mut self, last_pane_rect: Option<egui::Rect>, factory: &PaneFactory) {
@@ -481,7 +508,7 @@ impl TabManager {
         if !active.layout.split_leaf(active.focused, new_id, dir) {
             eprintln!("split_here: focused leaf {} not found in layout", active.focused);
         }
-        active.focused = new_id;
+        self.set_focused_pane(self.active_tab, new_id);
     }
 
     pub(crate) fn close_focused(&mut self, egui_ctx: &egui::Context, dialogs: &mut DialogState) {
@@ -870,20 +897,17 @@ impl TabManager {
         }
     }
 
-    pub(crate) fn copy_selection(&self, egui_ctx: &egui::Context, smart_copy: bool) {
+    /// Plain `copy_clipboard`: copy the focused pane's selection, nothing
+    /// without one. The smart_copy fall-through is not an effect of copying —
+    /// it is the Copy chord being left unconsumed by `input::process_keys`, so
+    /// the child receives the ordinary control byte through the key path.
+    pub(crate) fn copy_selection(&self, egui_ctx: &egui::Context) {
         let tab = &self.tabs[self.active_tab];
         let Some(pane) = tab.panes.get(&tab.focused) else {
             return;
         };
-        match pane.selection_text() {
-            Some(text) if !text.is_empty() => {
-                egui_ctx.copy_text(text);
-            }
-            _ => {
-                if smart_copy {
-                    pane.send_bytes(vec![0x03]);
-                }
-            }
+        if let Some(text) = pane.selection_text().filter(|t| !t.is_empty()) {
+            egui_ctx.copy_text(text);
         }
     }
 
@@ -904,27 +928,26 @@ impl TabManager {
         }
     }
 
+    /// Middle-click paste of PRIMARY into `pane_id`'s broadcast targets:
+    /// Terminator's `paste_clipboard` (terminal.py:1843-1847) pastes into
+    /// `get_target_terms(self)`, the same fan-out as the keyboard Paste,
+    /// measured from the clicked terminal. read_only panes never receive it.
     pub(crate) fn paste_primary(&self, pane_id: PaneId) {
         let text = match crate::pane_ui::read_primary() {
             Some(t) => t,
             None => return,
         };
-        // Middle-click targets one specific pane (not a broadcast fan-out), but
-        // a read_only pane must still reject pasted input.
-        if let Some(pane) = self.tabs[self.active_tab].panes.get(&pane_id) {
-            if !pane.read_only {
-                pane.send_paste(&text);
-            }
+        for pane in self.active_tab().input_targets_from(pane_id, self.broadcast_scope) {
+            pane.send_paste(&text);
         }
     }
 
+    /// Text dropped onto `pane_id` goes to its broadcast targets (Terminator
+    /// terminal.py:1415-1416 feeds `get_target_terms(self)` from the drop
+    /// target). read_only panes never receive it.
     pub(crate) fn paste_text_into_pane(&self, pane_id: PaneId, text: &str) {
-        // External drop targets one specific pane (the one under the cursor); a
-        // read_only pane must still reject the dropped text.
-        if let Some(pane) = self.tabs[self.active_tab].panes.get(&pane_id) {
-            if !pane.read_only {
-                pane.send_paste(text);
-            }
+        for pane in self.active_tab().input_targets_from(pane_id, self.broadcast_scope) {
+            pane.send_paste(text);
         }
     }
 

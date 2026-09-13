@@ -136,6 +136,8 @@ pub fn defaults_from_profile(profile: &Profile) -> PaneDefaults {
         bold_is_bright: profile.bold_is_bright,
         inactive_color_offset: profile.inactive_color_offset.clamp(0.0, 1.0),
         inactive_bg_color_offset: profile.inactive_bg_color_offset.clamp(0.0, 1.0),
+        backspace_binding: profile.backspace_binding,
+        delete_binding: profile.delete_binding,
     }
 }
 

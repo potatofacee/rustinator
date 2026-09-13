@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -8,6 +9,7 @@ use glutin::context::{PossiblyCurrentContext, PossiblyCurrentGlContext as _};
 use glutin::display::{Display, GlDisplay as _};
 use glutin::surface::{GlSurface as _, Surface, SurfaceAttributesBuilder, WindowSurface};
 use raw_window_handle::HasWindowHandle as _;
+use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::ActiveEventLoop;
 use winit::window::{Window, WindowAttributes};
 
@@ -17,6 +19,9 @@ pub(crate) struct GlWindow {
     pub(crate) painter: egui_glow::Painter,
     pub(crate) egui_ctx: egui::Context,
     pub(crate) egui_winit: egui_winit::State,
+    /// Mouse buttons currently held, mirrored from `MouseInput`. While one is
+    /// held the window has the implicit pointer grab (see `on_window_event`).
+    held_mouse_buttons: HashSet<MouseButton>,
 }
 
 impl GlWindow {
@@ -113,7 +118,28 @@ impl GlWindow {
             painter,
             egui_ctx,
             egui_winit,
+            held_mouse_buttons: HashSet::new(),
         }
+    }
+
+    /// Feed a winit event to egui, keeping the implicit pointer grab a
+    /// toolkit would keep. While a mouse button is held, X11 still delivers
+    /// the pointer's motion and release to this window after it crosses the
+    /// border (the implicit grab) but also sends `LeaveNotify` at the
+    /// crossing; egui-winit turns that into `PointerGone`, which drops egui's
+    /// click/drag interest in the pressed widget and makes it discard a
+    /// release that arrives with no motion in between. GTK/VTE ignore the
+    /// crossing and finish the drag (a selection, a divider) on the release
+    /// wherever it happens, so a `CursorLeft` during a held button is not
+    /// forwarded. The leave that ends the grab arrives after the release,
+    /// with nothing held, and is forwarded as usual. Wayland sends no leave
+    /// during a grab; a button held from outside the window is never seen
+    /// pressed, so its crossings are forwarded unchanged.
+    pub(crate) fn on_window_event(&mut self, event: &WindowEvent) -> egui_winit::EventResponse {
+        if withheld_by_grab(&mut self.held_mouse_buttons, event) {
+            return egui_winit::EventResponse { consumed: false, repaint: false };
+        }
+        self.egui_winit.on_window_event(&self.window, event)
     }
 
     pub(crate) fn destroy(mut self, main_context: &PossiblyCurrentContext) {
@@ -185,5 +211,69 @@ impl GlWindow {
         self.swap_buffers(main_context);
 
         repaint_at
+    }
+}
+
+/// The implicit-grab filter behind `GlWindow::on_window_event`: tracks the
+/// held buttons through `MouseInput` and says whether `event` is a
+/// `CursorLeft` to withhold from egui. Pure so the sequence is testable.
+fn withheld_by_grab(held: &mut HashSet<MouseButton>, event: &WindowEvent) -> bool {
+    match event {
+        WindowEvent::MouseInput { state: ElementState::Pressed, button, .. } => {
+            held.insert(*button);
+        }
+        WindowEvent::MouseInput { state: ElementState::Released, button, .. } => {
+            held.remove(button);
+        }
+        WindowEvent::CursorLeft { .. } => return !held.is_empty(),
+        _ => {}
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use winit::event::DeviceId;
+
+    fn button(state: ElementState, button: MouseButton) -> WindowEvent {
+        WindowEvent::MouseInput { device_id: DeviceId::dummy(), state, button }
+    }
+
+    fn left() -> WindowEvent {
+        WindowEvent::CursorLeft { device_id: DeviceId::dummy() }
+    }
+
+    #[test]
+    fn cursor_left_withheld_only_while_a_button_is_held() {
+        // R-012: the border crossing during a drag (X11 LeaveNotify under the
+        // implicit grab) must not reach egui as PointerGone; the leave that
+        // ends the grab, after the release, must.
+        let mut held = HashSet::new();
+        assert!(!withheld_by_grab(&mut held, &left()));
+        assert!(!withheld_by_grab(&mut held, &button(ElementState::Pressed, MouseButton::Left)));
+        assert!(withheld_by_grab(&mut held, &left()));
+        assert!(!withheld_by_grab(&mut held, &button(ElementState::Released, MouseButton::Left)));
+        assert!(!withheld_by_grab(&mut held, &left()));
+    }
+
+    #[test]
+    fn grab_lasts_until_every_held_button_is_released() {
+        let mut held = HashSet::new();
+        withheld_by_grab(&mut held, &button(ElementState::Pressed, MouseButton::Left));
+        withheld_by_grab(&mut held, &button(ElementState::Pressed, MouseButton::Middle));
+        withheld_by_grab(&mut held, &button(ElementState::Released, MouseButton::Left));
+        assert!(withheld_by_grab(&mut held, &left()));
+        withheld_by_grab(&mut held, &button(ElementState::Released, MouseButton::Middle));
+        assert!(!withheld_by_grab(&mut held, &left()));
+    }
+
+    #[test]
+    fn button_held_from_outside_does_not_grab() {
+        // A button pressed in another window and released over ours was never
+        // seen pressed: its crossings are forwarded unchanged.
+        let mut held = HashSet::new();
+        assert!(!withheld_by_grab(&mut held, &button(ElementState::Released, MouseButton::Left)));
+        assert!(!withheld_by_grab(&mut held, &left()));
     }
 }

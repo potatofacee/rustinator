@@ -153,7 +153,7 @@ pub(crate) fn draw_panes(
         );
     }
 
-    handle_drag_drop(state, &mut ctx.tab_mgr.tabs[ctx.tab_mgr.active_tab], &pane_drop_rects, ui);
+    handle_drag_drop(state, ctx.tab_mgr, &pane_drop_rects, ui);
     apply_external_drop(state, ctx.tab_mgr, &pane_drop_rects);
 
     deferred
@@ -213,25 +213,28 @@ fn draw_leaf(
         egui::Sense::click_and_drag(),
     );
 
-    if response.clicked()
-        || response.secondary_clicked()
-        || response.middle_clicked()
-        || response.drag_started()
-        || response.double_clicked()
-        || response.triple_clicked()
-    {
-        let active = ctx.tab_mgr.active_tab;
-        ctx.tab_mgr.set_focused_pane(active, id);
-    }
-
-    if response.middle_clicked() {
-        ctx.tab_mgr.paste_primary(id);
-    }
+    // Button routing follows Terminator's `on_buttonpress` (terminal.py:
+    // 1108-1176), which acts on the press, not egui's release-based clicks: a
+    // middle press is offered to VTE first and pastes only if VTE did not
+    // consume it — i.e. the app is not reporting mouse, or Shift is held —
+    // never with Ctrl. `mouse_to_app` is that "VTE consumes it" condition for
+    // the per-frame consumer here (the context menu); each press and wheel
+    // event decides it again from its own modifiers in `handle_pane_mouse`.
+    // While a popup menu is open (a pane's or the tab bar's context menu) the
+    // press belongs to the menu, as under GTK's popup grab: it dismisses the
+    // menu and never reaches the terminal.
+    let active = ctx.tab_mgr.active_tab;
+    let menu_open = egui::Popup::is_any_open(ui.ctx());
+    let mouse_to_app = ctx.tab_mgr.tabs[active]
+        .panes
+        .get(&id)
+        .is_some_and(|p| p.mouse_reporting())
+        && !shift_held;
 
     let (handled_by_url, url_highlight) = handle_pane_mouse(
+        ctx.tab_mgr,
+        active,
         id,
-        ctx.tab_mgr.active_tab,
-        &mut ctx.tab_mgr.tabs[ctx.tab_mgr.active_tab],
         &response,
         terminal_rect,
         ui,
@@ -241,6 +244,7 @@ fn draw_leaf(
         ctrl_held,
         shift_held,
         alt_held,
+        menu_open,
         ctx.user_config,
         ctx.egui_ctx,
     );
@@ -255,21 +259,36 @@ fn draw_leaf(
         state.last_pane_rect = Some(terminal_rect);
     }
 
+    // A right press goes to VTE first and pops the menu only if VTE did not
+    // consume it (terminal.py:1166-1175); Ctrl+Right never pops — it is the
+    // drag source (497-500). egui's `Response::context_menu` would open on any
+    // secondary click, so the open command is supplied here; the close-on-
+    // left-click half of its default is kept.
+    let open_menu = !menu_open && response.secondary_clicked() && !ctrl_held && !mouse_to_app;
+    let open_cmd = if open_menu {
+        Some(egui::SetOpenCommand::Bool(true))
+    } else if response.clicked() {
+        Some(egui::SetOpenCommand::Bool(false))
+    } else {
+        None
+    };
     let scope = ctx.tab_mgr.broadcast_scope;
-    response.context_menu(|ui| {
-        build_context_menu(
-            ui,
-            id,
-            &ctx.tab_mgr.tabs[ctx.tab_mgr.active_tab],
-            zoomed,
-            scope,
-            ctx.user_config,
-            ctx.bindings,
-            ctx.dialogs,
-            state,
-            deferred,
-        );
-    });
+    egui::Popup::context_menu(&response)
+        .open_memory(open_cmd)
+        .show(|ui| {
+            build_context_menu(
+                ui,
+                id,
+                &ctx.tab_mgr.tabs[ctx.tab_mgr.active_tab],
+                zoomed,
+                scope,
+                ctx.user_config,
+                ctx.bindings,
+                ctx.dialogs,
+                state,
+                deferred,
+            );
+        });
 }
 
 /// Per-pane title bar. The interaction (click to focus, drag to rearrange) stays
@@ -292,12 +311,14 @@ fn draw_title_bar(
         egui::Id::new(("title_bar", ctx.tab_mgr.active_tab, id)),
         egui::Sense::click_and_drag(),
     );
+    // Focus moves through `set_focused_pane` so the pane losing it gets its
+    // focus-out (CSI O) and this one its focus-in, as VTE emits on grab_focus.
     if title_resp.drag_started() {
         state.drag_source_pane = Some(id);
-        ctx.tab_mgr.active_tab_mut().focused = id;
+        ctx.tab_mgr.set_focused_pane(ctx.tab_mgr.active_tab, id);
     }
     if title_resp.clicked() {
-        ctx.tab_mgr.active_tab_mut().focused = id;
+        ctx.tab_mgr.set_focused_pane(ctx.tab_mgr.active_tab, id);
     }
     if title_resp.dragged() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
@@ -308,8 +329,7 @@ fn draw_title_bar(
     // bar never shows stale values from a previous frame.
     let ppp = ui.ctx().pixels_per_point();
     let inner = terminal_rect.shrink(FOCUS_BORDER);
-    let cols = ((inner.width() * ppp / ctx.cell_w).floor() as usize).max(1);
-    let lines = ((inner.height() * ppp / ctx.cell_h).floor() as usize).max(1);
+    let (cols, lines) = grid_dims(inner, ppp, ctx.cell_w, ctx.cell_h);
     let scope = ctx.tab_mgr.broadcast_scope;
     let model = title_bar_model(
         ctx.tab_mgr.tabs[ctx.tab_mgr.active_tab].panes.get(&id),
@@ -437,10 +457,18 @@ fn handle_dividers(
     }
 }
 
+/// Pointer handling for one pane: URL hover/click, and the frame's pointer
+/// events replayed in delivery order — each press focuses the pane and is
+/// handed to the app, a selection or a paste as Terminator's `on_buttonpress`
+/// decides; motion and the release then follow the press's owner; each wheel
+/// event acts in whole notches as `wheel_action` decides. Nothing reaches the
+/// terminal while a popup menu is open (`menu_open`): under GTK the popup's
+/// grab owns the pointer until the menu is dismissed, so the dismissing click
+/// is neither forwarded to the app nor a selection.
 fn handle_pane_mouse(
-    pane_id: PaneId,
+    tab_mgr: &mut TabManager,
     tab_idx: usize,
-    tab: &mut crate::tabs::Tab,
+    pane_id: PaneId,
     response: &egui::Response,
     terminal_rect: egui::Rect,
     ui: &mut egui::Ui,
@@ -450,33 +478,25 @@ fn handle_pane_mouse(
     ctrl_held: bool,
     shift_held: bool,
     alt_held: bool,
+    menu_open: bool,
     user_config: &Config,
     egui_ctx: &egui::Context,
 ) -> (bool, Option<UrlMatch>) {
+    if menu_open {
+        return (false, None);
+    }
     let pointer = response
         .interact_pointer_pos()
         .or_else(|| response.hover_pos());
     let inner_rect = terminal_rect.shrink(FOCUS_BORDER);
-    // Pixel->cell from fixed cell width; then resolve a click on the right half
-    // of a double-width glyph (its WIDE_CHAR_SPACER column) back to the base
-    // column, matching alacritty's whole-glyph hit semantics. All downstream
-    // uses (selection, mouse-to-app, URL hit-test) get the authoritative column.
     let pointer_cell = pointer.map(|p| {
-        let (col, row) = cell_at(p, inner_rect, ppp, cell_w, cell_h);
-        let col = tab
-            .panes
-            .get(&pane_id)
-            .and_then(|p| p.cached.as_ref())
-            .map(|frame| crate::pane::resolve_wide_click_col(&frame.cells, row, col))
-            .unwrap_or(col);
-        (col, row)
+        cell_under(tab_mgr.tabs[tab_idx].panes.get(&pane_id), p, inner_rect, ppp, cell_w, cell_h)
     });
-    let pointer_side = pointer.map(|p| cell_side(p, inner_rect, ppp, cell_w));
     // URL hit-testing only matters while Ctrl is held (hover highlight + click).
     // Scan on demand for the pointer's row instead of every frame snapshot.
     let url_at_pointer = if ctrl_held {
         pointer_cell.and_then(|(col, row)| {
-            let frame = tab.panes.get(&pane_id)?.cached.as_ref()?;
+            let frame = tab_mgr.tabs[tab_idx].panes.get(&pane_id)?.cached.as_ref()?;
             url_at_click(&frame.cells, row, col)
         })
     } else {
@@ -490,8 +510,7 @@ fn handle_pane_mouse(
 
     let handled_by_url = if ctrl_held && response.clicked() {
         if let Some(url) = url_at_pointer.as_ref() {
-            let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
-            let _ = std::process::Command::new(opener).arg(&url.url).spawn();
+            open_url(&url.url);
             true
         } else {
             false
@@ -500,129 +519,293 @@ fn handle_pane_mouse(
         false
     };
 
-    let mouse_to_app = tab
-        .panes
-        .get(&pane_id)
-        .map(|p| p.mouse_reporting())
-        .unwrap_or(false)
-        && !shift_held;
-
-    // `is_pointer_button_down_on()` is true for ANY button, so a right/middle
-    // press would otherwise be treated as a selection gesture and clear it.
-    // Gate on the primary (left) button actually being held.
-    let primary_down = response.is_pointer_button_down_on()
-        && ui.input(|i| i.pointer.primary_down());
-
-    let mem_id = egui::Id::new(("pane_sel_down", tab_idx, pane_id));
-    let was_down: bool = ui.ctx().data(|d| d.get_temp(mem_id).unwrap_or(false));
-    ui.ctx().data_mut(|d| d.insert_temp(mem_id, primary_down));
-    let just_pressed = primary_down && !was_down;
-
-    if mouse_to_app && !handled_by_url {
-        if let Some(pane) = tab.panes.get(&pane_id) {
-            let mm = MouseMods { shift: shift_held, alt: alt_held, ctrl: ctrl_held };
-            forward_mouse_to_app(pane, response, ui, pointer_cell, tab_idx, pane_id, cell_h, mm);
-        }
-    } else if !handled_by_url {
-        if let Some((col, row)) = pointer_cell {
-            if let Some(pane) = tab.panes.get(&pane_id) {
-                let side = pointer_side.unwrap_or(Side::Left);
-                if response.triple_clicked() {
-                    pane.begin_selection(col, row, side, SelectionType::Lines);
-                } else if response.double_clicked() {
-                    pane.begin_selection(col, row, side, SelectionType::Semantic);
-                } else if just_pressed {
-                    if std::env::var_os("RUSTINATOR_SEL_DEBUG").is_some() {
-                        eprintln!("SEL_DEBUG gesture: begin col={} row={} side={:?}", col, row, side);
-                    }
-                    pane.begin_selection(col, row, side, SelectionType::Simple);
-                } else if primary_down {
-                    if let Some(p) = pointer {
-                        let visible_cols = (terminal_rect.width() * ppp / cell_w).floor() as i32;
-                        // Auto-scroll when the drag reaches the top/bottom edge.
-                        // A maximized window's bottom edge coincides with the
-                        // screen edge, where the OS clamps the cursor so it can
-                        // never travel *past* the rect — so an edge band (>=/<=)
-                        // is used instead of a strict-outside test, else downward
-                        // auto-scroll never fires. When already at the scroll
-                        // limit, selection_auto_scroll returns false and we do a
-                        // normal in-bounds update so the edge line still selects.
-                        const EDGE: f32 = 6.0;
-                        let scrolled = if p.y <= terminal_rect.top() + EDGE {
-                            pane.selection_auto_scroll(1, visible_cols)
-                        } else if p.y >= terminal_rect.bottom() - EDGE {
-                            pane.selection_auto_scroll(-1, visible_cols)
-                        } else {
-                            false
-                        };
-                        if !scrolled {
-                            if std::env::var_os("RUSTINATOR_SEL_DEBUG").is_some() {
-                                eprintln!("SEL_DEBUG gesture: update col={} row={} side={:?}", col, row, side);
-                            }
-                            pane.update_selection(col, row, side);
-                        }
-                    }
-                } else if response.clicked() {
-                    pane.clear_selection();
+    // The frame's pointer events, replayed in order the way VTE receives them
+    // as discrete press/motion/release events, each at its own position and
+    // with the modifiers of its moment. egui's per-frame flags (`clicked`,
+    // `is_pointer_button_down_on`, `double_clicked`) sample the frame's end
+    // state instead, so a press, drag and release batched into one frame under
+    // the governor left no selection, a release never extended the selection
+    // to where the button came up, and a left release batched with a middle
+    // press pasted the PRIMARY from before the release wrote it.
+    let (events, down_at_end, time) = ui.input(|i| {
+        let events: Vec<PointerEv> = i
+            .events
+            .iter()
+            .filter_map(|e| match *e {
+                egui::Event::PointerButton { pos, button, pressed, modifiers } => {
+                    Some(PointerEv::Button { pos, button: mouse_button(button), pressed, mods: modifiers })
                 }
-            }
-
-            let gesture_ended = (!primary_down && was_down)
-                || response.double_clicked()
-                || response.triple_clicked();
-            if gesture_ended {
-                if let Some(pane) = tab.panes.get(&pane_id) {
-                    if let Some(text) = pane.selection_text() {
-                        if !text.is_empty() {
-                            write_primary(&text);
-                            if user_config.active().copy_on_selection {
-                                egui_ctx.copy_text(text);
-                            }
-                        }
-                    }
+                egui::Event::PointerMoved(pos) => Some(PointerEv::Moved(pos)),
+                egui::Event::MouseWheel { unit, delta, modifiers, .. } => {
+                    Some(PointerEv::Wheel { unit, delta, mods: modifiers })
                 }
-            }
-        }
+                _ => None,
+            })
+            .collect();
+        let down = [
+            egui::PointerButton::Primary,
+            egui::PointerButton::Middle,
+            egui::PointerButton::Secondary,
+        ]
+        .map(|b| i.pointer.button_down(b));
+        (events, down, i.time)
+    });
+    let mut down = buttons_down_before(down_at_end, &events);
 
-        if response.hovered() {
-            let scroll_y = ui.ctx().input(|i| i.smooth_scroll_delta.y);
-            if scroll_y.abs() > 0.5 {
-                let lines = (scroll_y * ppp / cell_h).round() as i32;
-                if lines != 0 {
-                    if let Some(pane) = tab.panes.get(&pane_id) {
-                        let mode = pane.mode();
-                        // Alternate scroll (xterm mode 1007): on the alt screen an
-                        // app like vim/less/man has no scrollback, so a wheel tick
-                        // is translated into arrow-key presses that scroll it.
-                        if mode.contains(TermMode::ALT_SCREEN)
-                            && mode.contains(TermMode::ALTERNATE_SCROLL)
-                        {
-                            // APP_CURSOR (DECCKM): SS3 (ESC O A/B) vs CSI (ESC [ A/B).
-                            let seq: &[u8] = match (lines > 0, mode.contains(TermMode::APP_CURSOR)) {
-                                (true, false) => b"\x1b[A",
-                                (true, true) => b"\x1bOA",
-                                (false, false) => b"\x1b[B",
-                                (false, true) => b"\x1bOB",
-                            };
-                            // Read-only gate: a wheel tick here is translated
-                            // into user keystrokes sent to the app, so it must
-                            // honor read-only (unlike terminal-response
-                            // send_bytes paths, which must never be suppressed).
-                            if !pane.read_only {
-                                for _ in 0..lines.abs().min(8) {
-                                    pane.send_bytes(seq.to_vec());
+    let held_id = egui::Id::new(("pane_buttons", tab_idx, pane_id));
+    let mut held: HeldButtons = ui.ctx().data(|d| d.get_temp(held_id)).unwrap_or_default();
+    let held_before = held;
+    // A release the pane never saw (its tab was hidden, a popup had the
+    // pointer) leaves a hold with no button behind it; drop it before plain
+    // motion is taken for its drag.
+    for (slot, is_down) in held.0.iter_mut().zip(down) {
+        if !is_down {
+            *slot = None;
+        }
+    }
+    let was_selecting = held.0[0] == Some(PressOwner::Selection);
+    let clicks_id = egui::Id::new(("pane_clicks", tab_idx, pane_id));
+    let mut clicks: ClickInfo = ui.ctx().data(|d| d.get_temp(clicks_id)).unwrap_or_default();
+    let clicks_before = clicks;
+    let motion_id = egui::Id::new(("pane_motion_cell", tab_idx, pane_id));
+    // The fraction of a wheel notch left over by earlier events (VTE's
+    // `m_mouse_smooth_scroll_delta`), kept in egui temp data like the rest of
+    // the pane's pointer state; see `wheel_action`.
+    let wheel_id = egui::Id::new(("pane_wheel", tab_idx, pane_id));
+    let mut wheel_carry: f32 = ui.ctx().data(|d| d.get_temp(wheel_id)).unwrap_or(0.0);
+    let wheel_carry_before = wheel_carry;
+
+    for ev in events {
+        match ev {
+            PointerEv::Button { pos, button, pressed: true, mods } => {
+                // GTK's implicit grab: a pane holding a button keeps the
+                // pointer wherever it goes; otherwise the press is the pane's
+                // only if nothing else already holds a button and it landed
+                // on the terminal.
+                let mine = held.any()
+                    || (!down.iter().any(|&d| d)
+                        && press_hits_pane(
+                            ui.ctx(),
+                            response.layer_id,
+                            terminal_rect,
+                            tab_mgr.tabs[tab_idx].panes.get(&pane_id),
+                            inner_rect,
+                            pos,
+                        ));
+                let slot = button.and_then(button_slot);
+                if let Some(slot) = slot {
+                    down[slot] = true;
+                }
+                if !mine {
+                    continue;
+                }
+                // Any button press focuses the terminal first
+                // (`widget.grab_focus()`, terminal.py:1111), so a paste fans
+                // out from the clicked pane. That is all an extra button does.
+                tab_mgr.set_focused_pane(tab_idx, pane_id);
+                let (Some(button), Some(slot)) = (button, slot) else { continue };
+                let Some(pane) = tab_mgr.tabs[tab_idx].panes.get(&pane_id) else { continue };
+                // The frame's time stands in for the event's: winit carries no
+                // timestamps, and the governor delays a press by at most one
+                // frame interval against GTK's 400 ms window.
+                let count = click_count(&mut clicks, button, pos, time);
+                let (col, row) = cell_under(Some(pane), pos, inner_rect, ppp, cell_w, cell_h);
+                let on_url = mods.ctrl
+                    && pane
+                        .cached
+                        .as_ref()
+                        .is_some_and(|frame| url_at_click(&frame.cells, row, col).is_some());
+                let action = press_action(
+                    button,
+                    count,
+                    mods,
+                    pane.mouse_reporting(),
+                    on_url,
+                    user_config.global.disable_mouse_paste,
+                );
+                match action {
+                    PressAction::Forward => {
+                        // Shift is never held here: it is what keeps a press
+                        // from the app.
+                        let mm = MouseMods { shift: false, alt: mods.alt, ctrl: mods.ctrl };
+                        pane.send_mouse(MouseKind::Press, button, col, row, mm);
+                    }
+                    PressAction::Select(ty) => {
+                        let side = cell_side(pos, inner_rect, ppp, cell_w);
+                        if std::env::var_os("RUSTINATOR_SEL_DEBUG").is_some() {
+                            eprintln!(
+                                "SEL_DEBUG gesture: begin col={} row={} side={:?} ty={:?}",
+                                col, row, side, ty
+                            );
+                        }
+                        pane.begin_selection(col, row, side, ty);
+                    }
+                    PressAction::Paste => tab_mgr.paste_primary(pane_id),
+                    PressAction::Nothing => {}
+                }
+                held.0[slot] = Some(action.owner());
+            }
+            PointerEv::Button { pos, button: Some(button), pressed: false, mods } => {
+                let Some(slot) = button_slot(button) else { continue };
+                down[slot] = false;
+                let Some(owner) = held.0[slot].take() else { continue };
+                let Some(pane) = tab_mgr.tabs[tab_idx].panes.get(&pane_id) else { continue };
+                let (col, row) = cell_under(Some(pane), pos, inner_rect, ppp, cell_w, cell_h);
+                match owner {
+                    PressOwner::Selection => {
+                        // The selection ends where the button came up (VTE
+                        // sees the motion to that point before the release),
+                        // then PRIMARY is written — ahead of any later press
+                        // in this frame that reads it. A click that selected
+                        // nothing leaves no selection behind.
+                        let side = cell_side(pos, inner_rect, ppp, cell_w);
+                        if std::env::var_os("RUSTINATOR_SEL_DEBUG").is_some() {
+                            eprintln!("SEL_DEBUG gesture: end col={} row={} side={:?}", col, row, side);
+                        }
+                        pane.update_selection(col, row, side);
+                        match pane.selection_text() {
+                            Some(text) if !text.is_empty() => {
+                                write_primary(&text);
+                                if user_config.active().copy_on_selection {
+                                    egui_ctx.copy_text(text);
                                 }
                             }
-                        } else {
-                            pane.scroll_by(lines);
+                            _ => pane.clear_selection(),
                         }
                     }
+                    PressOwner::App => {
+                        // The release goes where the press went, at its own
+                        // cell and with its own modifiers; `encode` drops it
+                        // if the app has since left mouse mode.
+                        let mm = MouseMods { shift: mods.shift, alt: mods.alt, ctrl: mods.ctrl };
+                        pane.send_mouse(MouseKind::Release, button, col, row, mm);
+                    }
+                    PressOwner::Consumed => {}
+                }
+            }
+            PointerEv::Button { button: None, .. } => {}
+            PointerEv::Moved(pos) => {
+                let Some(pane) = tab_mgr.tabs[tab_idx].panes.get(&pane_id) else { continue };
+                let (col, row) = cell_under(Some(pane), pos, inner_rect, ppp, cell_w, cell_h);
+                if held.0[0] == Some(PressOwner::Selection) {
+                    // Inside the edge band the per-frame auto-scroll step
+                    // below extends the selection instead.
+                    if edge_band_scroll(pos, terminal_rect) == 0 {
+                        let side = cell_side(pos, inner_rect, ppp, cell_w);
+                        if std::env::var_os("RUSTINATOR_SEL_DEBUG").is_some() {
+                            eprintln!("SEL_DEBUG gesture: update col={} row={} side={:?}", col, row, side);
+                        }
+                        pane.update_selection(col, row, side);
+                    }
+                } else if held.any() || response.hovered() {
+                    // Cell-motion / drag reporting (modes 1002/1003). The
+                    // pointer moves at event rate, but a terminal only cares
+                    // about cell transitions, so we coalesce by reporting only
+                    // when the resolved cell changes from the last one
+                    // reported for this pane (tracked in egui temp data).
+                    let last_cell: Option<(i32, i32)> = ui.ctx().data(|d| d.get_temp(motion_id));
+                    let (should_send, new_last) =
+                        motion_report(pane.term_mode(), held.any(), last_cell, (col, row));
+                    if should_send {
+                        let mm = MouseMods { shift: shift_held, alt: alt_held, ctrl: ctrl_held };
+                        pane.send_mouse(MouseKind::Motion, held.drag_button(), col, row, mm);
+                    }
+                    if new_last != last_cell {
+                        ui.ctx().data_mut(|d| d.insert_temp(motion_id, (col, row)));
+                    }
+                }
+            }
+            PointerEv::Wheel { unit, delta, mods } => {
+                // The wheel is the hovered pane's; the frame's pointer
+                // position stands for the event's, as VTE reports the wheel
+                // at `m_mouse_last_position`.
+                if handled_by_url || !response.hovered() {
+                    continue;
+                }
+                let Some(pane) = tab_mgr.tabs[tab_idx].panes.get(&pane_id) else { continue };
+                let notches = wheel_notches(unit, delta.y, ppp, cell_h);
+                let mode = pane.mode();
+                let rows = pane.scroll_info().2;
+                match wheel_action(&mut wheel_carry, notches, mods, mode, rows) {
+                    WheelAction::Pages(pages) => pane.scroll_by_page(pages as f32),
+                    WheelAction::Reports(notches) => {
+                        if let Some((col, row)) = pointer_cell {
+                            let btn = if notches > 0 { MouseButton::WheelUp } else { MouseButton::WheelDown };
+                            let mm = MouseMods { shift: mods.shift, alt: mods.alt, ctrl: mods.ctrl };
+                            for _ in 0..notches.abs() {
+                                pane.send_mouse(MouseKind::Press, btn, col, row, mm);
+                            }
+                        }
+                    }
+                    WheelAction::Arrows(lines) => {
+                        // Alternate scroll (xterm mode 1007): on the alt
+                        // screen an app like vim/less/man has no scrollback,
+                        // so a wheel tick is translated into arrow-key
+                        // presses that scroll it. APP_CURSOR (DECCKM): SS3
+                        // (ESC O A/B) vs CSI (ESC [ A/B).
+                        let seq: &[u8] = match (lines > 0, mode.contains(TermMode::APP_CURSOR)) {
+                            (true, false) => b"\x1b[A",
+                            (true, true) => b"\x1bOA",
+                            (false, false) => b"\x1b[B",
+                            (false, true) => b"\x1bOB",
+                        };
+                        // Read-only gate: a wheel tick here is translated
+                        // into user keystrokes sent to the app, so it must
+                        // honor read-only (unlike terminal-response
+                        // send_bytes paths, which must never be suppressed).
+                        if !pane.read_only {
+                            for _ in 0..lines.abs() {
+                                pane.send_bytes(seq.to_vec());
+                            }
+                        }
+                    }
+                    WheelAction::Lines(lines) => pane.scroll_by(lines),
                 }
             }
         }
     }
 
+    // Auto-scroll while a selection drag rests in the top/bottom edge band,
+    // one line per frame from the frame after the press. When already at the
+    // scroll limit, selection_auto_scroll returns false and we do a normal
+    // in-bounds update so the edge line still selects.
+    if was_selecting && held.0[0] == Some(PressOwner::Selection) {
+        if let (Some(p), Some(pane)) = (pointer, tab_mgr.tabs[tab_idx].panes.get(&pane_id)) {
+            let delta = edge_band_scroll(p, terminal_rect);
+            if delta != 0 {
+                let visible_cols = (terminal_rect.width() * ppp / cell_w).floor() as i32;
+                if !pane.selection_auto_scroll(delta, visible_cols) {
+                    let (col, row) = cell_under(Some(pane), p, inner_rect, ppp, cell_w, cell_h);
+                    pane.update_selection(col, row, cell_side(p, inner_rect, ppp, cell_w));
+                }
+            }
+        }
+    }
+
+    if held != held_before {
+        ui.ctx().data_mut(|d| {
+            if held.any() {
+                d.insert_temp(held_id, held);
+            } else {
+                d.remove::<HeldButtons>(held_id);
+            }
+        });
+    }
+    if clicks != clicks_before {
+        ui.ctx().data_mut(|d| d.insert_temp(clicks_id, clicks));
+    }
+    if wheel_carry != wheel_carry_before {
+        ui.ctx().data_mut(|d| d.insert_temp(wheel_id, wheel_carry));
+    }
+
     (handled_by_url, url_highlight)
+}
+
+/// Hand a URL to the desktop's default opener (Terminator's `open_url` default
+/// handler path). Used by Ctrl+click on a matched URL and by the Help action.
+pub(crate) fn open_url(url: &str) {
+    let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+    let _ = std::process::Command::new(opener).arg(url).spawn();
 }
 
 /// Menu entry that fires an action, showing the bound key combo (if any)
@@ -644,6 +827,24 @@ fn action_menu_item(
     }
 }
 
+/// The menu's Copy is a plain `copy_clipboard`, sensitive only while the pane
+/// has a selection (Terminator terminal_popup_menu.py:198-200). It deliberately
+/// bypasses `Action::Copy`: the smart_copy fall-through belongs to the key
+/// handler alone, so a menu click can never inject ^C into the shell.
+fn copy_menu_item(ui: &mut egui::Ui, bindings: &BindingTable, pane: Option<&crate::pane::Pane>) {
+    let mut btn = egui::Button::new("Copy");
+    if let Some(combo) = bindings.combo_for(Action::Copy) {
+        btn = btn.shortcut_text(combo);
+    }
+    let has_selection = pane.is_some_and(|p| p.has_selection());
+    if ui.add_enabled(has_selection, btn).clicked() {
+        if let Some(text) = pane.and_then(|p| p.selection_text()).filter(|t| !t.is_empty()) {
+            ui.ctx().copy_text(text);
+        }
+        ui.close();
+    }
+}
+
 fn build_context_menu(
     ui: &mut egui::Ui,
     pane_id: PaneId,
@@ -656,7 +857,7 @@ fn build_context_menu(
     state: &mut PaneViewState,
     deferred: &mut Vec<Action>,
 ) {
-    action_menu_item(ui, bindings, "Copy", Action::Copy, deferred);
+    copy_menu_item(ui, bindings, tab.panes.get(&pane_id));
     action_menu_item(ui, bindings, "Paste", Action::Paste, deferred);
     ui.separator();
     action_menu_item(ui, bindings, "Split Horizontally", Action::SplitHorizontal, deferred);
@@ -779,24 +980,29 @@ fn profiles_menu(
 
 fn handle_drag_drop(
     state: &mut PaneViewState,
-    tab: &mut crate::tabs::Tab,
+    tab_mgr: &mut TabManager,
     pane_drop_rects: &[(PaneId, egui::Rect)],
     ui: &mut egui::Ui,
 ) {
     if state.drag_source_pane.is_some() && !ui.input(|i| i.pointer.any_down()) {
         if let Some(src) = state.drag_source_pane.take() {
             if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
+                let tab_idx = tab_mgr.active_tab;
                 for (tid, full_rect) in pane_drop_rects {
                     if *tid != src && full_rect.contains(pos) {
                         let (dir, src_first) = drop_zone_direction(*full_rect, pos);
-                        tab.layout.remove_leaf(src);
+                        let layout = &mut tab_mgr.tabs[tab_idx].layout;
+                        layout.remove_leaf(src);
                         if src_first {
-                            tab.layout.split_leaf(*tid, src, dir);
-                            tab.layout.swap_leaves(src, *tid);
+                            layout.split_leaf(*tid, src, dir);
+                            layout.swap_leaves(src, *tid);
                         } else {
-                            tab.layout.split_leaf(*tid, src, dir);
+                            layout.split_leaf(*tid, src, dir);
                         }
-                        tab.focused = src;
+                        // The dropped pane takes focus
+                        // (`widgetsrc.ensure_visible_and_focussed()`,
+                        // terminal.py:1450), with the focus-out/in pair.
+                        tab_mgr.set_focused_pane(tab_idx, src);
                         break;
                     }
                 }
@@ -858,13 +1064,9 @@ fn paint_scrollbar(
 ) {
     if let Some(pane) = tab.panes.get(&pane_id) {
         let (offset, history, screen) = pane.scroll_info();
-        if history > 0 && pane.scrollbar_visible {
+        if let Some(track) = scrollbar_track(inner_rect, history, pane.scrollbar_visible) {
             let total = history + screen;
             let sb_width = SCROLLBAR_WIDTH;
-            let track = egui::Rect::from_min_max(
-                egui::pos2(inner_rect.right() - sb_width, inner_rect.top()),
-                inner_rect.right_bottom(),
-            );
             let track_h = track.height();
             let thumb_frac = (screen as f32 / total as f32).clamp(0.05, 1.0);
             let thumb_h = (track_h * thumb_frac).max(16.0);
@@ -940,10 +1142,7 @@ fn paint_pane(
 
     let ppp = ui.ctx().pixels_per_point();
     let inner_rect = rect.shrink(FOCUS_BORDER);
-    let width_px = inner_rect.width() * ppp;
-    let height_px = inner_rect.height() * ppp;
-    let new_cols = ((width_px / cell_w).floor() as usize).max(1);
-    let new_lines = ((height_px / cell_h).floor() as usize).max(1);
+    let (new_cols, new_lines) = grid_dims(inner_rect, ppp, cell_w, cell_h);
     pane.resize(new_cols, new_lines, cell_w, cell_h);
 
     let frame = pane.frame(focused);
@@ -1442,12 +1641,27 @@ fn drop_zone_rect(rect: egui::Rect, pos: egui::Pos2) -> egui::Rect {
     }
 }
 
+/// The grid that fills `inner_rect`: whole cells only, never fewer than one
+/// each way. `paint_pane` resizes the terminal to exactly this, so it is the
+/// coordinate space every mouse report and selection point must lie in.
+fn grid_dims(inner_rect: egui::Rect, ppp: f32, cell_w: f32, cell_h: f32) -> (usize, usize) {
+    let cols = ((inner_rect.width() * ppp / cell_w).floor() as usize).max(1);
+    let lines = ((inner_rect.height() * ppp / cell_h).floor() as usize).max(1);
+    (cols, lines)
+}
+
+/// Pixel -> cell, confined to the grid that fills `rect` (VTE's
+/// `confine_grid_coords`): a pointer in the right/bottom margin, past the
+/// rect during a drag, or above/left of it resolves to the nearest actual
+/// cell, so a mouse report never names a column or row the app does not
+/// have.
 fn cell_at(p: egui::Pos2, rect: egui::Rect, ppp: f32, cell_w: f32, cell_h: f32) -> (i32, i32) {
+    let (cols, lines) = grid_dims(rect, ppp, cell_w, cell_h);
     let rel_x = ((p.x - rect.left()).max(0.0)) * ppp;
     let rel_y = ((p.y - rect.top()).max(0.0)) * ppp;
     let col = (rel_x / cell_w).floor() as i32;
     let row = (rel_y / cell_h).floor() as i32;
-    (col.max(0), row.max(0))
+    (col.clamp(0, cols as i32 - 1), row.clamp(0, lines as i32 - 1))
 }
 
 /// Which half of the cell the cursor sits in. Selection includes the anchor
@@ -1479,138 +1693,321 @@ fn motion_report(
     (should_send, new_last)
 }
 
-/// Forward mouse activity to the application while a mouse-reporting mode is
-/// active (the `mouse_to_app` branch of `handle_pane_mouse`).
-///
-/// Real terminals send Press when a button goes down, Motion while it drags,
-/// and Release when it comes back up. egui's click events never fire once the
-/// pointer has moved, so a synthetic Press+Release pair on `clicked()` left
-/// drags with no Press before and no Release after their Motion stream. The
-/// forwarded button is tracked in temp data (same pattern as `motion_id`) and
-/// the transitions are emitted directly by `button_forward`.
-fn forward_mouse_to_app(
-    pane: &crate::pane::Pane,
-    response: &egui::Response,
-    ui: &egui::Ui,
-    pointer_cell: Option<(i32, i32)>,
-    tab_idx: usize,
-    pane_id: PaneId,
+/// Pixel->cell from fixed cell width; then resolve a click on the right half
+/// of a double-width glyph (its WIDE_CHAR_SPACER column) back to the base
+/// column, matching alacritty's whole-glyph hit semantics. All downstream
+/// uses (selection, mouse-to-app, URL hit-test) get the authoritative column.
+fn cell_under(
+    pane: Option<&crate::pane::Pane>,
+    p: egui::Pos2,
+    inner_rect: egui::Rect,
+    ppp: f32,
+    cell_w: f32,
     cell_h: f32,
-    mm: MouseMods,
-) {
-    let motion_id = egui::Id::new(("pane_motion_cell", tab_idx, pane_id));
+) -> (i32, i32) {
+    let (col, row) = cell_at(p, inner_rect, ppp, cell_w, cell_h);
+    let col = pane
+        .and_then(|p| p.cached.as_ref())
+        .map(|frame| crate::pane::resolve_wide_click_col(&frame.cells, row, col))
+        .unwrap_or(col);
+    (col, row)
+}
 
-    // Button state machine. Runs before the pointer_cell gate so the Release
-    // still fires when the button comes up after the pointer left the pane.
-    let btn_id = egui::Id::new(("pane_mouse_btn", tab_idx, pane_id));
-    let recorded: Option<MouseButton> = ui.ctx().data(|d| d.get_temp(btn_id));
-    let (just_pressed, down) = ui.input(|i| {
-        let pressed = if i.pointer.button_pressed(egui::PointerButton::Primary) {
-            Some(MouseButton::Left)
-        } else if i.pointer.button_pressed(egui::PointerButton::Secondary) {
-            Some(MouseButton::Right)
-        } else if i.pointer.button_pressed(egui::PointerButton::Middle) {
-            Some(MouseButton::Middle)
-        } else {
-            None
-        };
-        let down = (i.pointer.primary_down(), i.pointer.secondary_down(), i.pointer.middle_down());
-        (pressed, down)
-    });
-    let (event, new_recorded) =
-        button_forward(recorded, just_pressed, pointer_cell.is_some(), down);
-    if let Some((kind, btn)) = event {
-        // A Press always has a pointer cell (the over-pane gate); a Release
-        // uses the last motion-reported cell when the pointer is gone.
-        let cell = match kind {
-            MouseKind::Press => pointer_cell,
-            _ => ui.ctx().data(|d| d.get_temp(motion_id)).or(pointer_cell),
-        };
-        if let Some((col, row)) = cell {
-            pane.send_mouse(kind, btn, col, row, mm);
+/// Auto-scroll direction for a selection drag at `p`: 1 (up) in the band along
+/// the terminal's top edge, -1 (down) along the bottom, 0 elsewhere. A
+/// maximized window's bottom edge coincides with the screen edge, where the OS
+/// clamps the cursor so it can never travel *past* the rect — so an edge band
+/// (>=/<=) is used instead of a strict-outside test, else downward auto-scroll
+/// never fires.
+fn edge_band_scroll(p: egui::Pos2, terminal_rect: egui::Rect) -> i32 {
+    const EDGE: f32 = 6.0;
+    if p.y <= terminal_rect.top() + EDGE {
+        1
+    } else if p.y >= terminal_rect.bottom() - EDGE {
+        -1
+    } else {
+        0
+    }
+}
+
+/// The scrollbar's track along the pane's right edge, present only while there
+/// is scrollback to show. `paint_scrollbar` registers it as its own widget on
+/// top of the terminal, so a press there is the scrollbar's.
+fn scrollbar_track(inner_rect: egui::Rect, history: usize, visible: bool) -> Option<egui::Rect> {
+    (history > 0 && visible).then(|| {
+        egui::Rect::from_min_max(
+            egui::pos2(inner_rect.right() - SCROLLBAR_WIDTH, inner_rect.top()),
+            inner_rect.right_bottom(),
+        )
+    })
+}
+
+/// Whether a press at `pos` landed on this pane's terminal: inside its rect,
+/// with no other layer (a dialog window) over that point, and off the
+/// scrollbar strip. The per-event counterpart of egui's per-frame hit test,
+/// which knows only the frame's last pointer position.
+fn press_hits_pane(
+    ctx: &egui::Context,
+    layer: egui::LayerId,
+    terminal_rect: egui::Rect,
+    pane: Option<&crate::pane::Pane>,
+    inner_rect: egui::Rect,
+    pos: egui::Pos2,
+) -> bool {
+    terminal_rect.contains(pos)
+        && ctx.layer_id_at(pos) == Some(layer)
+        && !pane
+            .and_then(|p| scrollbar_track(inner_rect, p.scroll_info().1, p.scrollbar_visible))
+            .is_some_and(|track| track.contains(pos))
+}
+
+/// One of the frame's pointer events, as `handle_pane_mouse` replays them in
+/// delivery order from `InputState::events`. A `Button` with no
+/// `MouseButton` is an extra button (back/forward), which VTE neither tracks
+/// nor reports; its press still focuses the terminal. A `Wheel` is the raw
+/// event with its own modifiers, not egui's smoothed `smooth_scroll_delta`,
+/// which releases a notch over several frames and rewrites it to the x axis
+/// under Shift.
+enum PointerEv {
+    Button { pos: egui::Pos2, button: Option<MouseButton>, pressed: bool, mods: egui::Modifiers },
+    Moved(egui::Pos2),
+    Wheel { unit: egui::MouseWheelUnit, delta: egui::Vec2, mods: egui::Modifiers },
+}
+
+/// egui's pointer button as the terminal's; `None` for the extra buttons.
+fn mouse_button(button: egui::PointerButton) -> Option<MouseButton> {
+    match button {
+        egui::PointerButton::Primary => Some(MouseButton::Left),
+        egui::PointerButton::Secondary => Some(MouseButton::Right),
+        egui::PointerButton::Middle => Some(MouseButton::Middle),
+        _ => None,
+    }
+}
+
+/// Slot of a button in `HeldButtons` and the down-state arrays (left, middle,
+/// right — xterm's button numbering).
+fn button_slot(button: MouseButton) -> Option<usize> {
+    match button {
+        MouseButton::Left => Some(0),
+        MouseButton::Middle => Some(1),
+        MouseButton::Right => Some(2),
+        _ => None,
+    }
+}
+
+/// Which of left/middle/right were already down when the frame's events
+/// began: egui's end-of-frame state walked back through the frame's presses
+/// and releases. Under GTK's implicit grab the first press's window keeps the
+/// pointer until every button is up, so a press while another button is down
+/// is only ever the holder's.
+fn buttons_down_before(at_end: [bool; 3], events: &[PointerEv]) -> [bool; 3] {
+    let mut down = at_end;
+    for ev in events.iter().rev() {
+        if let PointerEv::Button { button, pressed, .. } = ev {
+            if let Some(slot) = button.and_then(button_slot) {
+                down[slot] = !pressed;
+            }
         }
     }
-    if new_recorded != recorded {
-        ui.ctx().data_mut(|d| match new_recorded {
-            Some(btn) => {
-                d.insert_temp(btn_id, btn);
-            }
-            None => d.remove::<MouseButton>(btn_id),
-        });
+    down
+}
+
+/// Who a button press belongs to — VTE's `m_mouse_handled_buttons`
+/// (vte.cc `widget_mouse_press`): decided once at the press and followed by
+/// the button's motion and release whatever Shift or the app's mouse mode do
+/// in the meantime.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PressOwner {
+    /// The press started a selection; motion extends it and the release
+    /// writes PRIMARY.
+    Selection,
+    /// The press was forwarded to the app; its release goes there too.
+    App,
+    /// Consumed at the press (a paste, a URL Ctrl+click, a context-menu
+    /// press); the release is nobody's.
+    Consumed,
+}
+
+/// Buttons held from presses on this pane (left, middle, right) with each
+/// press's owner — VTE's `m_mouse_pressed_buttons`. Kept in egui temp data
+/// across frames; while any is held the pane keeps the pointer (GTK's implicit
+/// grab), so a further press is its own wherever the pointer is.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct HeldButtons([Option<PressOwner>; 3]);
+
+impl HeldButtons {
+    fn any(&self) -> bool {
+        self.0.iter().any(Option::is_some)
     }
 
-    if let Some((col, row)) = pointer_cell {
-        if response.hovered() {
-            let scroll_y = ui.ctx().input(|i| i.smooth_scroll_delta.y);
-            if scroll_y.abs() > 1.0 {
-                let steps = (scroll_y.abs() / cell_h.max(1.0)).ceil() as i32;
-                let btn = if scroll_y > 0.0 { MouseButton::WheelUp } else { MouseButton::WheelDown };
-                for _ in 0..steps.min(8) {
-                    pane.send_mouse(MouseKind::Press, btn, col, row, mm);
-                }
-            }
-        }
-
-        // Cell-motion / drag reporting (modes 1002/1003). The pointer moves
-        // at frame rate, but a terminal only cares about cell transitions, so
-        // we coalesce by reporting only when the resolved cell changes from the
-        // last one reported for this pane (tracked in egui temp data).
-        if response.hovered() {
-            let (held_button, button_held) = ui.input(|i| {
-                if i.pointer.primary_down() {
-                    (MouseButton::Left, true)
-                } else if i.pointer.secondary_down() {
-                    (MouseButton::Right, true)
-                } else if i.pointer.middle_down() {
-                    (MouseButton::Middle, true)
-                } else {
-                    (MouseButton::Left, false)
-                }
-            });
-            let last_cell: Option<(i32, i32)> = ui.ctx().data(|d| d.get_temp(motion_id));
-            let (should_send, new_last) =
-                motion_report(pane.term_mode(), button_held, last_cell, (col, row));
-            if should_send {
-                pane.send_mouse(MouseKind::Motion, held_button, col, row, mm);
-            }
-            if new_last != last_cell {
-                ui.ctx().data_mut(|d| d.insert_temp(motion_id, (col, row)));
-            }
+    /// The button a drag report names: the lowest-numbered held one, as VTE's
+    /// `maybe_send_mouse_drag` reports "the leftmost pressed button", or
+    /// `None` (xterm's button 3) for buttonless any-motion (1003) hover.
+    fn drag_button(&self) -> MouseButton {
+        match self.0 {
+            [Some(_), _, _] => MouseButton::Left,
+            [_, Some(_), _] => MouseButton::Middle,
+            [_, _, Some(_)] => MouseButton::Right,
+            _ => MouseButton::None,
         }
     }
 }
 
-/// Per-frame step of the forwarded-button state machine. Given which button a
-/// Press was already forwarded for, which button (if any) went down this frame,
-/// whether the pointer resolves to a cell in this pane, and the current
-/// down-state of (left, right, middle), decide what to send and the new record.
-/// A Press is only emitted over the pane with no button recorded (first
-/// recorded wins until released); a Release is emitted as soon as the recorded
-/// button is no longer down, wherever the pointer is. Pure so it is testable.
-fn button_forward(
-    recorded: Option<MouseButton>,
-    just_pressed: Option<MouseButton>,
-    over_pane: bool,
-    (left, right, middle): (bool, bool, bool),
-) -> (Option<(MouseKind, MouseButton)>, Option<MouseButton>) {
-    match recorded {
-        Some(btn) => {
-            let still_down = match btn {
-                MouseButton::Left => left,
-                MouseButton::Right => right,
-                MouseButton::Middle => middle,
-                _ => false,
-            };
-            if still_down {
-                (None, Some(btn))
-            } else {
-                (Some((MouseKind::Release, btn)), None)
-            }
+/// What a pane does with a press.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PressAction {
+    Forward,
+    Select(SelectionType),
+    Paste,
+    Nothing,
+}
+
+impl PressAction {
+    fn owner(self) -> PressOwner {
+        match self {
+            PressAction::Forward => PressOwner::App,
+            PressAction::Select(_) => PressOwner::Selection,
+            PressAction::Paste | PressAction::Nothing => PressOwner::Consumed,
         }
-        None => match just_pressed {
-            Some(btn) if over_pane => (Some((MouseKind::Press, btn)), Some(btn)),
-            _ => (None, None),
-        },
+    }
+}
+
+/// Terminator's `on_buttonpress` (terminal.py:1108-1176) over VTE's
+/// `widget_mouse_press`, from the press's own modifiers and click count:
+/// Ctrl+left on a URL is consumed by Terminator before VTE sees it (the URL
+/// opens on the click; no selection starts and nothing reaches the app);
+/// otherwise an app reporting mouse gets the press unless Shift is held; left
+/// starts a selection — by word on the second click, by line on the third;
+/// middle pastes PRIMARY unless Ctrl is held (or `disable_mouse_paste`);
+/// right is the context menu's, which `draw_leaf` opens on the click.
+fn press_action(
+    button: MouseButton,
+    count: u8,
+    mods: egui::Modifiers,
+    reporting: bool,
+    on_url: bool,
+    disable_mouse_paste: bool,
+) -> PressAction {
+    match button {
+        MouseButton::Left if mods.ctrl && on_url => PressAction::Nothing,
+        _ if reporting && !mods.shift => PressAction::Forward,
+        MouseButton::Left => PressAction::Select(match count {
+            3 => SelectionType::Lines,
+            2 => SelectionType::Semantic,
+            _ => SelectionType::Simple,
+        }),
+        MouseButton::Middle if !mods.ctrl && !disable_mouse_paste => PressAction::Paste,
+        _ => PressAction::Nothing,
+    }
+}
+
+/// What a wheel event does, in whole units; positive is up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WheelAction {
+    /// Shift+wheel: Terminator's `scroll_by_page(±1)`, one page per notch.
+    Pages(i32),
+    /// An app reporting mouse gets one button-4/5 press per notch.
+    Reports(i32),
+    /// The alternate screen under alternate scroll (mode 1007): arrow keys.
+    Arrows(i32),
+    /// History scroll, in lines.
+    Lines(i32),
+}
+
+/// A wheel event in notches, the unit VTE's wheel accounting runs in (one
+/// `GDK_SCROLL_UP`, one smooth-scroll unit): a `Line` is one; a trackpad's
+/// `Point` delta counts a row of pointer travel as one, `ppp` taking the
+/// points to the physical pixels `cell_h` is in; a `Page` is ten, a notch
+/// scrolling a tenth of a page (see `wheel_action`).
+fn wheel_notches(unit: egui::MouseWheelUnit, delta_y: f32, ppp: f32, cell_h: f32) -> f32 {
+    match unit {
+        egui::MouseWheelUnit::Line => delta_y,
+        egui::MouseWheelUnit::Point => delta_y * ppp / cell_h.max(1.0),
+        egui::MouseWheelUnit::Page => delta_y * 10.0,
+    }
+}
+
+/// Terminator's `on_mousewheel` (terminal.py:1178-1210) over VTE's
+/// `widget_mouse_scroll`, decided per event from its own modifiers: Shift
+/// alone takes a page per notch (Ctrl alone zooms, upstream in window.rs);
+/// anything else is VTE's — an app reporting mouse gets a button-4/5 press
+/// per notch whatever the modifiers, the alternate screen with alternate
+/// scroll gets `v` arrow keys per notch, and the normal screen scrolls `v`
+/// lines of history per notch, `v = max(1, ceil(rows / 10))`. `carry` is
+/// VTE's `m_mouse_smooth_scroll_delta`: the event's `notches` join what
+/// earlier events left short of a whole unit, the whole part is taken out
+/// here and the remainder waits for the next event, so a notch is neither
+/// lost to frame timing nor acted on twice.
+fn wheel_action(
+    carry: &mut f32,
+    notches: f32,
+    mods: egui::Modifiers,
+    mode: TermMode,
+    rows: usize,
+) -> WheelAction {
+    *carry += notches;
+    let take = |carry: &mut f32, per_notch: f32| -> i32 {
+        let whole = (*carry * per_notch).trunc();
+        *carry = (*carry * per_notch - whole) / per_notch;
+        whole as i32
+    };
+    let v = (rows as f32 / 10.0).ceil().max(1.0);
+    if mods.shift && !mods.ctrl {
+        WheelAction::Pages(take(carry, 1.0))
+    } else if mode.intersects(TermMode::MOUSE_MODE) {
+        WheelAction::Reports(take(carry, 1.0))
+    } else if mode.contains(TermMode::ALT_SCREEN) && mode.contains(TermMode::ALTERNATE_SCROLL) {
+        WheelAction::Arrows(take(carry, v))
+    } else {
+        WheelAction::Lines(take(carry, v))
+    }
+}
+
+/// GTK's `gtk-double-click-time` and `gtk-double-click-distance` defaults:
+/// how soon and how near a further press of the same button must follow to
+/// count as a double (triple) click.
+const DOUBLE_CLICK_TIME: f64 = 0.4;
+const DOUBLE_CLICK_DISTANCE: f32 = 5.0;
+
+/// GDK's multiple-click bookkeeping (`_gdk_event_button_generate`): the last
+/// two presses on this pane, newest first. Kept in egui temp data; see
+/// `click_count`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct ClickInfo {
+    button: [Option<MouseButton>; 2],
+    time: [f64; 2],
+    pos: [egui::Pos2; 2],
+}
+
+/// Count a press on the pane the way GDK does, per button and on the press: a
+/// second press of the same button within `DOUBLE_CLICK_TIME` and
+/// `DOUBLE_CLICK_DISTANCE` of the previous one is a double click, a third
+/// within twice the time of the one before that a triple, after which the run
+/// resets so the fourth is a single again. A press of any other button breaks
+/// the run, so left, middle, left at one spot is three single clicks. egui's
+/// own counter is button-blind and counts on release.
+fn click_count(info: &mut ClickInfo, button: MouseButton, pos: egui::Pos2, time: f64) -> u8 {
+    let near = |i: usize| {
+        (pos.x - info.pos[i].x).abs() <= DOUBLE_CLICK_DISTANCE
+            && (pos.y - info.pos[i].y).abs() <= DOUBLE_CLICK_DISTANCE
+    };
+    if info.button[1] == Some(button) && time < info.time[1] + 2.0 * DOUBLE_CLICK_TIME && near(1) {
+        *info = ClickInfo::default();
+        3
+    } else if info.button[0] == Some(button) && time < info.time[0] + DOUBLE_CLICK_TIME && near(0) {
+        *info = ClickInfo {
+            button: [Some(button), info.button[0]],
+            time: [time, info.time[0]],
+            pos: [pos, info.pos[0]],
+        };
+        2
+    } else {
+        *info = ClickInfo {
+            button: [Some(button), None],
+            time: [time, 0.0],
+            pos: [pos, egui::Pos2::ZERO],
+        };
+        1
     }
 }
 
@@ -1647,6 +2044,31 @@ mod tests {
     }
 
     #[test]
+    fn cell_at_confines_to_the_grid() {
+        // R-062: VTE's `confine_grid_coords`. A 1005x1010 rect with 10x20
+        // cells holds 100 cols x 50 lines (whole cells only), so the last
+        // cell is (99, 49).
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1005.0, 1010.0));
+        assert_eq!(grid_dims(rect, 1.0, 10.0, 20.0), (100, 50));
+        // The right/bottom margin (inside the rect, past the last whole
+        // cell) is the last cell, not col == cols / row == lines.
+        assert_eq!(cell_at(egui::pos2(1002.0, 1005.0), rect, 1.0, 10.0, 20.0), (99, 49));
+        // A drag past the rect (egui keeps the widget hovered) clamps too.
+        assert_eq!(cell_at(egui::pos2(1500.0, 30.0), rect, 1.0, 10.0, 20.0), (99, 1));
+        assert_eq!(cell_at(egui::pos2(25.0, 4000.0), rect, 1.0, 10.0, 20.0), (2, 49));
+        // The last whole cell itself is unaffected.
+        assert_eq!(cell_at(egui::pos2(999.0, 999.0), rect, 1.0, 10.0, 20.0), (99, 49));
+        // ppp scales the grid the same way it scales the pointer: at ppp=2
+        // the rect is 2010x2020 px -> 201 cols x 101 lines.
+        assert_eq!(grid_dims(rect, 2.0, 10.0, 20.0), (201, 101));
+        assert_eq!(cell_at(egui::pos2(1500.0, 30.0), rect, 2.0, 10.0, 20.0), (200, 3));
+        // A rect smaller than one cell is still a 1x1 grid.
+        let tiny = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(4.0, 4.0));
+        assert_eq!(grid_dims(tiny, 1.0, 10.0, 20.0), (1, 1));
+        assert_eq!(cell_at(egui::pos2(50.0, 50.0), tiny, 1.0, 10.0, 20.0), (0, 0));
+    }
+
+    #[test]
     fn cell_side_half_cell_threshold_inclusive_right() {
         let rect = rect_origin();
         // Within the first cell (cell_w=10): just under the half-cell is Left,
@@ -1680,36 +2102,189 @@ mod tests {
     }
 
     #[test]
-    fn button_forward_press_drag_release() {
-        use MouseButton::{Left, Right};
-        use MouseKind::{Press, Release};
-        // Idle with nothing pressed: nothing to send, nothing recorded.
-        assert_eq!(button_forward(None, None, true, (false, false, false)), (None, None));
-        // Left goes down over the pane: Press sent and recorded.
+    fn press_action_follows_terminator_on_buttonpress() {
+        use MouseButton::{Left, Middle, Right};
+        use PressAction::{Forward, Nothing, Paste, Select};
+        let plain = egui::Modifiers::NONE;
+        let shift = egui::Modifiers::SHIFT;
+        let ctrl = egui::Modifiers::CTRL;
+        // No mouse mode: left selects, middle pastes, right is the menu's.
+        assert_eq!(press_action(Left, 1, plain, false, false, false), Select(SelectionType::Simple));
+        assert_eq!(press_action(Middle, 1, plain, false, false, false), Paste);
+        assert_eq!(press_action(Right, 1, plain, false, false, false), Nothing);
+        // An app reporting mouse gets every button — unless Shift is held,
+        // which keeps the press local (Shift+left selects, Shift+middle pastes).
+        assert_eq!(press_action(Left, 1, plain, true, false, false), Forward);
+        assert_eq!(press_action(Middle, 1, plain, true, false, false), Forward);
+        assert_eq!(press_action(Right, 1, plain, true, false, false), Forward);
+        assert_eq!(press_action(Left, 1, shift, true, false, false), Select(SelectionType::Simple));
+        assert_eq!(press_action(Middle, 1, shift, true, false, false), Paste);
+        // Ctrl+middle never pastes; `disable_mouse_paste` turns the paste off.
+        assert_eq!(press_action(Middle, 1, ctrl, false, false, false), Nothing);
+        assert_eq!(press_action(Middle, 1, plain, false, false, true), Nothing);
+        // R-058: Ctrl+left on a URL is consumed before VTE sees it — no
+        // selection starts and, in mouse mode, nothing is forwarded. Ctrl+left
+        // off a URL is an ordinary press.
+        assert_eq!(press_action(Left, 1, ctrl, false, true, false), Nothing);
+        assert_eq!(press_action(Left, 1, ctrl, true, true, false), Nothing);
+        assert_eq!(press_action(Left, 1, ctrl, false, false, false), Select(SelectionType::Simple));
+        assert_eq!(press_action(Left, 1, ctrl, true, false, false), Forward);
+        // R-057: the click count picks the selection unit on the press.
+        assert_eq!(press_action(Left, 2, plain, false, false, false), Select(SelectionType::Semantic));
+        assert_eq!(press_action(Left, 3, plain, false, false, false), Select(SelectionType::Lines));
+        // ...but every physical press still reaches a mouse-mode app.
+        assert_eq!(press_action(Left, 2, plain, true, false, false), Forward);
+    }
+
+    #[test]
+    fn wheel_action_scrolls_whole_notches_and_carries_the_rest() {
+        use WheelAction::{Arrows, Lines, Pages, Reports};
+        let plain = egui::Modifiers::NONE;
+        let normal = TermMode::empty();
+        // R-004: one notch on a 24-row screen is `ceil(24/10)` = 3 lines,
+        // whole and at once, however the frames fall; a notch down likewise.
+        let mut carry = 0.0;
+        assert_eq!(wheel_action(&mut carry, 1.0, plain, normal, 24), Lines(3));
+        assert_eq!(carry, 0.0);
+        assert_eq!(wheel_action(&mut carry, -1.0, plain, normal, 24), Lines(-3));
+        // Never fewer than one line per notch, and larger screens get more.
+        assert_eq!(wheel_action(&mut carry, 1.0, plain, normal, 5), Lines(1));
+        assert_eq!(wheel_action(&mut carry, 1.0, plain, normal, 50), Lines(5));
+        // A trackpad's fraction of a notch waits until it adds up to a whole
+        // line (4 lines per notch at 40 rows, so an eighth is half a line);
+        // nothing is dropped and nothing is acted on twice.
+        let mut carry = 0.0;
+        assert_eq!(wheel_action(&mut carry, 0.125, plain, normal, 40), Lines(0));
+        assert_eq!(wheel_action(&mut carry, 0.125, plain, normal, 40), Lines(1));
+        assert_eq!(wheel_action(&mut carry, 0.125, plain, normal, 40), Lines(0));
+        assert_eq!(wheel_action(&mut carry, 0.125, plain, normal, 40), Lines(1));
+        assert_eq!(carry, 0.0);
+        // A run of arbitrary fractions still scrolls their sum in whole lines
+        // and keeps only the shortfall.
+        let mut carry = 0.0;
+        let total: i32 = (0..30)
+            .map(|_| match wheel_action(&mut carry, 0.1, plain, normal, 24) {
+                Lines(n) => n,
+                other => panic!("{other:?}"),
+            })
+            .sum();
+        assert!(total == 8 || total == 9, "total {total}");
+        assert!((carry * 3.0 + total as f32 - 9.0).abs() < 1e-4, "carry {carry}");
+        // A mouse-reporting app gets exactly one report per whole notch,
+        // whatever the frame rate delivered the notch in.
+        let tracking = TermMode::MOUSE_REPORT_CLICK;
+        let mut carry = 0.0;
+        assert_eq!(wheel_action(&mut carry, 0.5, plain, tracking, 24), Reports(0));
+        assert_eq!(wheel_action(&mut carry, 0.5, plain, tracking, 24), Reports(1));
+        assert_eq!(wheel_action(&mut carry, -3.0, plain, tracking, 24), Reports(-3));
+        // Alternate scroll on the alt screen: `v` arrow keys per notch.
+        let alt_scroll = TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL;
+        let mut carry = 0.0;
+        assert_eq!(wheel_action(&mut carry, 1.0, plain, alt_scroll, 24), Arrows(3));
+        // The alt screen without alternate scroll is a plain history scroll
+        // (a no-op there), not arrow keys.
+        assert_eq!(wheel_action(&mut carry, 1.0, plain, TermMode::ALT_SCREEN, 24), Lines(3));
+        // R-027: Shift+wheel is Terminator's page scroll, a page per notch,
+        // even inside a mouse-reporting app; Ctrl+Shift falls through to VTE.
+        let shift = egui::Modifiers::SHIFT;
+        let mut carry = 0.0;
+        assert_eq!(wheel_action(&mut carry, 1.0, shift, normal, 24), Pages(1));
+        assert_eq!(wheel_action(&mut carry, -1.0, shift, tracking, 24), Pages(-1));
+        assert_eq!(wheel_action(&mut carry, 1.0, shift | egui::Modifiers::CTRL, normal, 24), Lines(3));
+        assert_eq!(wheel_action(&mut carry, 1.0, shift | egui::Modifiers::CTRL, tracking, 24), Reports(1));
+    }
+
+    #[test]
+    fn wheel_notches_by_unit() {
+        // A wheel line is a notch; trackpad points count a row of travel as
+        // one (cell_h is physical, delta in points); a page is ten notches.
+        assert_eq!(wheel_notches(egui::MouseWheelUnit::Line, 2.0, 2.0, 20.0), 2.0);
+        assert_eq!(wheel_notches(egui::MouseWheelUnit::Point, 10.0, 2.0, 20.0), 1.0);
+        assert_eq!(wheel_notches(egui::MouseWheelUnit::Point, -5.0, 1.0, 20.0), -0.25);
+        assert_eq!(wheel_notches(egui::MouseWheelUnit::Page, 1.0, 1.0, 20.0), 10.0);
+    }
+
+    #[test]
+    fn click_count_is_per_button_on_press_and_resets_after_triple() {
+        use MouseButton::{Left, Middle};
+        let at = egui::pos2(100.0, 100.0);
+        let mut info = ClickInfo::default();
+        // Three quick presses of one button at one spot: 1, 2, 3 — and the
+        // run resets, so a fourth is a single again (GDK zeroes its slots).
+        assert_eq!(click_count(&mut info, Left, at, 0.0), 1);
+        assert_eq!(click_count(&mut info, Left, at, 0.1), 2);
+        assert_eq!(click_count(&mut info, Left, at, 0.2), 3);
+        assert_eq!(click_count(&mut info, Left, at, 0.3), 1);
+        // R-057: another button in between breaks the run — left, middle,
+        // left at one spot is three single clicks, not a triple.
+        let mut info = ClickInfo::default();
+        assert_eq!(click_count(&mut info, Left, at, 0.0), 1);
+        assert_eq!(click_count(&mut info, Middle, at, 0.1), 1);
+        assert_eq!(click_count(&mut info, Left, at, 0.2), 1);
+        // Too slow (past DOUBLE_CLICK_TIME) or too far (past
+        // DOUBLE_CLICK_DISTANCE, per axis) is a single.
+        let mut info = ClickInfo::default();
+        assert_eq!(click_count(&mut info, Left, at, 0.0), 1);
+        assert_eq!(click_count(&mut info, Left, at, 0.0 + DOUBLE_CLICK_TIME), 1);
+        let mut info = ClickInfo::default();
+        assert_eq!(click_count(&mut info, Left, at, 0.0), 1);
+        let far = egui::pos2(at.x + DOUBLE_CLICK_DISTANCE + 0.5, at.y);
+        assert_eq!(click_count(&mut info, Left, far, 0.1), 1);
+        // The triple window is twice the double window, measured from the
+        // first press: 1 at 0.0, 2 at 0.35, 3 at 0.7 qualifies.
+        let mut info = ClickInfo::default();
+        assert_eq!(click_count(&mut info, Left, at, 0.0), 1);
+        assert_eq!(click_count(&mut info, Left, at, 0.35), 2);
+        assert_eq!(click_count(&mut info, Left, at, 0.7), 3);
+    }
+
+    #[test]
+    fn buttons_down_before_walks_back_through_the_frame() {
+        use MouseButton::{Left, Middle};
+        let ev = |button, pressed| PointerEv::Button {
+            pos: egui::Pos2::ZERO,
+            button: Some(button),
+            pressed,
+            mods: egui::Modifiers::NONE,
+        };
+        // Left pressed this frame and still down at its end: it was up before.
+        assert_eq!(buttons_down_before([true, false, false], &[ev(Left, true)]), [false, false, false]);
+        // Left released this frame (up at the end): it was down before.
+        assert_eq!(buttons_down_before([false, false, false], &[ev(Left, false)]), [true, false, false]);
+        // R-054/R-056 batch: left release then middle press and release, all
+        // in one frame, ends with nothing down — only left was down before.
         assert_eq!(
-            button_forward(None, Some(Left), true, (true, false, false)),
-            (Some((Press, Left)), Some(Left))
+            buttons_down_before(
+                [false, false, false],
+                &[ev(Left, false), ev(Middle, true), ev(Middle, false)]
+            ),
+            [true, false, false]
         );
-        // A press with the pointer off the pane is ignored.
-        assert_eq!(
-            button_forward(None, Some(Left), false, (true, false, false)),
-            (None, None)
-        );
-        // Held during a drag: silent (motion is reported elsewhere), record kept.
-        assert_eq!(
-            button_forward(Some(Left), None, true, (true, false, false)),
-            (None, Some(Left))
-        );
-        // A second button pressed while one is recorded: first recorded wins.
-        assert_eq!(
-            button_forward(Some(Left), Some(Right), true, (true, true, false)),
-            (None, Some(Left))
-        );
-        // Button up, even with the pointer off the pane: Release, record cleared.
-        assert_eq!(
-            button_forward(Some(Left), None, false, (false, false, false)),
-            (Some((Release, Left)), None)
-        );
+        // No button events: the end state is the start state.
+        assert_eq!(buttons_down_before([false, true, false], &[]), [false, true, false]);
+    }
+
+    #[test]
+    fn held_buttons_drag_button_is_the_leftmost() {
+        use PressOwner::{App, Consumed};
+        assert_eq!(HeldButtons::default().drag_button(), MouseButton::None);
+        assert!(!HeldButtons::default().any());
+        assert_eq!(HeldButtons([None, None, Some(App)]).drag_button(), MouseButton::Right);
+        assert_eq!(HeldButtons([None, Some(Consumed), Some(App)]).drag_button(), MouseButton::Middle);
+        assert_eq!(HeldButtons([Some(App), Some(App), None]).drag_button(), MouseButton::Left);
+    }
+
+    #[test]
+    fn edge_band_scroll_is_inclusive_at_both_edges() {
+        let rect = egui::Rect::from_min_max(egui::pos2(0.0, 10.0), egui::pos2(100.0, 110.0));
+        assert_eq!(edge_band_scroll(egui::pos2(50.0, 16.0), rect), 1);
+        assert_eq!(edge_band_scroll(egui::pos2(50.0, 16.1), rect), 0);
+        assert_eq!(edge_band_scroll(egui::pos2(50.0, 104.0), rect), -1);
+        assert_eq!(edge_band_scroll(egui::pos2(50.0, 103.9), rect), 0);
+        // The band is also entered from outside the rect (the pointer clamped
+        // at a screen edge, or dragged past the pane).
+        assert_eq!(edge_band_scroll(egui::pos2(50.0, 0.0), rect), 1);
+        assert_eq!(edge_band_scroll(egui::pos2(50.0, 200.0), rect), -1);
     }
 
     fn cell(col: i32, c: char, wide: bool, hyperlink: Option<&str>) -> CellSnapshot {

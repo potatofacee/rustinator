@@ -62,6 +62,25 @@ impl TabBarState {
     pub(crate) fn is_renaming(&self) -> bool {
         self.rename.is_some()
     }
+
+    /// Start the inline rename of the tab at `index` from the keyboard
+    /// (Terminator `edit_tab_title` -> `label.edit()`), seeded with the title
+    /// the strip currently shows — the same editor the tab context menu opens.
+    /// A no-op while the strip is hidden: the editor lives in the strip, so
+    /// there would be nothing to draw (and `is_renaming` would wedge input).
+    pub(crate) fn start_rename(&mut self, tabs: &[Tab], index: usize, position: TabPosition) {
+        if position == TabPosition::Hidden {
+            return;
+        }
+        let Some(tab) = tabs.get(index) else {
+            return;
+        };
+        self.rename = Some(TabRename {
+            index,
+            buf: tab_title(tab, index),
+            focus_pending: true,
+        });
+    }
 }
 
 /// Per-frame, borrowed snapshot the App derives from config + `TabManager` and
