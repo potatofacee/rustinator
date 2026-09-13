@@ -94,6 +94,16 @@ pub struct GlobalConfig {
     /// (default) preserves today's behavior of opening a single default tab.
     #[serde(default)]
     pub startup_layout: Option<String>,
+    /// A Ctrl Copy chord (Ctrl+Shift+C) with nothing selected is left to the
+    /// shell as ^C instead of being swallowed. Global in Terminator
+    /// (config.py `smart_copy`, default True), not per profile.
+    #[serde(default = "default_true")]
+    pub smart_copy: bool,
+    /// Middle-click does not paste PRIMARY. Global in Terminator (config.py
+    /// `disable_mouse_paste`, default False), checked only for the mouse
+    /// paste — the keyboard Paste action ignores it (terminal.py:1843-1847).
+    #[serde(default)]
+    pub disable_mouse_paste: bool,
 }
 
 /// Where the tab bar is positioned. `Hidden` suppresses the panel entirely.
@@ -118,8 +128,6 @@ pub struct Profile {
     pub transparency: TransparencyConfig,
     #[serde(default)]
     pub copy_on_selection: bool,
-    #[serde(default)]
-    pub smart_copy: bool,
     #[serde(default = "default_true")]
     pub cursor_blink: bool,
     /// Cursor shape used until an application picks one with DECSCUSR (and
@@ -130,10 +138,20 @@ pub struct Profile {
     pub scroll_on_output: bool,
     #[serde(default = "default_true")]
     pub scroll_on_keystroke: bool,
+    /// Ctrl+wheel does not change the font size; the event scrolls instead
+    /// (Terminator `disable_mousewheel_zoom`, config.py:250, default False).
+    #[serde(default)]
+    pub disable_mousewheel_zoom: bool,
     #[serde(default)]
     pub clear_wipes_scrollback: bool,
     #[serde(default = "default_word_chars")]
     pub word_chars: String,
+    /// What the Backspace and Delete keys send (Terminator Profiles >
+    /// Compatibility, config.py:233-234).
+    #[serde(default = "default_backspace_binding")]
+    pub backspace_binding: EraseBinding,
+    #[serde(default = "default_delete_binding")]
+    pub delete_binding: EraseBinding,
     #[serde(default)]
     pub exit_action: ExitAction,
     /// Factor (0.0-1.0) multiplied into the foreground and the 16 ANSI palette
@@ -184,6 +202,25 @@ impl CursorShape {
     }
 }
 
+/// What an erase key sends — Terminator's `backspace_binding` /
+/// `delete_binding` values, which it hands to VTE as its erase bindings
+/// (terminal.py:730-772). Spelled as Terminator spells them so a value
+/// carries over verbatim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EraseBinding {
+    /// VTE's ERASE_AUTO, the pty's own erase character. The pty's termios is
+    /// not read here, so this is VTE's fallback for that case: ^? for
+    /// Backspace, the escape sequence for Delete.
+    Automatic,
+    /// ^H (0x08).
+    ControlH,
+    /// ^? (0x7f).
+    AsciiDel,
+    /// `\e[3~`, carrying the modifiers as CSI 3;{mod}~.
+    EscapeSequence,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ExitAction {
@@ -199,6 +236,14 @@ fn default_true() -> bool {
 
 fn default_word_chars() -> String {
     "-A-Za-z0-9,./?%&#:_=+@~".into()
+}
+
+fn default_backspace_binding() -> EraseBinding {
+    EraseBinding::AsciiDel
+}
+
+fn default_delete_binding() -> EraseBinding {
+    EraseBinding::EscapeSequence
 }
 
 fn default_inactive_color_offset() -> f32 {
@@ -237,7 +282,9 @@ pub struct ColorsConfig {
 
 /// Title bar fg/bg per broadcast state: transmit = the focused pane, receive
 /// = an unfocused pane receiving broadcast input, inactive = everything else
-/// (including every pane while the window is unfocused). Terminator defaults.
+/// (including every pane while the window is unfocused). Same state model as
+/// Terminator's titlebar; defaults follow rustinator's dark palette (tab-bar
+/// greys, `focus_border` indigo) rather than Terminator's red/blue/grey stock.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct TitleColors {
@@ -252,34 +299,34 @@ pub struct TitleColors {
 impl Default for TitleColors {
     fn default() -> Self {
         Self {
-            transmit_fg: "#ffffff".into(),
-            transmit_bg: "#c80003".into(),
-            receive_fg: "#ffffff".into(),
-            receive_bg: "#0076c9".into(),
-            inactive_fg: "#000000".into(),
-            inactive_bg: "#c0bebf".into(),
+            transmit_fg: "#e5e5e5".into(),
+            transmit_bg: "#520095".into(),
+            receive_fg: "#e5e5e5".into(),
+            receive_bg: "#2f5f6e".into(),
+            inactive_fg: "#8c8c8c".into(),
+            inactive_bg: "#282828".into(),
         }
     }
 }
 
 impl TitleColors {
     pub fn transmit_fg_rgb(&self) -> [u8; 3] {
-        parse_hex(&self.transmit_fg).unwrap_or([0xff, 0xff, 0xff])
+        parse_hex(&self.transmit_fg).unwrap_or([0xe5, 0xe5, 0xe5])
     }
     pub fn transmit_bg_rgb(&self) -> [u8; 3] {
-        parse_hex(&self.transmit_bg).unwrap_or([0xc8, 0x00, 0x03])
+        parse_hex(&self.transmit_bg).unwrap_or([0x52, 0x00, 0x95])
     }
     pub fn receive_fg_rgb(&self) -> [u8; 3] {
-        parse_hex(&self.receive_fg).unwrap_or([0xff, 0xff, 0xff])
+        parse_hex(&self.receive_fg).unwrap_or([0xe5, 0xe5, 0xe5])
     }
     pub fn receive_bg_rgb(&self) -> [u8; 3] {
-        parse_hex(&self.receive_bg).unwrap_or([0x00, 0x76, 0xc9])
+        parse_hex(&self.receive_bg).unwrap_or([0x2f, 0x5f, 0x6e])
     }
     pub fn inactive_fg_rgb(&self) -> [u8; 3] {
-        parse_hex(&self.inactive_fg).unwrap_or([0x00, 0x00, 0x00])
+        parse_hex(&self.inactive_fg).unwrap_or([0x8c, 0x8c, 0x8c])
     }
     pub fn inactive_bg_rgb(&self) -> [u8; 3] {
-        parse_hex(&self.inactive_bg).unwrap_or([0xc0, 0xbe, 0xbf])
+        parse_hex(&self.inactive_bg).unwrap_or([0x28, 0x28, 0x28])
     }
 }
 
@@ -336,6 +383,8 @@ impl Default for GlobalConfig {
             new_tab_after_current: false,
             scroll_tabbar: false,
             startup_layout: None,
+            smart_copy: true,
+            disable_mouse_paste: false,
         }
     }
 }
@@ -355,13 +404,15 @@ impl Profile {
             scrollback: ScrollbackConfig::default(),
             transparency: TransparencyConfig::default(),
             copy_on_selection: false,
-            smart_copy: false,
             cursor_blink: true,
             cursor_shape: CursorShape::Block,
             scroll_on_output: false,
             scroll_on_keystroke: true,
+            disable_mousewheel_zoom: false,
             clear_wipes_scrollback: false,
             word_chars: default_word_chars(),
+            backspace_binding: default_backspace_binding(),
+            delete_binding: default_delete_binding(),
             exit_action: ExitAction::Close,
             bold_is_bright: false,
             inactive_color_offset: default_inactive_color_offset(),
@@ -574,13 +625,15 @@ impl Config {
                 scrollback: self.scrollback.take().unwrap_or_default(),
                 transparency: TransparencyConfig::default(),
                 copy_on_selection: false,
-                smart_copy: false,
                 cursor_blink: true,
                 cursor_shape: CursorShape::Block,
                 scroll_on_output: false,
                 scroll_on_keystroke: true,
+                disable_mousewheel_zoom: false,
                 clear_wipes_scrollback: false,
                 word_chars: default_word_chars(),
+                backspace_binding: default_backspace_binding(),
+                delete_binding: default_delete_binding(),
                 exit_action: ExitAction::Close,
                 bold_is_bright: false,
                 inactive_color_offset: default_inactive_color_offset(),
@@ -988,11 +1041,41 @@ mod tests {
         panic!("add show_titlebar: bool to Profile");
     }
 
-    // Gap #36: disable mouse paste
+    // Gap #36: disable mouse paste. Global in Terminator's config.py (the
+    // `global_config` section, next to smart_copy), not per profile.
     #[test]
-    #[ignore = "gap #36: disable_mouse_paste not yet in Profile"]
-    fn config_profile_disable_mouse_paste() {
-        panic!("add disable_mouse_paste: bool to Profile");
+    fn disable_mouse_paste_is_global_and_defaults_off() {
+        assert!(!GlobalConfig::default().disable_mouse_paste);
+        assert!(!Config::default().global.disable_mouse_paste);
+
+        let mut cfg = Config::default();
+        cfg.global.disable_mouse_paste = true;
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        assert!(text.contains("disable_mouse_paste = true"));
+        let parsed: Config = toml::from_str(&text).unwrap();
+        assert!(parsed.global.disable_mouse_paste);
+
+        // Old config missing the key gets Terminator's default.
+        let cfg: Config = toml::from_str("[global]\nconfirm_on_close = false\n").unwrap();
+        assert!(!cfg.global.disable_mouse_paste);
+    }
+
+    // R-034: Ctrl+wheel zoom can be turned off. Per profile in Terminator
+    // (config.py:250), like the other scroll options.
+    #[test]
+    fn disable_mousewheel_zoom_is_per_profile_and_defaults_off() {
+        assert!(!Profile::default().disable_mousewheel_zoom);
+
+        let mut cfg = Config::default();
+        cfg.profiles[0].disable_mousewheel_zoom = true;
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        assert!(text.contains("disable_mousewheel_zoom = true"));
+        let parsed: Config = toml::from_str(&text).unwrap();
+        assert!(parsed.profiles[0].disable_mousewheel_zoom);
+
+        // Old config missing the key gets Terminator's default.
+        let cfg: Config = toml::from_str("[[profiles]]\nname = \"Default\"\n").unwrap();
+        assert!(!cfg.profiles[0].disable_mousewheel_zoom);
     }
 
     // Gap #37: clear selection on copy
@@ -1030,6 +1113,33 @@ mod tests {
     }
 
     #[test]
+    fn erase_bindings_round_trip_with_terminator_spelling() {
+        // R-088: Terminator's defaults (config.py:233-234) and its values.
+        let p = Profile::default();
+        assert_eq!(p.backspace_binding, EraseBinding::AsciiDel);
+        assert_eq!(p.delete_binding, EraseBinding::EscapeSequence);
+        let mut cfg = Config::default();
+        cfg.active_mut().backspace_binding = EraseBinding::ControlH;
+        cfg.active_mut().delete_binding = EraseBinding::Automatic;
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        assert!(text.contains("backspace_binding = \"control-h\""));
+        assert!(text.contains("delete_binding = \"automatic\""));
+        let parsed: Config = toml::from_str(&text).unwrap();
+        assert_eq!(parsed.active().backspace_binding, EraseBinding::ControlH);
+        assert_eq!(parsed.active().delete_binding, EraseBinding::Automatic);
+        let cfg: Config = toml::from_str(
+            "[[profiles]]\nname = \"Default\"\nbackspace_binding = \"escape-sequence\"\ndelete_binding = \"ascii-del\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.active().backspace_binding, EraseBinding::EscapeSequence);
+        assert_eq!(cfg.active().delete_binding, EraseBinding::AsciiDel);
+        // A profile without the keys keeps the defaults.
+        let cfg: Config = toml::from_str("[[profiles]]\nname = \"Default\"\n").unwrap();
+        assert_eq!(cfg.active().backspace_binding, EraseBinding::AsciiDel);
+        assert_eq!(cfg.active().delete_binding, EraseBinding::EscapeSequence);
+    }
+
+    #[test]
     fn cursor_shape_round_trips_and_defaults_block() {
         assert_eq!(Profile::default().cursor_shape, CursorShape::Block);
         let mut cfg = Config::default();
@@ -1047,15 +1157,15 @@ mod tests {
     #[test]
     fn title_colors_round_trip_and_default() {
         let t = TitleColors::default();
-        assert_eq!(t.transmit_bg_rgb(), [0xc8, 0x00, 0x03]);
-        assert_eq!(t.receive_bg_rgb(), [0x00, 0x76, 0xc9]);
-        assert_eq!(t.inactive_fg_rgb(), [0x00, 0x00, 0x00]);
+        assert_eq!(t.transmit_bg_rgb(), [0x52, 0x00, 0x95]);
+        assert_eq!(t.receive_bg_rgb(), [0x2f, 0x5f, 0x6e]);
+        assert_eq!(t.inactive_fg_rgb(), [0x8c, 0x8c, 0x8c]);
         let mut cfg = Config::default();
         cfg.active_mut().colors.title.receive_fg = "#123456".into();
         let text = toml::to_string_pretty(&cfg).unwrap();
         let parsed: Config = toml::from_str(&text).unwrap();
         assert_eq!(parsed.active().colors.title.receive_fg_rgb(), [0x12, 0x34, 0x56]);
-        assert_eq!(parsed.active().colors.title.inactive_bg_rgb(), [0xc0, 0xbe, 0xbf]);
+        assert_eq!(parsed.active().colors.title.inactive_bg_rgb(), [0x28, 0x28, 0x28]);
     }
 
     #[test]
@@ -1277,6 +1387,34 @@ mod tests {
         assert_eq!(cfg.layouts.len(), 1);
         assert_eq!(cfg.layouts[0].name, "Old");
         assert!(cfg.layouts[0].terminals.is_empty());
+    }
+
+    #[test]
+    fn smart_copy_is_global_and_defaults_true() {
+        // R-038: Terminator's config.py has `smart_copy: True` in the global
+        // section, not per profile.
+        assert!(GlobalConfig::default().smart_copy);
+        assert!(Config::default().global.smart_copy);
+
+        // Off round-trips.
+        let mut cfg = Config::default();
+        cfg.global.smart_copy = false;
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        let parsed: Config = toml::from_str(&text).unwrap();
+        assert!(!parsed.global.smart_copy);
+
+        // Old config missing the key (or carrying the retired per-profile one)
+        // gets Terminator's default.
+        let toml_text = r##"
+            [global]
+            confirm_on_close = false
+
+            [[profiles]]
+            name = "Default"
+            smart_copy = false
+        "##;
+        let cfg: Config = toml::from_str(toml_text).unwrap();
+        assert!(cfg.global.smart_copy);
     }
 
     #[test]

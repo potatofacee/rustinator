@@ -19,6 +19,8 @@ pub enum Action {
     FocusPrev,
     Copy,
     Paste,
+    PasteSelection,
+    SendNewline,
     OpenPrefs,
     ToggleZoom,
     ScaledZoom,
@@ -50,6 +52,12 @@ pub enum Action {
     RotateCCW,
     SplitAuto,
     ToggleScrollbar,
+    PageUp,
+    PageDown,
+    PageUpHalf,
+    PageDownHalf,
+    LineUp,
+    LineDown,
     HideWindow,
     ToggleReadOnly,
     SetTitle,
@@ -67,6 +75,13 @@ pub enum Action {
     NextProfile,
     PreviousProfile,
     LayoutLauncher,
+    DetachTab,
+    EditWindowTitle,
+    EditTabTitle,
+    EditTerminalTitle,
+    PrefsKeybindings,
+    Help,
+    NewTerminator,
 }
 
 impl Action {
@@ -82,6 +97,8 @@ impl Action {
             "focus_prev" => Action::FocusPrev,
             "copy" => Action::Copy,
             "paste" => Action::Paste,
+            "paste_selection" => Action::PasteSelection,
+            "send_newline" => Action::SendNewline,
             "open_prefs" => Action::OpenPrefs,
             "toggle_zoom" => Action::ToggleZoom,
             "scaled_zoom" => Action::ScaledZoom,
@@ -122,6 +139,12 @@ impl Action {
             "rotate_ccw" => Action::RotateCCW,
             "split_auto" => Action::SplitAuto,
             "toggle_scrollbar" => Action::ToggleScrollbar,
+            "page_up" => Action::PageUp,
+            "page_down" => Action::PageDown,
+            "page_up_half" => Action::PageUpHalf,
+            "page_down_half" => Action::PageDownHalf,
+            "line_up" => Action::LineUp,
+            "line_down" => Action::LineDown,
             "hide_window" => Action::HideWindow,
             "toggle_read_only" => Action::ToggleReadOnly,
             "set_title" => Action::SetTitle,
@@ -139,6 +162,13 @@ impl Action {
             "next_profile" => Action::NextProfile,
             "previous_profile" => Action::PreviousProfile,
             "layout_launcher" => Action::LayoutLauncher,
+            "detach_tab" => Action::DetachTab,
+            "edit_window_title" => Action::EditWindowTitle,
+            "edit_tab_title" => Action::EditTabTitle,
+            "edit_terminal_title" => Action::EditTerminalTitle,
+            "preferences_keybindings" => Action::PrefsKeybindings,
+            "help" => Action::Help,
+            "new_terminator" => Action::NewTerminator,
             _ => return None,
         })
     }
@@ -172,26 +202,50 @@ impl BindingTable {
     pub fn new(force_linux: bool) -> Self {
         let mut t = Self { map: HashMap::new() };
         for (combo, action) in defaults_for_platform(force_linux) {
-            if let Some(parsed) = parse_combo(&combo) {
+            if let Ok(parsed) = parse_combo(&combo) {
                 t.map.insert(parsed, action);
             }
         }
         t
     }
 
-    /// Override / extend the table with user bindings. Unknown actions or unparseable
-    /// combos are logged and skipped.
+    /// Apply the user's `[[keybindings]]` over the defaults the way
+    /// Terminator's config lays its `[keybindings]` section over its own
+    /// before `Keybindings.reload` builds the lookup (keybindings.py:68-96):
+    /// an action the user names loses every default chord and is bound to
+    /// exactly the combos listed for it (several entries for one action are
+    /// Terminator's tuple of bindings), so a rebound action's old chord is no
+    /// longer live. An empty combo or "None" leaves the action unbound
+    /// (keybindings.py:73-74); so does an unparseable one, which is logged —
+    /// in Terminator the bad value has already replaced the default by the
+    /// time it fails to parse. A chord that belongs to another action is
+    /// taken over, last wins as in the loader's dict assignment (only the
+    /// prefs GUI refuses duplicates), and the collision is logged. Unknown
+    /// actions are logged and skipped.
     pub fn apply_user(&mut self, entries: &[(String, String)]) {
+        let named: Vec<Action> = entries
+            .iter()
+            .filter_map(|(action_str, _)| Action::from_str(action_str))
+            .collect();
+        self.map.retain(|_, action| !named.contains(action));
         for (action_str, combo) in entries {
             let Some(action) = Action::from_str(action_str) else {
                 eprintln!("keybinding: unknown action '{}'", action_str);
                 continue;
             };
-            let Some(parsed) = parse_combo(combo) else {
-                eprintln!("keybinding: can't parse combo '{}'", combo);
+            if combo_is_unbound(combo) {
                 continue;
+            }
+            let parsed = match parse_combo(combo) {
+                Ok(parsed) => parsed,
+                Err(e) => {
+                    eprintln!("keybinding: can't parse combo '{}' for {}: {}", combo, action_str, e);
+                    continue;
+                }
             };
-            self.map.insert(parsed, action);
+            if let Some(prev) = self.map.insert(parsed, action).filter(|prev| *prev != action) {
+                eprintln!("keybinding: '{}' was {:?}, now {}", combo, prev, action_str);
+            }
         }
     }
 
@@ -319,7 +373,7 @@ fn linux_defaults() -> Vec<(String, Action)> {
         ("Ctrl+Shift+Q".into(), Action::CloseWindow),        // close_window
         ("Ctrl+Shift+T".into(), Action::NewTab),             // new_tab
         ("Ctrl+Shift+I".into(), Action::NewWindow),          // new_window
-        // ("Super+I", Action::NewTerminator),         // new_terminator — not implemented
+        ("Super+I".into(), Action::NewTerminator),           // new_terminator
         ("Alt+L".into(), Action::LayoutLauncher),            // layout_launcher
 
         // ── Navigation (focus) ───────────────────────────────────────
@@ -337,6 +391,7 @@ fn linux_defaults() -> Vec<(String, Action)> {
         ("Ctrl+PageUp".into(), Action::PrevTab),             // prev_tab
         ("Ctrl+Shift+PageDown".into(), Action::MoveTabRight),
         ("Ctrl+Shift+PageUp".into(), Action::MoveTabLeft),
+        ("Ctrl+Shift+D".into(), Action::DetachTab),           // detach_tab
         // switch_to_tab_1..10 — unbound by default in Terminator
 
         // ── Resize ───────────────────────────────────────────────────
@@ -352,8 +407,11 @@ fn linux_defaults() -> Vec<(String, Action)> {
         ("Ctrl+Shift+X".into(), Action::ToggleZoom),          // toggle_zoom
         ("Ctrl+Shift+Z".into(), Action::ScaledZoom),          // scaled_zoom
         ("Ctrl+Shift+Alt+A".into(), Action::HideWindow),
-        ("Ctrl+Equals".into(), Action::ZoomIn),               // zoom_in (Ctrl+Plus)
-        ("Ctrl+Shift+Equals".into(), Action::ZoomIn),         // zoom_in (shifted = literal +)
+        // zoom_in is `<Control>plus`: the `+` keysym, wherever the layout puts
+        // it — Ctrl+Shift+= on US (Shift consumed, see input::lookup_binding),
+        // the unshifted `+` key on German. Ctrl+Equals is kept alongside.
+        ("Ctrl+Plus".into(), Action::ZoomIn),                 // zoom_in
+        ("Ctrl+Equals".into(), Action::ZoomIn),               // zoom_in (rustinator extra)
         ("Ctrl+Minus".into(), Action::ZoomOut),                // zoom_out
         ("Ctrl+0".into(), Action::ZoomReset),                  // zoom_normal
         // ("", Action::ZoomInAll),                     // zoom_in_all — not implemented
@@ -363,7 +421,9 @@ fn linux_defaults() -> Vec<(String, Action)> {
         // ── Clipboard ────────────────────────────────────────────────
         ("Ctrl+Shift+C".into(), Action::Copy),                // copy
         ("Ctrl+Shift+V".into(), Action::Paste),               // paste
-        // ("", Action::PasteSelection),               // paste_selection — not implemented
+        // paste_selection stays UNBOUND by default (Terminator parity);
+        // Shift+Insert pastes PRIMARY as VTE's own built-in (input::key_builtin).
+        ("Shift+Enter".into(), Action::SendNewline),          // send_newline (<Shift>Return)
 
         // ── Search ───────────────────────────────────────────────────
         ("Ctrl+Shift+F".into(), Action::ToggleSearch),        // search
@@ -372,8 +432,11 @@ fn linux_defaults() -> Vec<(String, Action)> {
         ("Ctrl+Shift+R".into(), Action::ResetTerminal),       // reset
         ("Ctrl+Shift+G".into(), Action::ResetClear),          // reset_clear
 
-        // ── Scrollbar & profiles ─────────────────────────────────────
+        // ── Scrollbar, scrolling & profiles ──────────────────────────
         ("Ctrl+Shift+S".into(), Action::ToggleScrollbar),
+        // page_up / page_down / page_up_half / page_down_half / line_up /
+        // line_down stay UNBOUND by default (Terminator parity); Shift+PgUp/
+        // PgDn/Home/End scroll as VTE's own built-ins (input::key_builtin).
         // next_profile / previous_profile stay UNBOUND by default (Terminator
         // parity; reachable via the right-click "Profiles" radio submenu).
 
@@ -387,9 +450,9 @@ fn linux_defaults() -> Vec<(String, Action)> {
         // broadcast_off/group/all stay UNBOUND (Terminator parity; menu radio items)
 
         // ── Title editing ────────────────────────────────────────────
-        // ("Ctrl+Alt+W", Action::EditWindowTitle),     // edit_window_title — not implemented
-        // ("Ctrl+Alt+A", Action::EditTabTitle),        // edit_tab_title — not implemented
-        // ("Ctrl+Alt+X", Action::EditTerminalTitle),   // edit_terminal_title — not implemented
+        ("Ctrl+Alt+W".into(), Action::EditWindowTitle),       // edit_window_title
+        ("Ctrl+Alt+A".into(), Action::EditTabTitle),          // edit_tab_title
+        ("Ctrl+Alt+X".into(), Action::EditTerminalTitle),     // edit_terminal_title
 
         // ── Terminal index insert ────────────────────────────────────
         ("Super+1".into(), Action::InsertNumber),             // insert_number
@@ -397,28 +460,79 @@ fn linux_defaults() -> Vec<(String, Action)> {
 
         // ── Preferences & help ───────────────────────────────────────
         // ("", Action::OpenPrefs),                     // preferences — unbound in Terminator
-        // ("Ctrl+Shift+K", Action::PrefsKeybindings),  // preferences_keybindings — not implemented
-        // ("F1", Action::Help),                        // help — not implemented
+        ("Ctrl+Shift+K".into(), Action::PrefsKeybindings),    // preferences_keybindings
+        ("F1".into(), Action::Help),                          // help
     ]
 }
 
-fn parse_combo(s: &str) -> Option<(Mods, egui::Key)> {
-    let parts: Vec<&str> = s.split('+').map(str::trim).filter(|p| !p.is_empty()).collect();
-    if parts.is_empty() {
-        return None;
-    }
+/// A combo that binds nothing: Terminator's `''` / `"None"` (keybindings.py:73-74).
+fn combo_is_unbound(combo: &str) -> bool {
+    let combo = combo.trim();
+    combo.is_empty() || combo.eq_ignore_ascii_case("none")
+}
+
+/// Parse a combo in either spelling: rustinator's `Ctrl+Shift+O` or
+/// Terminator's own `<Shift><Control>o` (keybindings.py:31,98-111 — every
+/// `<name>` group is a modifier, whatever is left is the keysym name), so a
+/// binding copied out of a Terminator config works as written. Errors carry
+/// Terminator's `KeymapError` wording.
+fn parse_combo(s: &str) -> Result<(Mods, egui::Key), String> {
     let mut mods = Mods { shift: false, alt: false, ctrl: false, mac_cmd: false };
-    for part in &parts[..parts.len() - 1] {
-        match part.to_ascii_lowercase().as_str() {
-            "ctrl" | "control" => mods.ctrl = true,
-            "shift" => mods.shift = true,
-            "alt" | "meta" => mods.alt = true,
-            "super" | "cmd" | "command" => mods.mac_cmd = true,
-            _ => return None,
+    let key_name = if s.contains('<') {
+        gtk_modifiers(s, &mut mods)?
+    } else {
+        let mut parts: Vec<&str> = s.split('+').map(str::trim).filter(|p| !p.is_empty()).collect();
+        let key = parts.pop().unwrap_or_default();
+        for part in parts {
+            apply_modifier(part, &mut mods)?;
         }
+        key.to_string()
+    };
+    let key_name = key_name.trim();
+    if key_name.is_empty() {
+        return Err("No key found".into());
     }
-    let key = parse_key(parts[parts.len() - 1])?;
-    Some((mods, key))
+    parse_key(key_name)
+        .map(|key| (mods, key))
+        .ok_or_else(|| format!("Key '{key_name}' is unrecognised"))
+}
+
+/// Strip every `<name>` group of a GTK-style combo into `mods`, returning
+/// the key name that is left over.
+fn gtk_modifiers(s: &str, mods: &mut Mods) -> Result<String, String> {
+    let mut key = String::new();
+    let mut rest = s;
+    while let Some(open) = rest.find('<') {
+        key.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+        let close = after
+            .find('>')
+            .ok_or_else(|| format!("Unterminated modifier in '{s}'"))?;
+        apply_modifier(&after[..close], mods)?;
+        rest = &after[close + 1..];
+    }
+    key.push_str(rest);
+    Ok(key)
+}
+
+/// Set the modifier a combo token names (Terminator's table, keybindings.py:35-45).
+fn apply_modifier(name: &str, mods: &mut Mods) -> Result<(), String> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "ctrl" | "control" | "primary" => mods.ctrl = true,
+        "shift" => mods.shift = true,
+        "alt" | "meta" => mods.alt = true,
+        // Super, Hyper and Mod4 are one key on a stock xkb map (Mod4 holds
+        // Super_L/R and Hyper_L, and GDK raises both virtual masks for it),
+        // so a Terminator `<Hyper>` or `<Mod4>` chord is the Super chord here.
+        "super" | "cmd" | "command" | "hyper" | "mod4" => mods.mac_cmd = true,
+        // Terminator makes Mod2 the Command key on macOS (keybindings.py:45);
+        // on X11 Mod2 is NumLock, a lock state winit never reports, so such
+        // a chord cannot be matched there.
+        "mod2" if cfg!(target_os = "macos") => mods.mac_cmd = true,
+        "mod2" => return Err("Modifier '<Mod2>' is NumLock on this platform".into()),
+        other => return Err(format!("Unhandled modifier '<{other}>'")),
+    }
+    Ok(())
 }
 
 fn parse_key(s: &str) -> Option<egui::Key> {
@@ -443,8 +557,8 @@ fn parse_key(s: &str) -> Option<egui::Key> {
         "insert" => Key::Insert,
         "home" => Key::Home,
         "end" => Key::End,
-        "pageup" => Key::PageUp,
-        "pagedown" => Key::PageDown,
+        "pageup" | "page_up" => Key::PageUp,
+        "pagedown" | "page_down" => Key::PageDown,
         "up" | "arrowup" => Key::ArrowUp,
         "down" | "arrowdown" => Key::ArrowDown,
         "left" | "arrowleft" => Key::ArrowLeft,
@@ -455,7 +569,12 @@ fn parse_key(s: &str) -> Option<egui::Key> {
         "slash" | "/" => Key::Slash,
         "backslash" | "\\" => Key::Backslash,
         "minus" | "-" => Key::Minus,
-        "equals" | "=" => Key::Equals,
+        "plus" => Key::Plus,
+        "equals" | "equal" | "=" => Key::Equals,
+        "bracketleft" | "[" => Key::OpenBracket,
+        "bracketright" | "]" => Key::CloseBracket,
+        "apostrophe" | "'" => Key::Quote,
+        "grave" | "`" => Key::Backtick,
         "f1" => Key::F1, "f2" => Key::F2, "f3" => Key::F3, "f4" => Key::F4,
         "f5" => Key::F5, "f6" => Key::F6, "f7" => Key::F7, "f8" => Key::F8,
         "f9" => Key::F9, "f10" => Key::F10, "f11" => Key::F11, "f12" => Key::F12,
@@ -483,25 +602,96 @@ mod tests {
 
     #[test]
     fn unknown_modifier_rejected() {
-        assert!(parse_combo("Hyper+A").is_none());
+        assert_eq!(parse_combo("Mod3+A"), Err("Unhandled modifier '<mod3>'".into()));
+        assert_eq!(parse_combo("<Mod3>a"), Err("Unhandled modifier '<mod3>'".into()));
     }
 
     #[test]
     fn unknown_key_rejected() {
-        assert!(parse_combo("Ctrl+UnknownKey").is_none());
+        assert_eq!(parse_combo("Ctrl+UnknownKey"), Err("Key 'UnknownKey' is unrecognised".into()));
+        assert_eq!(parse_combo(""), Err("No key found".into()));
+        assert_eq!(parse_combo("<Control>"), Err("No key found".into()));
     }
 
     #[test]
     fn linux_defaults_all_parse() {
         for (combo, _) in linux_defaults() {
-            assert!(parse_combo(&combo).is_some(), "failed: {combo}");
+            assert!(parse_combo(&combo).is_ok(), "failed: {combo}");
         }
     }
 
     #[test]
     fn macos_defaults_all_parse() {
         for (combo, _) in macos_defaults() {
-            assert!(parse_combo(&combo).is_some(), "failed: {combo}");
+            assert!(parse_combo(&combo).is_ok(), "failed: {combo}");
+        }
+    }
+
+    // plugins-29: Terminator's own `<Modifier>keyname` spelling parses to the
+    // same chord as the `+` form, keysym names included.
+    #[test]
+    fn parse_gtk_style_combo() {
+        assert_eq!(parse_combo("<Shift><Control>t"), parse_combo("Ctrl+Shift+T"));
+        assert_eq!(parse_combo("<Control>Page_Down"), parse_combo("Ctrl+PageDown"));
+        assert_eq!(parse_combo("<Shift>Return"), parse_combo("Shift+Enter"));
+        assert_eq!(parse_combo("<Control>plus"), parse_combo("Ctrl+Plus"));
+        assert_eq!(parse_combo("<Alt>Up"), parse_combo("Alt+Up"));
+        assert_eq!(parse_combo("<Shift><Control><Alt>a"), parse_combo("Ctrl+Shift+Alt+A"));
+        assert_eq!(parse_combo("<Super>r"), parse_combo("Super+R"));
+        assert_eq!(parse_combo("<Control>equal"), parse_combo("Ctrl+Equals"));
+        assert_eq!(parse_combo("<Control>bracketleft"), parse_combo("Ctrl+["));
+        // Modifiers are case-insensitive, as Terminator lowercases them.
+        assert_eq!(parse_combo("<CONTROL><shift>Tab"), parse_combo("Ctrl+Shift+Tab"));
+        // Terminator strips the groups wherever they sit.
+        assert_eq!(parse_combo("t<Control>"), parse_combo("Ctrl+T"));
+        assert_eq!(parse_combo("<Control"), Err("Unterminated modifier in '<Control'".into()));
+    }
+
+    /// Terminator's non-empty default chords (config.py:126-215), verbatim.
+    fn terminator_default_combos() -> Vec<&'static str> {
+        vec![
+            "<Control>plus", "<Control>minus", "<Control>0", "<Shift><Control>t",
+            "<Control>Tab", "<Shift><Control>Tab", "<Shift><Control>n",
+            "<Shift><Control>p", "<Alt>Up", "<Alt>Down", "<Alt>Left", "<Alt>Right",
+            "<Super>r", "<Super><Shift>r", "<Shift><Control>a", "<Shift><Control>o",
+            "<Shift><Control>e", "<Shift><Control>w", "<Shift><Control>c",
+            "<Shift><Control>v", "<Shift>Return", "<Shift><Control>s",
+            "<Shift><Control>f", "<Shift><Control>q", "<Shift><Control>Up",
+            "<Shift><Control>Down", "<Shift><Control>Left", "<Shift><Control>Right",
+            "<Shift><Control>Page_Down", "<Shift><Control>Page_Up",
+            "<Shift><Control>x", "<Shift><Control>z", "<Control>Page_Down",
+            "<Control>Page_Up", "F11", "<Shift><Control>r", "<Shift><Control>g",
+            "<Shift><Control><Alt>a", "<Super>g", "<Shift><Super>g",
+            "<Shift><Super>w", "<Super>t", "<Shift><Super>t", "<Shift><Control>i",
+            "<Super>i", "<Super>1", "<Super>0", "<Control><Alt>w", "<Control><Alt>a",
+            "<Control><Alt>x", "<Alt>l", "<Control><Shift>k", "F1",
+            "<Shift><Control>d",
+        ]
+    }
+
+    #[test]
+    fn terminator_default_combos_all_parse() {
+        for combo in terminator_default_combos() {
+            assert!(parse_combo(combo).is_ok(), "failed: {combo}");
+        }
+    }
+
+    // plugins-30: Terminator's whole modifier table (keybindings.py:35-45).
+    #[test]
+    fn terminator_modifier_names() {
+        let ctrl = Mods { ctrl: true, shift: false, alt: false, mac_cmd: false };
+        let sup = Mods { ctrl: false, shift: false, alt: false, mac_cmd: true };
+        assert_eq!(parse_combo("<Primary>a"), Ok((ctrl, egui::Key::A)));
+        assert_eq!(parse_combo("<Control>a"), Ok((ctrl, egui::Key::A)));
+        assert_eq!(parse_combo("<Hyper>a"), Ok((sup, egui::Key::A)));
+        assert_eq!(parse_combo("<Mod4>a"), Ok((sup, egui::Key::A)));
+        assert_eq!(parse_combo("Hyper+A"), Ok((sup, egui::Key::A)));
+        if cfg!(target_os = "macos") {
+            // Terminator's darwin remap: Mod2 is the Command key.
+            assert_eq!(parse_combo("<Mod2>a"), Ok((sup, egui::Key::A)));
+        } else {
+            // NumLock cannot be part of a chord here.
+            assert!(parse_combo("<Mod2>a").is_err());
         }
     }
 
@@ -518,6 +708,74 @@ mod tests {
             table.lookup(egui::Key::H, mods),
             Some(Action::SplitHorizontal)
         );
+        // R-086: the default chord is gone with it, as Terminator's config
+        // replaces the action's value rather than adding to it.
+        let ctrl_shift = egui::Modifiers { ctrl: true, shift: true, ..Default::default() };
+        assert_eq!(table.lookup(egui::Key::O, ctrl_shift), None);
+    }
+
+    #[test]
+    fn user_empty_or_none_combo_unbinds() {
+        // R-086: '' and "None" are Terminator's spellings for "no chord"
+        // (keybindings.py:73-74); the default chord no longer fires.
+        let ctrl_shift = egui::Modifiers { ctrl: true, shift: true, ..Default::default() };
+        for combo in ["", "None", "none", "  "] {
+            let mut table = BindingTable::new(true);
+            table.apply_user(&[("copy".into(), combo.into())]);
+            assert_eq!(table.lookup(egui::Key::C, ctrl_shift), None, "combo {combo:?}");
+            assert_eq!(table.combo_for(Action::Copy), None, "combo {combo:?}");
+        }
+    }
+
+    #[test]
+    fn user_unparseable_combo_unbinds() {
+        // In Terminator the bad value has replaced the default before it
+        // fails to parse, so the action ends up unbound rather than on a
+        // chord the user never wrote.
+        let mut table = BindingTable::new(true);
+        table.apply_user(&[("copy".into(), "Ctrl+Shift+Bogus".into())]);
+        let ctrl_shift = egui::Modifiers { ctrl: true, shift: true, ..Default::default() };
+        assert_eq!(table.lookup(egui::Key::C, ctrl_shift), None);
+        // An unknown action touches nothing.
+        let mut table = BindingTable::new(true);
+        table.apply_user(&[("no_such_action".into(), "Ctrl+Shift+C".into())]);
+        assert_eq!(table.lookup(egui::Key::C, ctrl_shift), Some(Action::Copy));
+    }
+
+    #[test]
+    fn user_lists_several_chords_for_one_action() {
+        // Terminator's tuple of bindings: every entry for the action stays.
+        let mut table = BindingTable::new(true);
+        table.apply_user(&[
+            ("copy".into(), "Ctrl+Alt+C".into()),
+            ("copy".into(), "<Shift><Control>y".into()),
+        ]);
+        let ctrl_alt = egui::Modifiers { ctrl: true, alt: true, ..Default::default() };
+        let ctrl_shift = egui::Modifiers { ctrl: true, shift: true, ..Default::default() };
+        assert_eq!(table.lookup(egui::Key::C, ctrl_alt), Some(Action::Copy));
+        assert_eq!(table.lookup(egui::Key::Y, ctrl_shift), Some(Action::Copy));
+        assert_eq!(table.lookup(egui::Key::C, ctrl_shift), None);
+    }
+
+    #[test]
+    fn user_chord_collision_last_wins() {
+        // Rebinding onto another action's default chord takes it over, as the
+        // loader's dict assignment does (keybindings.py:94-95).
+        let mut table = BindingTable::new(true);
+        table.apply_user(&[("new_tab".into(), "Ctrl+Shift+O".into())]);
+        let ctrl_shift = egui::Modifiers { ctrl: true, shift: true, ..Default::default() };
+        assert_eq!(table.lookup(egui::Key::O, ctrl_shift), Some(Action::NewTab));
+        assert_eq!(table.lookup(egui::Key::T, ctrl_shift), None);
+        assert_eq!(table.combo_for(Action::SplitHorizontal), None);
+    }
+
+    #[test]
+    fn binding_shift_enter_send_newline() {
+        // R-087: Terminator's `<Shift>Return` -> send_newline.
+        let table = BindingTable::new(true);
+        let shift = egui::Modifiers { shift: true, ..Default::default() };
+        assert_eq!(table.lookup(egui::Key::Enter, shift), Some(Action::SendNewline));
+        assert_eq!(Action::from_str("send_newline"), Some(Action::SendNewline));
     }
 
     #[test]
@@ -633,8 +891,20 @@ mod tests {
     }
 
     #[test]
-    fn binding_ctrl_shift_equals_zoom_in() {
-        assert_eq!(linux_ctrl_shift(egui::Key::Equals), Some(Action::ZoomIn));
+    fn binding_ctrl_plus_zoom_in() {
+        // Terminator's `<Control>plus` (config.py:131): the `+` keysym with
+        // Shift consumed, which is how Ctrl+Shift+= on US reaches this entry
+        // (input::lookup_binding). A literal Ctrl+Shift+Equals entry no longer
+        // exists on its own.
+        assert_eq!(linux_ctrl_only(egui::Key::Plus), Some(Action::ZoomIn));
+        assert_eq!(linux_ctrl_shift(egui::Key::Equals), None);
+    }
+
+    #[test]
+    fn parse_plus_key() {
+        let (mods, key) = parse_combo("Ctrl+Plus").unwrap();
+        assert!(mods.ctrl && !mods.shift);
+        assert_eq!(key, egui::Key::Plus);
     }
 
     #[test]
@@ -677,12 +947,64 @@ mod tests {
         assert_eq!(linux_ctrl_shift(egui::Key::B), Some(Action::ToggleBroadcast));
     }
 
+    // R-013: every Terminator default chord has an action, so none of them can
+    // fall through to the shell as a control byte (Ctrl+Shift+D was EOF).
+    #[test]
+    fn binding_ctrl_shift_d_detach_tab() {
+        assert_eq!(linux_ctrl_shift(egui::Key::D), Some(Action::DetachTab));
+    }
+
+    #[test]
+    fn binding_ctrl_shift_k_prefs_keybindings() {
+        assert_eq!(linux_ctrl_shift(egui::Key::K), Some(Action::PrefsKeybindings));
+    }
+
+    #[test]
+    fn binding_f1_help() {
+        assert_eq!(linux_no_mods(egui::Key::F1), Some(Action::Help));
+    }
+
+    fn linux_ctrl_alt(key: egui::Key) -> Option<Action> {
+        let table = BindingTable::new(true);
+        let mods = egui::Modifiers { ctrl: true, alt: true, ..Default::default() };
+        table.lookup(key, mods)
+    }
+
+    #[test]
+    fn binding_ctrl_alt_title_editors() {
+        assert_eq!(linux_ctrl_alt(egui::Key::W), Some(Action::EditWindowTitle));
+        assert_eq!(linux_ctrl_alt(egui::Key::A), Some(Action::EditTabTitle));
+        assert_eq!(linux_ctrl_alt(egui::Key::X), Some(Action::EditTerminalTitle));
+    }
+
+    #[test]
+    fn binding_super_i_new_terminator() {
+        let table = BindingTable::new(true);
+        let mods = egui::Modifiers { mac_cmd: true, ..Default::default() };
+        assert_eq!(table.lookup(egui::Key::I, mods), Some(Action::NewTerminator));
+    }
+
+    #[test]
+    fn terminator_default_actions_parse_by_name() {
+        for (name, action) in [
+            ("detach_tab", Action::DetachTab),
+            ("edit_window_title", Action::EditWindowTitle),
+            ("edit_tab_title", Action::EditTabTitle),
+            ("edit_terminal_title", Action::EditTerminalTitle),
+            ("preferences_keybindings", Action::PrefsKeybindings),
+            ("help", Action::Help),
+            ("new_terminator", Action::NewTerminator),
+        ] {
+            assert_eq!(Action::from_str(name), Some(action), "{name}");
+        }
+    }
+
     // ── macOS per-binding coverage ──────────────────────────────────
 
     fn mac_table() -> BindingTable {
         let mut t = BindingTable { map: HashMap::new() };
         for (combo, action) in macos_defaults() {
-            if let Some(parsed) = parse_combo(&combo) {
+            if let Ok(parsed) = parse_combo(&combo) {
                 t.map.insert(parsed, action);
             }
         }
@@ -910,6 +1232,29 @@ mod tests {
         assert!(Action::from_str("toggle_scrollbar").is_some());
     }
 
+    // R-009 / R-035: Terminator's scroll actions (terminal.py:2284-2300) and
+    // `paste_selection` parse from their config names and are unbound by
+    // default (config.py:154,158-163), so a user binding is the only way in.
+    #[test]
+    fn scroll_and_paste_selection_actions_parse_and_start_unbound() {
+        let table = BindingTable::new(true);
+        for (name, action) in [
+            ("page_up", Action::PageUp),
+            ("page_down", Action::PageDown),
+            ("page_up_half", Action::PageUpHalf),
+            ("page_down_half", Action::PageDownHalf),
+            ("line_up", Action::LineUp),
+            ("line_down", Action::LineDown),
+            ("paste_selection", Action::PasteSelection),
+        ] {
+            assert_eq!(Action::from_str(name), Some(action), "{name}");
+            assert_eq!(table.combo_for(action), None, "{name}");
+        }
+        let mut table = BindingTable::new(true);
+        table.apply_user(&[("page_up".into(), "Shift+PageUp".into())]);
+        assert_eq!(table.lookup(egui::Key::PageUp, egui::Modifiers::SHIFT), Some(Action::PageUp));
+    }
+
     // Profile cycling: both parse from their config strings. Unbound by default
     // (Terminator parity), so there is no default-binding assertion.
     #[test]
@@ -1011,15 +1356,14 @@ mod tests {
             table.combo_for(Action::SplitHorizontal).as_deref(),
             Some("Ctrl+Shift+O")
         );
-        // User override is reflected in the hint.
+        // User override is reflected in the hint — and is the only chord left
+        // for the action (R-086).
         let mut table = BindingTable::new(true);
         table.apply_user(&[("split_horizontal".into(), "Ctrl+Alt+H".into())]);
-        let combos: Vec<String> = ["Ctrl+Alt+H", "Ctrl+Shift+O"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        let got = table.combo_for(Action::SplitHorizontal).unwrap();
-        assert!(combos.contains(&got), "unexpected combo {got}");
+        assert_eq!(
+            table.combo_for(Action::SplitHorizontal).as_deref(),
+            Some("Ctrl+Alt+H")
+        );
     }
 
     // ── Dispatch-coverage guard ───────────────────────────────────────
@@ -1047,6 +1391,8 @@ mod tests {
                 | Action::FocusPrev
                 | Action::Copy
                 | Action::Paste
+                | Action::PasteSelection
+                | Action::SendNewline
                 | Action::OpenPrefs
                 | Action::ToggleZoom
                 | Action::ScaledZoom
@@ -1078,6 +1424,12 @@ mod tests {
                 | Action::RotateCCW
                 | Action::SplitAuto
                 | Action::ToggleScrollbar
+                | Action::PageUp
+                | Action::PageDown
+                | Action::PageUpHalf
+                | Action::PageDownHalf
+                | Action::LineUp
+                | Action::LineDown
                 | Action::HideWindow
                 | Action::ToggleReadOnly
                 | Action::SetTitle
@@ -1094,7 +1446,14 @@ mod tests {
                 | Action::InsertPadded
                 | Action::NextProfile
                 | Action::PreviousProfile
-                | Action::LayoutLauncher => {}
+                | Action::LayoutLauncher
+                | Action::DetachTab
+                | Action::EditWindowTitle
+                | Action::EditTabTitle
+                | Action::EditTerminalTitle
+                | Action::PrefsKeybindings
+                | Action::Help
+                | Action::NewTerminator => {}
             }
         }
         vec![
@@ -1108,6 +1467,8 @@ mod tests {
             Action::FocusPrev,
             Action::Copy,
             Action::Paste,
+            Action::PasteSelection,
+            Action::SendNewline,
             Action::OpenPrefs,
             Action::ToggleZoom,
             Action::ScaledZoom,
@@ -1139,6 +1500,12 @@ mod tests {
             Action::RotateCCW,
             Action::SplitAuto,
             Action::ToggleScrollbar,
+            Action::PageUp,
+            Action::PageDown,
+            Action::PageUpHalf,
+            Action::PageDownHalf,
+            Action::LineUp,
+            Action::LineDown,
             Action::HideWindow,
             Action::ToggleReadOnly,
             Action::SetTitle,
@@ -1156,14 +1523,21 @@ mod tests {
             Action::NextProfile,
             Action::PreviousProfile,
             Action::LayoutLauncher,
+            Action::DetachTab,
+            Action::EditWindowTitle,
+            Action::EditTabTitle,
+            Action::EditTerminalTitle,
+            Action::PrefsKeybindings,
+            Action::Help,
+            Action::NewTerminator,
         ]
     }
 
     /// Actions reachable from the right-click context menu. Mirrors the
-    /// `action_menu_item` entries in `pane_ui::build_context_menu`.
+    /// `action_menu_item` entries in `pane_ui::build_context_menu` (the menu's
+    /// Copy is a plain copy that bypasses `Action::Copy`, so it is not listed).
     fn context_menu_actions() -> Vec<Action> {
         vec![
-            Action::Copy,
             Action::Paste,
             Action::SplitHorizontal,
             Action::SplitVertical,
@@ -1198,12 +1572,22 @@ mod tests {
             //  - NextProfile/PreviousProfile: unbound by default (Terminator
             //    parity); switched via the right-click "Profiles" submenu, not
             //    these Actions.
+            //  - PasteSelection and the six scroll actions: unbound by default
+            //    (Terminator parity); Shift+Insert and Shift+PgUp/PgDn/Home/End
+            //    reach the same effects as VTE's built-ins (input::key_builtin).
             if matches!(
                 action,
                 Action::SwitchToTab(_)
                     | Action::QuitHotkeyWindow
                     | Action::NextProfile
                     | Action::PreviousProfile
+                    | Action::PasteSelection
+                    | Action::PageUp
+                    | Action::PageDown
+                    | Action::PageUpHalf
+                    | Action::PageDownHalf
+                    | Action::LineUp
+                    | Action::LineDown
             ) {
                 continue;
             }

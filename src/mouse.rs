@@ -7,6 +7,9 @@ pub enum MouseButton {
     Left,
     Middle,
     Right,
+    /// No button held — xterm's "button 3", what VTE's `maybe_send_mouse_drag`
+    /// reports for any-motion (1003) hover, as xterm and alacritty do.
+    None,
     WheelUp,
     WheelDown,
 }
@@ -17,6 +20,7 @@ impl MouseButton {
             MouseButton::Left => 0,
             MouseButton::Middle => 1,
             MouseButton::Right => 2,
+            MouseButton::None => 3,
             MouseButton::WheelUp => 64,
             MouseButton::WheelDown => 65,
         }
@@ -189,6 +193,21 @@ mod tests {
         let mode = sgr_mode() | TermMode::MOUSE_DRAG;
         let bytes = encode(MouseKind::Motion, MouseButton::Left, 0, 0, mods, mode).unwrap();
         // Motion adds 32 to base code, so Left+motion = 32.
+        assert_eq!(bytes, b"\x1b[<32;1;1M");
+    }
+
+    #[test]
+    fn buttonless_motion_reports_button_3() {
+        // R-018: any-motion (1003) hover with nothing held is "no button"
+        // (code 3), not a left drag (code 0): SGR `35`, legacy 3|32+32 = 'C'.
+        let mods = MouseMods { shift: false, alt: false, ctrl: false };
+        let any = TermMode::MOUSE_REPORT_CLICK | TermMode::MOUSE_MOTION;
+        let bytes = encode(MouseKind::Motion, MouseButton::None, 0, 0, mods, any | TermMode::SGR_MOUSE).unwrap();
+        assert_eq!(bytes, b"\x1b[<35;1;1M");
+        let bytes = encode(MouseKind::Motion, MouseButton::None, 0, 0, mods, any).unwrap();
+        assert_eq!(bytes, vec![0x1b, b'[', b'M', b'C', 33, 33]);
+        // A held left button still reports as a drag.
+        let bytes = encode(MouseKind::Motion, MouseButton::Left, 0, 0, mods, any | TermMode::SGR_MOUSE).unwrap();
         assert_eq!(bytes, b"\x1b[<32;1;1M");
     }
 

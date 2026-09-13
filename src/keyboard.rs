@@ -147,6 +147,7 @@ fn kitty_keycode(key: egui::Key) -> Option<u32> {
         Key::Num9 => 57,
 
         Key::Minus => 45,
+        Key::Plus => 43,
         Key::Equals => 61,
         Key::OpenBracket => 91,
         Key::CloseBracket => 93,
@@ -315,6 +316,7 @@ mod tests {
     #[test]
     fn kitty_keycode_punctuation() {
         assert_eq!(kitty_keycode(egui::Key::Minus), Some(45));
+        assert_eq!(kitty_keycode(egui::Key::Plus), Some(43));
         assert_eq!(kitty_keycode(egui::Key::Equals), Some(61));
         assert_eq!(kitty_keycode(egui::Key::OpenBracket), Some(91));
         assert_eq!(kitty_keycode(egui::Key::CloseBracket), Some(93));

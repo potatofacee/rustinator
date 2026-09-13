@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
-use winit::keyboard::{Key, NamedKey};
+use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::window::{WindowAttributes, WindowId, WindowLevel};
 
@@ -167,9 +167,11 @@ impl HotkeyWindowState {
         main_context: &glutin::context::PossiblyCurrentContext,
     ) {
         let raw_input = self.gl_window.begin_frame(main_context);
+        // Sampled before egui's pass, for the same reason as the main paint.
+        let egui_owns_keys = self.gl_window.egui_ctx.egui_wants_keyboard_input();
 
         let full_output = self.gl_window.egui_ctx.run_ui(raw_input, |ui| {
-            window.logic(shared, ui.ctx());
+            window.logic(shared, ui.ctx(), egui_owns_keys);
             window.ui(shared, ui);
         });
 
@@ -628,7 +630,7 @@ impl WinitApp {
     // router stays a thin classify-and-dispatch.
     fn handle_prefs_window_event(&mut self, event: WindowEvent) {
         let mut prefs = self.prefs.take().unwrap();
-        let response = prefs.gl_window.egui_winit.on_window_event(&prefs.gl_window.window, &event);
+        let response = prefs.gl_window.on_window_event(&event);
         if response.repaint {
             prefs.gl_window.window.request_redraw();
         }
@@ -679,7 +681,11 @@ impl WinitApp {
             hk.current_modifiers = *mods;
         }
 
-        if let WindowEvent::KeyboardInput { event: key_event, .. } = &event {
+        // `is_synthetic: false` — on X11 winit replays every physically held
+        // key as a synthetic press when a window gains focus (XQueryKeymap in
+        // xinput2_focused); those are not keystrokes and GTK never produced
+        // them, so the raw path must drop them exactly as egui-winit does.
+        if let WindowEvent::KeyboardInput { event: key_event, is_synthetic: false, .. } = &event {
             if key_event.state.is_pressed()
                 && key_event.logical_key == Key::Named(NamedKey::Escape)
                 && hk.current_modifiers.state().is_empty()
@@ -699,12 +705,11 @@ impl WinitApp {
         }
 
         if let WindowEvent::MouseWheel { delta, .. } = &event {
-            let zoom_mod = if cfg!(target_os = "macos") {
-                hk.current_modifiers.state().super_key()
-            } else {
-                hk.current_modifiers.state().control_key()
-            };
-            if zoom_mod {
+            let zoom_off = self
+                .shared
+                .as_ref()
+                .is_some_and(|s| s.user_config.active().disable_mousewheel_zoom);
+            if wheel_zooms(hk.current_modifiers.state()) && !zoom_off {
                 match delta {
                     winit::event::MouseScrollDelta::LineDelta(_, y) => {
                         let direction = y.signum() as i32;
@@ -731,7 +736,7 @@ impl WinitApp {
             }
         }
 
-        let response = hk.gl_window.egui_winit.on_window_event(&hk.gl_window.window, &event);
+        let response = hk.gl_window.on_window_event(&event);
         if response.repaint {
             hk.repaint_at = Some(Instant::now());
         }
@@ -814,19 +819,22 @@ impl WinitApp {
             self.current_modifiers = *mods;
         }
 
-        if let WindowEvent::KeyboardInput { event: key_event, .. } = &event {
+        // Synthetic focus-in replays are not keystrokes (see the hotkey site).
+        if let WindowEvent::KeyboardInput { event: key_event, is_synthetic: false, .. } = &event {
             if let Some(raw) = encode_raw_key(key_event, self.current_modifiers) {
                 win.pending_raw_keys.push(raw);
             }
         }
 
+        // Ctrl+wheel zooms before egui sees the event; every other wheel
+        // event (Shift, Ctrl+Shift, or zoom disabled) is the pane's to
+        // scroll, as Terminator's `on_mousewheel` leaves those to VTE.
         if let WindowEvent::MouseWheel { delta, .. } = &event {
-            let zoom_mod = if cfg!(target_os = "macos") {
-                self.current_modifiers.state().super_key()
-            } else {
-                self.current_modifiers.state().control_key()
-            };
-            if zoom_mod {
+            let zoom_off = self
+                .shared
+                .as_ref()
+                .is_some_and(|s| s.user_config.active().disable_mousewheel_zoom);
+            if wheel_zooms(self.current_modifiers.state()) && !zoom_off {
                 match delta {
                     winit::event::MouseScrollDelta::LineDelta(_, y) => {
                         let direction = y.signum() as i32;
@@ -877,10 +885,7 @@ impl WinitApp {
             _ => None,
         };
 
-        let response = win
-            .gl_window
-            .egui_winit
-            .on_window_event(&win.gl_window.window, &event);
+        let response = win.gl_window.on_window_event(&event);
 
         if motion_repaint.unwrap_or(response.repaint) {
             self.repaint_pending = true;
@@ -1001,6 +1006,13 @@ impl WinitApp {
                 .unwrap();
 
             let mut raw_input = win.gl_window.begin_frame(gl.context());
+            // Who owns this frame's keys is the focus state they arrived under,
+            // sampled before egui's pass: `begin_pass` reacts to the very keys
+            // being routed (an unmodified Escape drops a TextEdit's focus), so
+            // reading `egui_wants_keyboard_input()` inside the pass would hand a
+            // dialog's closing Escape to the PTY and strip it from the dialog.
+            // This is the state egui-winit itself consulted per key event.
+            let egui_owns_keys = win.gl_window.egui_ctx.egui_wants_keyboard_input();
             // Keep egui's focus traversal from eating Tab/Shift+Tab. egui decides
             // focus movement in begin_pass from these events, before app.logic can
             // strip them, so it grabs keyboard focus on a widget — after which
@@ -1030,7 +1042,7 @@ impl WinitApp {
             let egui_ctx = win.gl_window.egui_ctx.clone();
             let full_output = egui_ctx.run_ui(raw_input, |ui| {
                 if !hotkey_visible {
-                    win.logic(shared, ui.ctx());
+                    win.logic(shared, ui.ctx(), egui_owns_keys);
                 }
                 win.ui(shared, ui);
             });
@@ -1192,6 +1204,21 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Whether a wheel event under these modifiers zooms the font: Terminator's
+/// `on_mousewheel` (terminal.py:1182-1186) masks the state to Ctrl|Shift and
+/// zooms on exactly Ctrl, so Alt rides along (and Super, which there zooms
+/// every terminal — the font is window-wide here anyway) while Shift hands
+/// the event to VTE. macOS zooms on Cmd, the modifier its bindings use for
+/// Ctrl.
+fn wheel_zooms(state: ModifiersState) -> bool {
+    let zoom_key = if cfg!(target_os = "macos") {
+        state.super_key()
+    } else {
+        state.control_key()
+    };
+    zoom_key && !state.shift_key()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1211,6 +1238,20 @@ mod tests {
         assert_eq!(classify(hotkey, p, h, m), WindowKind::Hotkey);
         assert_eq!(classify(main, p, h, m), WindowKind::Terminal);
         assert_eq!(classify(wid(99), p, h, m), WindowKind::Unknown);
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn wheel_zooms_on_ctrl_alone_not_ctrl_shift() {
+        // R-034: Ctrl (with Alt or Super along) zooms; Ctrl+Shift is VTE's
+        // to scroll, and a plain or Shift wheel never zooms.
+        assert!(wheel_zooms(ModifiersState::CONTROL));
+        assert!(wheel_zooms(ModifiersState::CONTROL | ModifiersState::ALT));
+        assert!(wheel_zooms(ModifiersState::CONTROL | ModifiersState::SUPER));
+        assert!(!wheel_zooms(ModifiersState::CONTROL | ModifiersState::SHIFT));
+        assert!(!wheel_zooms(ModifiersState::empty()));
+        assert!(!wheel_zooms(ModifiersState::SHIFT));
+        assert!(!wheel_zooms(ModifiersState::SUPER));
     }
 
     #[test]

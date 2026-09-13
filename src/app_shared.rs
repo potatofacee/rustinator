@@ -155,6 +155,12 @@ impl AppShared {
         self.prefs.open(&self.user_config);
     }
 
+    /// Open the prefs panel on the Keybindings section (`preferences_keybindings`).
+    pub(crate) fn open_prefs_keybindings(&mut self) {
+        self.prefs
+            .open_section(&self.user_config, crate::prefs_ui::PrefsSection::Keybindings);
+    }
+
     /// Wake the main event loop so terminal windows repaint (governed).
     pub(crate) fn wake_main(&self) {
         let _ = self.event_loop_proxy.send_event(window::UserEvent::Repaint);

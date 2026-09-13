@@ -61,6 +61,13 @@ impl PrefsState {
             .unwrap_or(0);
     }
 
+    /// `open` landing on a specific section (Terminator's
+    /// `PrefsEditor(cur_page=...)`, used by `preferences_keybindings`).
+    pub(crate) fn open_section(&mut self, current_config: &Config, section: PrefsSection) {
+        self.open(current_config);
+        self.section = section;
+    }
+
     pub(crate) fn draw(
         &mut self,
         ui: &mut egui::Ui,
@@ -181,6 +188,11 @@ fn draw_prefs_global(ui: &mut egui::Ui, cfg: &mut Config) {
         &mut cfg.global.confirm_on_close,
         "Confirm before closing a window with multiple panes",
     );
+    ui.checkbox(
+        &mut cfg.global.smart_copy,
+        "Smart copy (Ctrl+Shift+C sends Ctrl+C when no selection)",
+    );
+    ui.checkbox(&mut cfg.global.disable_mouse_paste, "Disable mouse paste");
 
     ui.add_space(16.0);
     ui.heading("Hotkey Window");
@@ -558,12 +570,44 @@ fn profile_tab_behavior(ui: &mut egui::Ui, profile: &mut config::Profile) {
     ui.add_space(8.0);
     ui.label(egui::RichText::new("Clipboard").strong());
     ui.checkbox(&mut profile.copy_on_selection, "Copy on selection");
-    ui.checkbox(&mut profile.smart_copy, "Smart copy (Ctrl+Shift+C sends Ctrl+C when no selection)");
 
     ui.add_space(8.0);
     ui.label(egui::RichText::new("Scroll behavior").strong());
     ui.checkbox(&mut profile.scroll_on_output, "Scroll on output");
     ui.checkbox(&mut profile.scroll_on_keystroke, "Scroll on keystroke");
+    ui.checkbox(&mut profile.disable_mousewheel_zoom, "Disable Ctrl+mousewheel zoom");
+
+    ui.add_space(8.0);
+    ui.label(egui::RichText::new("Compatibility").strong());
+    erase_binding_combo(ui, "backspace_binding", "Backspace key generates", &mut profile.backspace_binding);
+    erase_binding_combo(ui, "delete_binding", "Delete key generates", &mut profile.delete_binding);
+}
+
+/// Terminator's "Backspace/Delete key generates" combobox
+/// (prefseditor.py:1060-1085), one per erase key.
+fn erase_binding_combo(ui: &mut egui::Ui, id: &str, label: &str, value: &mut config::EraseBinding) {
+    use config::EraseBinding;
+    let name = |b: EraseBinding| match b {
+        EraseBinding::Automatic => "Automatic",
+        EraseBinding::ControlH => "Control-H",
+        EraseBinding::AsciiDel => "ASCII DEL",
+        EraseBinding::EscapeSequence => "Escape sequence",
+    };
+    ui.horizontal(|ui| {
+        ui.label(label);
+        egui::ComboBox::from_id_salt(id)
+            .selected_text(name(*value))
+            .show_ui(ui, |ui| {
+                for b in [
+                    EraseBinding::Automatic,
+                    EraseBinding::ControlH,
+                    EraseBinding::AsciiDel,
+                    EraseBinding::EscapeSequence,
+                ] {
+                    ui.selectable_value(value, b, name(b));
+                }
+            });
+    });
 }
 
 fn draw_prefs_keybindings(ui: &mut egui::Ui, bindings: &BindingTable) {
@@ -589,6 +633,8 @@ fn draw_prefs_keybindings(ui: &mut egui::Ui, bindings: &BindingTable) {
             (Action::NewWindow, "New window"),
             (Action::Copy, "Copy"),
             (Action::Paste, "Paste"),
+            (Action::PasteSelection, "Paste primary selection"),
+            (Action::SendNewline, "Send newline"),
             (Action::ToggleSearch, "Search"),
             (Action::FocusNext, "Cycle panes forward"),
             (Action::FocusPrev, "Cycle panes backward"),
@@ -609,6 +655,12 @@ fn draw_prefs_keybindings(ui: &mut egui::Ui, bindings: &BindingTable) {
             (Action::ToggleBroadcast, "Toggle broadcast"),
             (Action::ToggleReadOnly, "Toggle read-only"),
             (Action::ToggleScrollbar, "Toggle scrollbar"),
+            (Action::PageUp, "Scroll up a page"),
+            (Action::PageDown, "Scroll down a page"),
+            (Action::PageUpHalf, "Scroll up half a page"),
+            (Action::PageDownHalf, "Scroll down half a page"),
+            (Action::LineUp, "Scroll up a line"),
+            (Action::LineDown, "Scroll down a line"),
             (Action::ToggleFullscreen, "Fullscreen"),
             (Action::ZoomIn, "Increase font size"),
             (Action::ZoomOut, "Decrease font size"),
@@ -616,8 +668,15 @@ fn draw_prefs_keybindings(ui: &mut egui::Ui, bindings: &BindingTable) {
             (Action::ResetTerminal, "Reset terminal"),
             (Action::ResetClear, "Reset and clear"),
             (Action::SetTitle, "Set pane title"),
+            (Action::EditWindowTitle, "Rename window"),
+            (Action::EditTabTitle, "Rename tab"),
+            (Action::EditTerminalTitle, "Rename terminal"),
+            (Action::DetachTab, "Detach tab"),
             (Action::OpenTerminalHere, "Open terminal here"),
+            (Action::NewTerminator, "New rustinator process"),
             (Action::OpenPrefs, "Open Preferences"),
+            (Action::PrefsKeybindings, "Keybinding preferences"),
+            (Action::Help, "Help"),
         ] {
             if let Some(combo) = bindings.combo_for(action) {
                 ui.label(combo);

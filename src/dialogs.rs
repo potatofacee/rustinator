@@ -5,6 +5,8 @@ pub(crate) struct DialogState {
     pub confirmed_close: bool,
     pub title_dialog_open: bool,
     pub title_dialog_buf: String,
+    pub window_title_dialog: bool,
+    pub window_title_buf: String,
     pub layout_save_dialog: bool,
     pub layout_save_buf: String,
     pub layout_launcher_dialog: bool,
@@ -25,6 +27,8 @@ pub(crate) enum DialogAction {
     CancelClose,
     SetTitle(String),
     ClearTitle,
+    SetWindowTitle(String),
+    ClearWindowTitle,
     SaveLayout(String),
     LaunchLayout(String),
     NewGroup(PaneId, String),
@@ -40,6 +44,8 @@ impl DialogState {
             confirmed_close: false,
             title_dialog_open: false,
             title_dialog_buf: String::new(),
+            window_title_dialog: false,
+            window_title_buf: String::new(),
             layout_save_dialog: false,
             layout_save_buf: String::new(),
             layout_launcher_dialog: false,
@@ -58,10 +64,28 @@ impl DialogState {
     /// window must not steal egui keyboard focus away from it. The layout
     /// launcher is a picker (no text field), so it is intentionally excluded.
     pub(crate) fn wants_text_input(&self) -> bool {
-        self.search_open
-            || self.title_dialog_open
+        self.search_open || self.modal_text_open()
+    }
+
+    /// True while a modal text dialog is open. Unlike the search bar, which the
+    /// user leaves by clicking a pane, these own the keyboard for as long as
+    /// they are up (Terminator's Gtk.Dialog MODAL), so `App::logic` sends no
+    /// raw keys to a PTY while one is open.
+    pub(crate) fn modal_text_open(&self) -> bool {
+        self.title_dialog_open
+            || self.window_title_dialog
             || self.layout_save_dialog
             || self.new_group_dialog
+    }
+
+    /// True while any modal dialog is open: the text dialogs above plus the
+    /// close confirmation (Terminator's `construct_confirm_close`, a MODAL
+    /// `Gtk.Dialog` run in its own loop) and the layout launcher (Terminator's
+    /// own window, which takes the keys while it is up). No raw key reaches a
+    /// PTY while one is open, and their key events stay in egui's input so
+    /// the dialog sees its Escape.
+    pub(crate) fn modal_open(&self) -> bool {
+        self.modal_text_open() || self.close_dialog_open || self.layout_launcher_dialog
     }
 
     pub(crate) fn draw_search(&mut self, ui: &mut egui::Ui) -> DialogAction {
@@ -101,17 +125,24 @@ impl DialogState {
                 if ui.button("Next").clicked() {
                     find_next = true;
                 }
+                // Enter makes a single-line TextEdit surrender focus, and a
+                // button click takes it; Terminator's entry keeps focus after
+                // `activate`. Take it back in this frame, not the next: the
+                // pre-pass focus sample decides who owns the next frame's
+                // keys, so a frame without focus hands whatever is typed
+                // right after Enter to the shell.
+                if find_next || find_prev {
+                    edit.request_focus();
+                }
                 if ui.button("Close").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                     close = true;
                 }
             });
         });
         if find_next {
-            self.search_focus_pending = true;
             return DialogAction::SearchNext;
         }
         if find_prev {
-            self.search_focus_pending = true;
             return DialogAction::SearchPrev;
         }
         if close {
@@ -151,6 +182,11 @@ impl DialogState {
                         dont_ask = true;
                     }
                 });
+                // Gtk.Dialog's Escape binding: a response that is not ACCEPT,
+                // so the window stays open.
+                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    cancel = true;
+                }
             });
         if cancel || !keep_open {
             self.close_dialog_open = false;
@@ -175,6 +211,7 @@ impl DialogState {
         let mut keep_open = true;
         let mut apply = false;
         let mut clear = false;
+        let mut cancel = false;
         egui::Window::new("Set tab title")
             .open(&mut keep_open)
             .resizable(false)
@@ -197,12 +234,15 @@ impl DialogState {
                         clear = true;
                     }
                 });
+                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    cancel = true;
+                }
             });
         if clear {
             self.title_dialog_open = false;
             return DialogAction::ClearTitle;
         }
-        if !keep_open {
+        if cancel || !keep_open {
             self.title_dialog_open = false;
             return DialogAction::None;
         }
@@ -214,12 +254,72 @@ impl DialogState {
         DialogAction::None
     }
 
+    /// Rename Window (Ctrl+Alt+W): Terminator's `key_edit_window_title`
+    /// dialog. OK with text forces the window title to exactly that text; OK
+    /// with an empty entry (or Clear) returns the title to the focused pane's.
+    /// Escape / the close button cancel.
+    pub(crate) fn draw_window_title_dialog(&mut self, ctx: &egui::Context) -> DialogAction {
+        if !self.window_title_dialog {
+            return DialogAction::None;
+        }
+        let mut keep_open = true;
+        let mut apply = false;
+        let mut clear = false;
+        let mut cancel = false;
+        egui::Window::new("Rename Window")
+            .open(&mut keep_open)
+            .resizable(false)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                ui.label("Enter a new title for the rustinator window...");
+                ui.add_space(4.0);
+                let resp = ui.text_edit_singleline(&mut self.window_title_buf);
+                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    apply = true;
+                }
+                resp.request_focus();
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui.button("OK").clicked() {
+                        apply = true;
+                    }
+                    if ui.button("Clear").clicked() {
+                        clear = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    cancel = true;
+                }
+            });
+        if cancel || !keep_open {
+            self.window_title_dialog = false;
+            return DialogAction::None;
+        }
+        if clear {
+            self.window_title_dialog = false;
+            return DialogAction::ClearWindowTitle;
+        }
+        if apply {
+            let title = self.window_title_buf.trim().to_string();
+            self.window_title_dialog = false;
+            if title.is_empty() {
+                return DialogAction::ClearWindowTitle;
+            }
+            return DialogAction::SetWindowTitle(title);
+        }
+        DialogAction::None
+    }
+
     pub(crate) fn draw_layout_save_dialog(&mut self, ctx: &egui::Context) -> DialogAction {
         if !self.layout_save_dialog {
             return DialogAction::None;
         }
         let mut keep_open = true;
         let mut save = false;
+        let mut cancel = false;
         egui::Window::new("Save layout")
             .open(&mut keep_open)
             .resizable(false)
@@ -237,8 +337,11 @@ impl DialogState {
                 if ui.button("Save").clicked() {
                     save = true;
                 }
+                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    cancel = true;
+                }
             });
-        if !keep_open {
+        if cancel || !keep_open {
             self.layout_save_dialog = false;
             return DialogAction::None;
         }
@@ -402,6 +505,63 @@ mod tests {
             d.wants_text_input(),
             "new-group has a text field, so it must hold egui keyboard focus"
         );
+    }
+
+    #[test]
+    fn modal_text_dialogs_hold_the_keyboard_but_search_does_not() {
+        // The three text dialogs (plus Rename Window) are modal: raw keys must
+        // never reach a PTY while one is open. The search bar is not — the user
+        // can click back into a pane and type with the bar still showing.
+        let mut d = DialogState::new();
+        assert!(!d.modal_text_open());
+        d.search_open = true;
+        assert!(d.wants_text_input());
+        assert!(!d.modal_text_open());
+        d.search_open = false;
+        for open in [
+            |d: &mut DialogState| d.title_dialog_open = true,
+            |d: &mut DialogState| d.window_title_dialog = true,
+            |d: &mut DialogState| d.layout_save_dialog = true,
+            |d: &mut DialogState| d.new_group_dialog = true,
+        ] {
+            let mut d = DialogState::new();
+            open(&mut d);
+            assert!(d.modal_text_open());
+            assert!(d.wants_text_input());
+        }
+    }
+
+    #[test]
+    fn close_confirm_and_launcher_are_modal_without_text_fields() {
+        // R-065: both hold the keyboard while up (no raw key reaches a PTY,
+        // so their Escape is not sent to the shell), yet neither has a text
+        // field to claim egui focus for.
+        for open in [
+            |d: &mut DialogState| d.close_dialog_open = true,
+            |d: &mut DialogState| d.layout_launcher_dialog = true,
+        ] {
+            let mut d = DialogState::new();
+            assert!(!d.modal_open());
+            open(&mut d);
+            assert!(d.modal_open());
+            assert!(!d.modal_text_open());
+            assert!(!d.wants_text_input());
+        }
+        // The text dialogs are modal through modal_text_open; the search bar
+        // is not modal at all.
+        let mut d = DialogState::new();
+        d.title_dialog_open = true;
+        assert!(d.modal_open());
+        let mut d = DialogState::new();
+        d.search_open = true;
+        assert!(!d.modal_open());
+    }
+
+    #[test]
+    fn window_title_dialog_returns_none_while_closed() {
+        let mut d = DialogState::new();
+        let ctx = egui::Context::default();
+        assert!(matches!(d.draw_window_title_dialog(&ctx), DialogAction::None));
     }
 
     #[test]
