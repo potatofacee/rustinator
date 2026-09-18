@@ -1878,7 +1878,8 @@ impl PressAction {
 /// opens on the click; no selection starts and nothing reaches the app);
 /// otherwise an app reporting mouse gets the press unless Shift is held; left
 /// starts a selection — by word on the second click, by line on the third;
-/// middle pastes PRIMARY unless Ctrl is held (or `disable_mouse_paste`);
+/// middle pastes PRIMARY on the single click only — as in VTE, where the paste
+/// lives under `case 1` — unless Ctrl is held (or `disable_mouse_paste`);
 /// right is the context menu's, which `draw_leaf` opens on the click.
 fn press_action(
     button: MouseButton,
@@ -1896,7 +1897,9 @@ fn press_action(
             2 => SelectionType::Semantic,
             _ => SelectionType::Simple,
         }),
-        MouseButton::Middle if !mods.ctrl && !disable_mouse_paste => PressAction::Paste,
+        MouseButton::Middle if count == 1 && !mods.ctrl && !disable_mouse_paste => {
+            PressAction::Paste
+        }
         _ => PressAction::Nothing,
     }
 }
@@ -2122,6 +2125,9 @@ mod tests {
         // Ctrl+middle never pastes; `disable_mouse_paste` turns the paste off.
         assert_eq!(press_action(Middle, 1, ctrl, false, false, false), Nothing);
         assert_eq!(press_action(Middle, 1, plain, false, false, true), Nothing);
+        // VTE pastes on the single click only; a repeat middle press does not.
+        assert_eq!(press_action(Middle, 2, plain, false, false, false), Nothing);
+        assert_eq!(press_action(Middle, 3, plain, false, false, false), Nothing);
         // R-058: Ctrl+left on a URL is consumed before VTE sees it — no
         // selection starts and, in mouse mode, nothing is forwarded. Ctrl+left
         // off a URL is an ordinary press.
