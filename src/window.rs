@@ -690,6 +690,8 @@ impl WinitApp {
                 && key_event.logical_key == Key::Named(NamedKey::Escape)
                 && hk.current_modifiers.state().is_empty()
             {
+                // Consumed here: its release reaches no pane.
+                win.forget_key_press(key_event.physical_key);
                 hk.shown_at = None;
                 hk.gl_window.window.set_visible(false);
                 #[cfg(target_os = "macos")]
@@ -699,9 +701,7 @@ impl WinitApp {
                 self.hotkey_window = Some(hk);
                 return;
             }
-            if let Some(raw) = encode_raw_key(key_event, hk.current_modifiers) {
-                win.pending_raw_keys.push(raw);
-            }
+            win.pending_raw_keys.push(encode_raw_key(key_event, hk.current_modifiers));
         }
 
         if let WindowEvent::MouseWheel { delta, .. } = &event {
@@ -817,13 +817,30 @@ impl WinitApp {
 
         if let WindowEvent::ModifiersChanged(mods) = &event {
             self.current_modifiers = *mods;
+            if std::env::var_os("RUSTINATOR_KEY_DEBUG").is_some() {
+                eprintln!("KEY_DEBUG modifiers: {:?}", mods.state());
+            }
+        }
+
+        if let WindowEvent::KeyboardInput { event: key_event, is_synthetic, .. } = &event {
+            if std::env::var_os("RUSTINATOR_KEY_DEBUG").is_some() {
+                eprintln!(
+                    "KEY_DEBUG event: logical={:?} physical={:?} location={:?} state={:?} repeat={} synthetic={} text={:?} mods={:?}",
+                    key_event.logical_key,
+                    key_event.physical_key,
+                    key_event.location,
+                    key_event.state,
+                    key_event.repeat,
+                    is_synthetic,
+                    key_event.text,
+                    self.current_modifiers.state(),
+                );
+            }
         }
 
         // Synthetic focus-in replays are not keystrokes (see the hotkey site).
         if let WindowEvent::KeyboardInput { event: key_event, is_synthetic: false, .. } = &event {
-            if let Some(raw) = encode_raw_key(key_event, self.current_modifiers) {
-                win.pending_raw_keys.push(raw);
-            }
+            win.pending_raw_keys.push(encode_raw_key(key_event, self.current_modifiers));
         }
 
         // Ctrl+wheel zooms before egui sees the event; every other wheel

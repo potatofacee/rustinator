@@ -20,6 +20,7 @@ use egui;
 use crate::config::EraseBinding;
 use crate::font::FontStyle;
 use crate::keyboard;
+use crate::RawTermKey;
 use crate::mouse::{self, MouseButton, MouseKind, MouseMods};
 use crate::profile::{ProfileName, SpawnCommand};
 
@@ -1222,36 +1223,31 @@ impl Pane {
         let _ = self.pty_tx.send(Msg::Input(bytes.into()));
     }
 
-    /// Encode and send a key event, using Kitty keyboard protocol when the term
-    /// has enabled it, otherwise sending the pre-encoded legacy bytes.
-    /// When APP_CURSOR (DECCKM) is active, unmodified arrow keys are rewritten
-    /// from CSI to SS3 format; Backspace and Delete are re-encoded for this
-    /// pane's erase bindings. A key egui has no name for (`key` None: é, ß,
-    /// Cyrillic) has only its legacy bytes.
-    pub fn send_key(
-        &self,
-        key: Option<egui::Key>,
-        mods: egui::Modifiers,
-        legacy_bytes: Option<Vec<u8>>,
-    ) {
+    /// Encode and send a key event; returns whether any bytes were written.
+    /// Under the kitty keyboard flags `keyboard::encode` decides first —
+    /// alacritty's `key_input`/`key_release` order: its default bindings
+    /// (DECCKM arrows, SS3 F1-F4, the erase keys) and plain text keep the
+    /// legacy encoding, everything else is a kitty report, and a release is
+    /// a report or nothing. Otherwise the pre-encoded legacy bytes go out:
+    /// with APP_CURSOR (DECCKM) unmodified arrow keys are rewritten from CSI
+    /// to SS3, and Backspace and Delete are re-encoded for this pane's erase
+    /// bindings. A key egui has no name for (`key` None: é, ß, Cyrillic) has
+    /// only its legacy bytes there.
+    pub fn send_key(&self, rk: &RawTermKey) -> bool {
         let mode = *self.terminal.lock().mode();
-        if let Some(bytes) = key.and_then(|key| keyboard::encode(key, mods, mode)) {
-            self.send_bytes(bytes);
-            return;
+        let bytes = key_bytes(rk, mode, &self.defaults);
+        if std::env::var_os("RUSTINATOR_KEY_DEBUG").is_some() {
+            eprintln!(
+                "KEY_DEBUG pane {:?}: kitty_flags={:?} app_cursor={} bytes={:?}",
+                self.id,
+                mode.intersection(TermMode::KITTY_KEYBOARD_PROTOCOL),
+                mode.contains(TermMode::APP_CURSOR),
+                String::from_utf8_lossy(&bytes),
+            );
         }
-        if let Some(bytes) = legacy_bytes {
-            if mode.contains(TermMode::APP_CURSOR) {
-                if let Some(app) = key.and_then(|key| decckm_override(key, mods)) {
-                    self.send_bytes(app);
-                    return;
-                }
-            }
-            if let Some(erase) = key.and_then(|key| erase_override(key, mods, &self.defaults)) {
-                self.send_bytes(erase);
-                return;
-            }
-            self.send_bytes(bytes);
-        }
+        let wrote = !bytes.is_empty() && !self.dead.get();
+        self.send_bytes(bytes);
+        wrote
     }
 
     pub fn mode(&self) -> TermMode {
@@ -1870,6 +1866,23 @@ fn decckm_override(key: egui::Key, mods: egui::Modifiers) -> Option<Vec<u8>> {
     Some(seq.to_vec())
 }
 
+/// The bytes `Pane::send_key` writes for `rk` in `mode`.
+fn key_bytes(rk: &RawTermKey, mode: TermMode, defaults: &PaneDefaults) -> Vec<u8> {
+    if let Some(bytes) = keyboard::encode(&rk.input, rk.wmods, mode) {
+        return bytes;
+    }
+    let (key, mods) = (rk.key, rk.mods);
+    if mode.contains(TermMode::APP_CURSOR) {
+        if let Some(app) = key.and_then(|key| decckm_override(key, mods)) {
+            return app;
+        }
+    }
+    if let Some(erase) = key.and_then(|key| erase_override(key, mods, defaults)) {
+        return erase;
+    }
+    rk.legacy_bytes.clone()
+}
+
 /// Backspace and Delete go out as this pane's profile says (Terminator's
 /// `backspace_binding` / `delete_binding`, terminal.py:730-772, set on each
 /// terminal's own VTE): the legacy bytes the key arrived with were encoded
@@ -2381,6 +2394,77 @@ mod tests {
     fn erase_override_keeps_cmd_chord_inert() {
         let cmd = egui::Modifiers { mac_cmd: true, command: true, ..Default::default() };
         assert_eq!(erase_override(egui::Key::Backspace, cmd, &PaneDefaults::default()), None);
+    }
+
+    // ---- key_bytes: kitty encoder vs. the legacy path ----
+
+    use winit::keyboard::{ModifiersState, NamedKey};
+
+    /// A press as `input::encode_raw_key` builds it for a named key.
+    fn named_press(named: winit::keyboard::NamedKey, egui_key: egui::Key, wmods: ModifiersState, legacy: &[u8]) -> RawTermKey {
+        use winit::keyboard::Key;
+        RawTermKey {
+            key: Some(egui_key),
+            mods: egui::Modifiers {
+                shift: wmods.shift_key(),
+                alt: wmods.alt_key(),
+                ctrl: wmods.control_key(),
+                mac_cmd: wmods.super_key(),
+                command: wmods.control_key() || wmods.super_key(),
+            },
+            legacy_bytes: legacy.to_vec(),
+            input: crate::keyboard::KeyInput {
+                logical_key: Key::Named(named),
+                key_without_modifiers: Key::Named(named),
+                text_with_all_modifiers: named.to_text().map(str::to_owned),
+                ..RawTermKey::default().input
+            },
+            wmods,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn key_bytes_app_cursor_arrow_is_ss3_under_kitty_flags() {
+        // alacritty's APP_CURSOR bindings precede build_sequence.
+        let up = named_press(NamedKey::ArrowUp, egui::Key::ArrowUp, ModifiersState::empty(), b"\x1b[A");
+        let defaults = PaneDefaults::default();
+        let mode = TermMode::APP_CURSOR | TermMode::DISAMBIGUATE_ESC_CODES;
+        assert_eq!(key_bytes(&up, mode, &defaults), b"\x1bOA");
+        assert_eq!(key_bytes(&up, TermMode::DISAMBIGUATE_ESC_CODES, &defaults), b"\x1b[A");
+        let ctrl_up = named_press(NamedKey::ArrowUp, egui::Key::ArrowUp, ModifiersState::CONTROL, b"\x1b[1;5A");
+        assert_eq!(key_bytes(&ctrl_up, mode, &defaults), b"\x1b[1;5A");
+    }
+
+    #[test]
+    fn key_bytes_enter_tab_backspace_stay_legacy_under_disambiguate() {
+        let none = ModifiersState::empty();
+        let mut defaults = PaneDefaults::default();
+        let mode = TermMode::DISAMBIGUATE_ESC_CODES;
+        let enter = named_press(NamedKey::Enter, egui::Key::Enter, none, b"\r");
+        let tab = named_press(NamedKey::Tab, egui::Key::Tab, none, b"\t");
+        let backspace = named_press(NamedKey::Backspace, egui::Key::Backspace, none, b"\x7f");
+        assert_eq!(key_bytes(&enter, mode, &defaults), b"\r");
+        assert_eq!(key_bytes(&tab, mode, &defaults), b"\t");
+        assert_eq!(key_bytes(&backspace, mode, &defaults), b"\x7f");
+        // Backspace keeps following the profile's erase binding.
+        defaults.backspace_binding = EraseBinding::ControlH;
+        assert_eq!(key_bytes(&backspace, mode, &defaults), b"\x08");
+        // Escape is disambiguated.
+        let escape = named_press(NamedKey::Escape, egui::Key::Escape, none, b"\x1b");
+        assert_eq!(key_bytes(&escape, mode, &defaults), b"\x1b[27u");
+        assert_eq!(key_bytes(&escape, TermMode::empty(), &defaults), b"\x1b");
+    }
+
+    #[test]
+    fn key_bytes_release_never_sends_legacy_bytes() {
+        let mut escape = named_press(NamedKey::Escape, egui::Key::Escape, ModifiersState::empty(), b"\x1b");
+        escape.input.state = winit::event::ElementState::Released;
+        let defaults = PaneDefaults::default();
+        assert_eq!(key_bytes(&escape, TermMode::empty(), &defaults), b"");
+        assert_eq!(key_bytes(&escape, TermMode::DISAMBIGUATE_ESC_CODES, &defaults), b"");
+        let mode = TermMode::DISAMBIGUATE_ESC_CODES | TermMode::REPORT_EVENT_TYPES;
+        assert_eq!(key_bytes(&escape, mode, &defaults), b"\x1b[27;1:3u");
     }
 
     // ---- escape_regex ----

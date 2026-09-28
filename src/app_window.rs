@@ -10,7 +10,10 @@
 //! `self.gl_window.egui_ctx`, `self.render.renderer` -> `self.renderer`); the
 //! runtime behavior is unchanged.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+
+use winit::keyboard::PhysicalKey;
 
 use crate::app_shared::{AppShared, ConfigDelta};
 use crate::dialogs::{DialogAction, DialogState};
@@ -198,6 +201,10 @@ pub(crate) struct AppWindow {
     /// cursor only blinks (and only arms its wake timer) while this is true.
     window_focused: bool,
     pub(crate) pending_raw_keys: Vec<RawTermKey>,
+    /// The panes each held key's last press or repeat was sent to, by
+    /// physical key, so its release reaches exactly those panes (for the
+    /// kitty REPORT_EVENT_TYPES flag) — see `send_key_release`.
+    key_press_targets: HashMap<PhysicalKey, Vec<PaneId>>,
 }
 
 /// Whether `execute_pane_actions` may keep processing the action batch. Returns
@@ -294,6 +301,7 @@ impl AppWindow {
             focus_regained: false,
             window_focused: true,
             pending_raw_keys: Vec::new(),
+            key_press_targets: HashMap::new(),
         };
         window.apply_startup_layout(shared);
         Ok(window)
@@ -507,8 +515,9 @@ impl AppWindow {
     /// its normal screen and is the child's on one showing the alternate
     /// screen; an Insert chord pastes into (copies from) the input targets,
     /// and VTE's scroll-on-keystroke jump follows it as after any key it did
-    /// not scroll on. Returns whether bytes reached a PTY.
-    fn run_key_builtin(&self, builtin: KeyBuiltin, rk: &RawTermKey, scroll_on_keystroke: bool) -> bool {
+    /// not scroll on. Returns whether bytes reached a PTY, and the panes the
+    /// key itself was sent to.
+    fn run_key_builtin(&self, builtin: KeyBuiltin, rk: &RawTermKey, scroll_on_keystroke: bool) -> (bool, Vec<PaneId>) {
         let scope = self.tab_mgr.broadcast_scope;
         let tab = self.tab_mgr.active_tab();
         match builtin {
@@ -523,7 +532,8 @@ impl AppWindow {
                         scroll.apply(pane);
                     }
                 }
-                return input::send_key(rk, &to_child, scroll_on_keystroke);
+                let sent = input::send_key(rk, &to_child, scroll_on_keystroke);
+                return (sent, to_child.iter().map(|pane| pane.id).collect());
             }
             KeyBuiltin::PastePrimary => self.tab_mgr.paste_primary(tab.focused),
             KeyBuiltin::Copy => self.tab_mgr.copy_selection(&self.gl_window.egui_ctx),
@@ -534,7 +544,58 @@ impl AppWindow {
                 pane.scroll_to_bottom();
             }
         }
-        false
+        (false, Vec::new())
+    }
+
+    /// Remember where a press (or repeat) went — nowhere when a binding or
+    /// a builtin consumed it — for its release.
+    fn record_key_press(&mut self, rk: &RawTermKey, targets: Vec<PaneId>) {
+        if targets.is_empty() {
+            self.key_press_targets.remove(&rk.input.physical_key);
+        } else {
+            self.key_press_targets.insert(rk.input.physical_key, targets);
+        }
+    }
+
+    /// A press the window consumed before it reached the key routing (the
+    /// hotkey window's Escape): its release goes nowhere.
+    pub(crate) fn forget_key_press(&mut self, physical_key: PhysicalKey) {
+        self.key_press_targets.remove(&physical_key);
+    }
+
+    /// Send a key release to the panes its press was sent to, still open
+    /// ones only; each reports it only if its kitty flags ask
+    /// (`keyboard::encode`). A release whose press a binding, a builtin or
+    /// an egui widget consumed goes nowhere, as kitty drops the release of a
+    /// shortcut key (keys.c `last_special_key_pressed`). A release is never
+    /// input for scroll-on-keystroke or the cursor blink: alacritty's
+    /// `key_release` writes without `on_terminal_input_start`.
+    fn send_key_release(&mut self, rk: &RawTermKey) {
+        let Some(targets) = self.key_press_targets.remove(&rk.input.physical_key) else {
+            return;
+        };
+        for tab in &self.tab_mgr.tabs {
+            for pane in tab.panes.values().filter(|pane| targets.contains(&pane.id)) {
+                pane.send_key(rk);
+            }
+        }
+    }
+
+    /// The keys of a frame no pane gets presses from (a modal dialog or an
+    /// egui text field holds the keyboard): releases still complete presses
+    /// sent before, and every press here is recorded as consumed. Returns the
+    /// presses.
+    fn release_keys_only(&mut self, raw_keys: Vec<RawTermKey>) -> Vec<RawTermKey> {
+        let mut presses = Vec::with_capacity(raw_keys.len());
+        for rk in raw_keys {
+            if rk.is_press() {
+                self.record_key_press(&rk, Vec::new());
+                presses.push(rk);
+            } else {
+                self.send_key_release(&rk);
+            }
+        }
+        presses
     }
 
     /// Routes the 10 group/broadcast actions out of `execute_pane_actions`. Each
@@ -857,12 +918,14 @@ impl AppWindow {
         // field first draws and takes egui focus; its key events stay in
         // egui's input so the dialog itself still sees Escape.
         if self.tab_mgr.tabs.is_empty() || self.dialogs.modal_open() {
-            self.pending_raw_keys.clear();
+            let raw_keys = std::mem::take(&mut self.pending_raw_keys);
+            self.release_keys_only(raw_keys);
         } else if egui_owns_keys {
             // An in-window text field (search bar, tab label) has the keys.
             // Only the toplevel's own bindings still apply, as Terminator's
             // `Window.on_key_press` runs ahead of the focus widget.
             let raw_keys = std::mem::take(&mut self.pending_raw_keys);
+            let raw_keys = self.release_keys_only(raw_keys);
             let actions = input::process_window_keys(ctx, &shared.bindings, raw_keys);
             self.execute_pane_actions(shared, ctx, actions);
         } else {
@@ -884,15 +947,32 @@ impl AppWindow {
     /// Alt+arrow) reaches the pane focused *after* the chord — GTK delivers
     /// each key event to the widget focused at that moment, and resolving the
     /// targets once for the whole batch sent them to the previous pane.
+    ///
+    /// Only a press (or repeat) is classified; a release goes where its press
+    /// went (`send_key_release`), and a silent press (`RawTermKey::is_silent`:
+    /// a bare modifier, a dead key) goes straight to the input targets for
+    /// the kitty encoder, as neither can be a binding or a builtin.
     fn route_raw_keys(&mut self, shared: &mut AppShared, ctx: &egui::Context, raw_keys: Vec<RawTermKey>) {
         let scroll_on_keystroke = shared.user_config.active().scroll_on_keystroke;
         let mut sent_input = false;
-        for rk in raw_keys {
+        let mut raw_keys = raw_keys.into_iter();
+        while let Some(rk) = raw_keys.next() {
             // An earlier key may have closed the last tab (bug M1).
             if !can_process_more_actions(self.tab_mgr.tabs.len()) {
                 break;
             }
+            if !rk.is_press() {
+                self.send_key_release(&rk);
+                continue;
+            }
             let tab = self.tab_mgr.active_tab();
+            if rk.is_silent() {
+                let targets = tab.select_input_targets(self.tab_mgr.broadcast_scope);
+                sent_input |= input::send_key(&rk, &targets, scroll_on_keystroke);
+                let ids = targets.iter().map(|pane| pane.id).collect();
+                self.record_key_press(&rk, ids);
+                continue;
+            }
             // Alt-screen passthrough is decided by the FOCUSED pane alone, not by
             // any broadcast target — see input::classify_key (bug M3).
             let focused = tab.panes.get(&tab.focused);
@@ -905,22 +985,32 @@ impl AppWindow {
                 && !focused.is_some_and(|p| p.has_selection());
             match input::classify_key(&shared.bindings, &rk, focused_alt_screen, copy_fallthrough) {
                 Some(action) => {
+                    self.record_key_press(&rk, Vec::new());
                     let text_field_before = self.text_field_open();
                     self.execute_pane_actions(shared, ctx, vec![action]);
                     // A dialog or text field the binding just opened owns the
                     // rest of the batch, exactly as the gate in `logic` would
-                    // from the next frame on: none of those keys reach a PTY.
+                    // from the next frame on: no press reaches a PTY, while a
+                    // release still goes where its press went (a key held
+                    // across the chord, whose press was already sent).
                     if self.dialogs.modal_open() || (!text_field_before && self.text_field_open()) {
+                        self.release_keys_only(raw_keys.collect());
                         break;
                     }
                 }
                 // What VTE does with the key itself comes between the
                 // bindings and the child.
                 None => match input::key_builtin(rk.key, rk.mods) {
-                    Some(builtin) => sent_input |= self.run_key_builtin(builtin, &rk, scroll_on_keystroke),
+                    Some(builtin) => {
+                        let (sent, ids) = self.run_key_builtin(builtin, &rk, scroll_on_keystroke);
+                        sent_input |= sent;
+                        self.record_key_press(&rk, ids);
+                    }
                     None => {
                         let targets = tab.select_input_targets(self.tab_mgr.broadcast_scope);
                         sent_input |= input::send_key(&rk, &targets, scroll_on_keystroke);
+                        let ids = targets.iter().map(|pane| pane.id).collect();
+                        self.record_key_press(&rk, ids);
                     }
                 },
             }

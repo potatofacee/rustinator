@@ -1,16 +1,17 @@
 use alacritty_terminal::term::TermMode;
-use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
+use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 
 use crate::config::EraseBinding;
 use crate::keybindings::{Action, BindingTable};
+use crate::keyboard::{self, KeyInput};
 use crate::pane::Pane;
 
 pub(crate) struct RawTermKey {
-    /// egui's name for the key, for binding lookup and the kitty key code;
-    /// None for a character egui cannot name (é, ß, Cyrillic, most non-US
-    /// punctuation) — such a key is carried by its bytes alone, no stand-in
-    /// name is invented for it.
+    /// egui's name for the key, for binding lookup and the legacy DECCKM /
+    /// erase rewrites; None for a character egui cannot name (é, ß,
+    /// Cyrillic, most non-US punctuation) — such a key is carried by its
+    /// bytes (and `input`) alone, no stand-in name is invented for it.
     pub key: Option<egui::Key>,
     /// The character Shift turned the key into when that is a different one
     /// egui can name (Shift+= is `+` on US); a binding on it matches with
@@ -18,6 +19,55 @@ pub(crate) struct RawTermKey {
     pub shifted_key: Option<egui::Key>,
     pub mods: egui::Modifiers,
     pub legacy_bytes: Vec<u8>,
+    /// The winit event itself, for the kitty keyboard encoder
+    /// (`keyboard::encode`): the press/repeat/release state, the key winit
+    /// names (every key, including the ones `key` is None for), its location
+    /// (left/right modifier, keypad) and its text.
+    pub input: KeyInput,
+    /// winit's modifier state at the event; carries Super on every platform
+    /// (egui's `mac_cmd` only means Cmd on macOS).
+    pub wmods: ModifiersState,
+}
+
+impl RawTermKey {
+    /// A press or a repeat. Only these reach the bindings, VTE's builtins and
+    /// the legacy encoding; a release is for the kitty encoder alone.
+    pub(crate) fn is_press(&self) -> bool {
+        self.input.state.is_pressed()
+    }
+
+    /// A press the legacy path has nothing for: no egui name and no bytes (a
+    /// bare modifier, a dead key, Caps Lock, a media key, an inert Cmd chord
+    /// on a key egui cannot name). Before the kitty encoder read winit's
+    /// event these were dropped at the window; they still match no binding
+    /// or builtin, and reach a pane only for the kitty encoder to report.
+    pub(crate) fn is_silent(&self) -> bool {
+        self.key.is_none() && self.legacy_bytes.is_empty()
+    }
+}
+
+#[cfg(test)]
+impl Default for RawTermKey {
+    /// An empty press, for tests that only look at the egui fields.
+    fn default() -> Self {
+        use winit::keyboard::{NativeKey, NativeKeyCode};
+        RawTermKey {
+            key: None,
+            shifted_key: None,
+            mods: egui::Modifiers::default(),
+            legacy_bytes: Vec::new(),
+            input: KeyInput {
+                logical_key: Key::Unidentified(NativeKey::Unidentified),
+                key_without_modifiers: Key::Unidentified(NativeKey::Unidentified),
+                text_with_all_modifiers: None,
+                location: winit::keyboard::KeyLocation::Standard,
+                physical_key: PhysicalKey::Unidentified(NativeKeyCode::Unidentified),
+                state: winit::event::ElementState::Pressed,
+                repeat: false,
+            },
+            wmods: ModifiersState::empty(),
+        }
+    }
 }
 
 /// Send one unconsumed key to every PTY in `targets` (scrolling each to the
@@ -26,12 +76,30 @@ pub(crate) struct RawTermKey {
 /// an empty broadcast set) still gets its bindings, exactly as Terminator's
 /// `on_keypress` runs before VTE's `input_enabled` gate; only this byte-
 /// sending stage needs a target. Returns whether any bytes were sent.
+///
+/// A silent press (`RawTermKey::is_silent`) is input only where a pane's
+/// kitty mode actually reports it, and never when it is a bare modifier:
+/// alacritty's `key_input` calls `on_terminal_input_start` (scroll to the
+/// bottom, restart the blink) only for written bytes, and skips it for
+/// `is_modifier_key`.
 pub(crate) fn send_key(rk: &RawTermKey, targets: &[&Pane], scroll_on_keystroke: bool) -> bool {
+    if rk.is_silent() {
+        let mut sent = false;
+        for pane in targets {
+            if pane.send_key(rk) && !keyboard::is_modifier_key(&rk.input) {
+                if scroll_on_keystroke {
+                    pane.scroll_to_bottom();
+                }
+                sent = true;
+            }
+        }
+        return sent;
+    }
     for pane in targets {
         if scroll_on_keystroke {
             pane.scroll_to_bottom();
         }
-        pane.send_key(rk.key, rk.mods, Some(rk.legacy_bytes.clone()));
+        pane.send_key(rk);
     }
     !targets.is_empty()
 }
@@ -74,6 +142,7 @@ pub(crate) fn process_window_keys(
 ) -> Vec<Action> {
     let actions: Vec<Action> = raw_keys
         .iter()
+        .filter(|rk| rk.is_press() && !rk.is_silent())
         .filter_map(|rk| lookup_binding(bindings, rk).map(|(a, _, _)| a).filter(|a| is_window_level(*a)))
         .collect();
     if !actions.is_empty() {
@@ -253,12 +322,16 @@ pub(crate) fn focus_event_bytes(mode: TermMode, focused: bool) -> Option<Vec<u8>
     }
 }
 
-pub(crate) fn encode_raw_key(event: &winit::event::KeyEvent, modifiers: winit::event::Modifiers) -> Option<RawTermKey> {
-    if !event.state.is_pressed() {
-        return None;
-    }
+/// Everything the key routing needs about one winit key event. A release
+/// carries no egui name and no legacy bytes: it matches no binding and has
+/// no legacy encoding, only a kitty report (`keyboard::encode`).
+pub(crate) fn encode_raw_key(event: &winit::event::KeyEvent, modifiers: winit::event::Modifiers) -> RawTermKey {
     let mods = winit_mods_to_egui(modifiers);
     let state = modifiers.state();
+    let input = KeyInput::from_event(event);
+    if !event.state.is_pressed() {
+        return RawTermKey { key: None, shifted_key: None, mods, legacy_bytes: Vec::new(), input, wmods: state };
+    }
     let alt = state.alt_key();
     let ctrl = state.control_key();
     let shift = state.shift_key();
@@ -273,11 +346,7 @@ pub(crate) fn encode_raw_key(event: &winit::event::KeyEvent, modifiers: winit::e
     };
     let shifted_key = shifted_char_key(&event.logical_key, shift, key);
     let legacy_bytes = legacy_key_bytes(event, &unmod, ctrl_latin, inert, shift, alt, ctrl);
-    // A bare modifier, a dead key: nothing to name and nothing to send.
-    if key.is_none() && legacy_bytes.is_empty() {
-        return None;
-    }
-    Some(RawTermKey { key, shifted_key, mods, legacy_bytes })
+    RawTermKey { key, shifted_key, mods, legacy_bytes, input, wmods: state }
 }
 
 /// The character key Shift turned this press into, when it is a different
@@ -384,7 +453,8 @@ pub(crate) fn legacy_mod_param(shift: bool, alt: bool, ctrl: bool) -> u8 {
 /// and the printable fallback never looks at it, so an unbound Super chord
 /// sends the key's ordinary bytes: Super+Enter is `\r`, Super+a is `a`.
 /// `mods.mac_cmd` itself stays set on every platform — the Super bindings
-/// (Super+I, Super+R, ...) and the kitty modifier bit depend on it.
+/// (Super+I, Super+R, ...) depend on it (the kitty encoder reads winit's
+/// own modifier state).
 pub(crate) fn cmd_is_inert(mods: egui::Modifiers) -> bool {
     cfg!(target_os = "macos") && mods.mac_cmd
 }
@@ -687,7 +757,7 @@ mod tests {
 
     /// A raw key as the encoder yields it for a press egui can name.
     fn raw(key: egui::Key, mods: egui::Modifiers, legacy_bytes: &[u8]) -> RawTermKey {
-        RawTermKey { key: Some(key), shifted_key: None, mods, legacy_bytes: legacy_bytes.to_vec() }
+        RawTermKey { key: Some(key), shifted_key: None, mods, legacy_bytes: legacy_bytes.to_vec(), ..Default::default() }
     }
 
     #[test]
@@ -1645,12 +1715,13 @@ mod tests {
             shifted_key: Some(egui::Key::Plus),
             mods: ctrl_shift,
             legacy_bytes: b"+".to_vec(),
+            ..Default::default()
         };
         assert_eq!(lookup_binding(&bindings, &us), Some((Action::ZoomIn, egui::Key::Plus, ctrl)));
         let german = raw(egui::Key::Plus, ctrl, b"+");
         assert_eq!(lookup_binding(&bindings, &german), Some((Action::ZoomIn, egui::Key::Plus, ctrl)));
         // Shift+* on German gives "*" (unnamed): nothing to match, "+" chord not consumed.
-        let german_shift = RawTermKey { key: Some(egui::Key::Plus), shifted_key: None, mods: ctrl_shift, legacy_bytes: b"*".to_vec() };
+        let german_shift = RawTermKey { key: Some(egui::Key::Plus), shifted_key: None, mods: ctrl_shift, legacy_bytes: b"*".to_vec(), ..Default::default() };
         assert_eq!(lookup_binding(&bindings, &german_shift), None);
     }
 
@@ -1666,6 +1737,7 @@ mod tests {
             shifted_key: Some(egui::Key::Plus),
             mods: ctrl_shift,
             legacy_bytes: b"+".to_vec(),
+            ..Default::default()
         };
         assert_eq!(lookup_binding(&bindings, &us), Some((Action::SplitVertical, egui::Key::Equals, ctrl_shift)));
     }
@@ -1679,10 +1751,10 @@ mod tests {
         bindings.apply_user(&[("switch_to_tab_2".into(), "Ctrl+2".into())]);
         let ctrl = egui::Modifiers { ctrl: true, ..Default::default() };
         let ctrl_shift = egui::Modifiers { ctrl: true, shift: true, ..Default::default() };
-        let e_acute = RawTermKey { key: None, shifted_key: None, mods: ctrl, legacy_bytes: "é".as_bytes().to_vec() };
+        let e_acute = RawTermKey { key: None, shifted_key: None, mods: ctrl, legacy_bytes: "é".as_bytes().to_vec(), ..Default::default() };
         assert_eq!(lookup_binding(&bindings, &e_acute), None);
         assert_eq!(classify_key(&bindings, &e_acute, false, false), None);
-        let shifted = RawTermKey { key: None, shifted_key: Some(egui::Key::Num2), mods: ctrl_shift, legacy_bytes: b"2".to_vec() };
+        let shifted = RawTermKey { key: None, shifted_key: Some(egui::Key::Num2), mods: ctrl_shift, legacy_bytes: b"2".to_vec(), ..Default::default() };
         assert_eq!(lookup_binding(&bindings, &shifted), Some((Action::SwitchToTab(2), egui::Key::Num2, ctrl)));
     }
 
