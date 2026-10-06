@@ -46,5 +46,3 @@ identifier = "com.rustinator.app"
 icon = ["assets/icon.icns"]
 osx_minimum_system_version = "10.15"
 
-[package.metadata.bundle.plist]
-LSUIElement = false
