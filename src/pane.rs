@@ -1,10 +1,9 @@
 use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
-use crate::pty_event_loop::{EventLoop, EventLoopSender, Msg, PaneHooks, State as EventLoopState};
+use crate::pty_event_loop::{EventLoop, EventLoopSender, Msg, PaneHooks};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Boundary, Column, Direction as GridDir, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
@@ -26,10 +25,61 @@ use crate::profile::{ProfileName, SpawnCommand};
 
 pub type PaneId = u64;
 
-/// JoinHandle for the alacritty PTY EventLoop thread. `EventLoop::spawn`
-/// returns `JoinHandle<(EventLoop, State)>`; we keep it so the old thread can
-/// be reaped deterministically on respawn.
-type PtyLoopHandle = JoinHandle<(EventLoop<tty::Pty, EventProxy>, EventLoopState)>;
+/// A pane's terminal. Derefs to the shared `Arc` (so `pane.terminal.lock()`
+/// and `Arc::clone(&pane.terminal)` work as on the bare Arc), but its drop runs
+/// on the reaper thread: the grid holds the whole scrollback, which can be
+/// gigabytes (minutes to free if swapped out), and panes drop on the UI thread.
+pub type TermHandle = DropOffThread<Arc<FairMutex<Term<EventProxy>>>>;
+
+/// Owns a value whose destructor may be slow and runs that destructor on a
+/// shared background reaper thread instead of the dropping thread.
+pub struct DropOffThread<T: Send + 'static>(Option<T>);
+
+impl<T: Send + 'static> DropOffThread<T> {
+    pub fn new(value: T) -> Self {
+        Self(Some(value))
+    }
+}
+
+impl<T: Send + 'static> std::ops::Deref for DropOffThread<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        // Only `drop` takes the value out.
+        self.0.as_ref().expect("DropOffThread value taken before drop")
+    }
+}
+
+impl<T: Send + 'static> Drop for DropOffThread<T> {
+    fn drop(&mut self) {
+        if let Some(value) = self.0.take() {
+            reap_off_thread(Box::new(value));
+        }
+    }
+}
+
+/// Hand `value` to the reaper thread to drop. One lazily started thread fed by
+/// a channel, since closing a window drops many panes at once. If the reaper
+/// cannot be started (or died in a panicking drop), drop inline rather than leak.
+fn reap_off_thread(value: Box<dyn Send>) {
+    static REAPER: OnceLock<Option<mpsc::Sender<Box<dyn Send>>>> = OnceLock::new();
+    let reaper = REAPER.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<Box<dyn Send>>();
+        std::thread::Builder::new()
+            .name("term reaper".into())
+            .spawn(move || rx.into_iter().for_each(drop))
+            .ok()
+            .map(|_| tx)
+    });
+    match reaper {
+        Some(tx) => {
+            if let Err(mpsc::SendError(value)) = tx.send(value) {
+                drop(value);
+            }
+        }
+        None => drop(value),
+    }
+}
 
 // Xterm-ish ANSI palette (NamedColor::Black..BrightWhite = 0..15).
 pub(crate) const ANSI: [[u8; 3]; 16] = [
@@ -887,7 +937,7 @@ fn scrub_foreign_term_vars(env: &mut std::collections::HashMap<String, String>) 
 
 pub struct Pane {
     pub id: PaneId,
-    pub terminal: Arc<FairMutex<Term<EventProxy>>>,
+    pub terminal: TermHandle,
     pub pty_tx: EventLoopSender,
     pub child_pid: u32,
     pub cols: usize,
@@ -939,9 +989,6 @@ pub struct Pane {
     /// while `dead` is a persistent status. A dead pane's PTY channel is
     /// closed, so input must be a no-op rather than silently dropped.
     dead: Cell<bool>,
-    /// JoinHandle for the live PTY EventLoop thread, kept so the old thread can
-    /// be joined (child reaped) before being replaced in `respawn`.
-    pty_handle: Option<PtyLoopHandle>,
 }
 
 impl Pane {
@@ -1006,16 +1053,18 @@ impl Pane {
             PaneHooks {
                 clear_wipes_scrollback: Arc::clone(&clear_wipes_scrollback),
                 defaults: Arc::clone(&shared_defaults),
+                child_pid,
             },
         )
         .map_err(|e| format!("failed to create pty event loop: {e}"))?;
         let pty_tx = event_loop.channel();
         *pty_writer.lock().unwrap() = Some(pty_tx.clone());
-        let pty_handle = Some(event_loop.spawn());
+        // Detached, as in alacritty: the thread tears down its own Pty.
+        let _ = event_loop.spawn();
 
         Ok(Self {
             id,
-            terminal,
+            terminal: TermHandle::new(terminal),
             pty_tx,
             child_pid,
             cols,
@@ -1039,7 +1088,6 @@ impl Pane {
             profile,
             spawn_command,
             dead: Cell::new(false),
-            pty_handle,
         })
     }
 
@@ -1050,14 +1098,11 @@ impl Pane {
         term_config: Config,
         winit_proxy: Option<winit::event_loop::EventLoopProxy<crate::window::UserEvent>>,
     ) -> Result<(), String> {
-        // Shut down the old PTY event loop thread before replacing the sender,
-        // then join it so the old child is reaped deterministically before we
-        // overwrite the pty/terminal (otherwise the thread is detached and the
-        // child may linger).
+        // Shut down the old PTY event loop before replacing the sender. It hangs
+        // up (and after its grace period kills) the old child and reaps it on
+        // its own thread; the old Term goes to the reaper when `self.terminal`
+        // is replaced below. No join: either could stall the UI thread.
         let _ = self.pty_tx.send(Msg::Shutdown);
-        if let Some(handle) = self.pty_handle.take() {
-            let _ = handle.join();
-        }
 
         let window_size = WindowSize {
             num_lines: self.lines as u16,
@@ -1111,16 +1156,16 @@ impl Pane {
             PaneHooks {
                 clear_wipes_scrollback: Arc::clone(&self.clear_wipes_scrollback),
                 defaults: Arc::clone(&self.shared_defaults),
+                child_pid,
             },
         )
         .map_err(|e| format!("failed to create pty event loop: {e}"))?;
         let pty_tx = event_loop.channel();
         *pty_writer.lock().unwrap() = Some(pty_tx.clone());
-        let pty_handle = Some(event_loop.spawn());
+        let _ = event_loop.spawn();
 
-        self.terminal = terminal;
+        self.terminal = TermHandle::new(terminal);
         self.pty_tx = pty_tx;
-        self.pty_handle = pty_handle;
         self.child_pid = child_pid;
         self.dirty = dirty;
         self.wake_pending = wake_pending;
@@ -1645,10 +1690,11 @@ impl Pane {
 
 impl Drop for Pane {
     fn drop(&mut self) {
+        // Only signal, as alacritty's WindowContext does: the PTY thread hangs
+        // up, reaps and closes its child itself, and `terminal` frees on the
+        // reaper. Nothing here may block the UI thread. A dead pane's loop has
+        // already ended, so the send just fails.
         let _ = self.pty_tx.send(Msg::Shutdown);
-        if let Some(handle) = self.pty_handle.take() {
-            let _ = handle.join();
-        }
     }
 }
 
@@ -1905,6 +1951,33 @@ mod tests {
     use super::*;
 
     const FB: &str = "en_US.UTF-8";
+
+    /// Records which thread ran its destructor.
+    struct DropThreadProbe(mpsc::Sender<(std::thread::ThreadId, Option<String>)>);
+
+    impl Drop for DropThreadProbe {
+        fn drop(&mut self) {
+            let me = std::thread::current();
+            let _ = self.0.send((me.id(), me.name().map(str::to_owned)));
+        }
+    }
+
+    /// The pane-teardown guarantee behind `TermHandle`: dropping the handle on
+    /// this (UI-standing) thread must not run the payload's destructor here,
+    /// but on the reaper thread, and the payload stays reachable via Deref
+    /// until then.
+    #[test]
+    fn drop_off_thread_frees_payload_on_reaper_thread() {
+        let (tx, rx) = mpsc::channel();
+        let handle = DropOffThread::new(Arc::new(DropThreadProbe(tx)));
+        let _: &Arc<DropThreadProbe> = &handle; // Deref reaches the Arc
+        drop(handle);
+        let (id, name) = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("payload was never dropped");
+        assert_ne!(id, std::thread::current().id(), "payload dropped on the dropping thread");
+        assert_eq!(name.as_deref(), Some("term reaper"));
+    }
 
     #[test]
     fn zerowidth_extraction_preserves_order_and_empty() {

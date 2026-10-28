@@ -9,7 +9,12 @@
 //! own `EventLoopSender` so the proxy can write query replies back to the PTY,
 //! and both parser dispatch sites (`advance`, `stop_sync`) go through the
 //! proxy; the PTY poll token constants are replicated locally because upstream
-//! keeps them pub(crate). Re-sync this file when bumping alacritty_terminal.
+//! keeps them pub(crate). Teardown also differs: `spawn` returns
+//! `JoinHandle<()>` and the thread drops the loop (and so the `Pty`) itself,
+//! and `Msg::Shutdown` hangs up the child and keeps the loop running until the
+//! child exits, escalating to SIGKILL after `SHUTDOWN_GRACE`, instead of
+//! breaking at once (see `begin_shutdown`). Re-sync this file when bumping
+//! alacritty_terminal.
 
 use std::borrow::Cow;
 use std::collections::VecDeque;
@@ -21,7 +26,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use alacritty_terminal::event::{self, Event, EventListener, WindowSize};
 use alacritty_terminal::sync::FairMutex;
@@ -34,15 +39,18 @@ use polling::{Event as PollingEvent, Events, PollMode, Poller};
 use crate::pane::PaneDefaults;
 use crate::term_handler::TermHandlerProxy;
 
-/// Per-pane state shared between the main thread and this loop's parse-time
-/// handler proxy. Bundled so `EventLoop::new` stays close to upstream's
-/// signature as more hooks are added.
+/// Per-pane state the main thread hands this loop (mostly shared with its
+/// parse-time handler proxy). Bundled so `EventLoop::new` stays close to
+/// upstream's signature as more hooks are added.
 pub struct PaneHooks {
     /// When true, ED 2 on the primary screen also wipes scrollback.
     pub clear_wipes_scrollback: Arc<AtomicBool>,
     /// Pane default colors, used to answer OSC 10/11/12 and OSC 4 queries when
     /// the program has not overridden the color. Written by the main thread.
     pub defaults: Arc<Mutex<PaneDefaults>>,
+    /// Pid of the PTY's direct child, signalled on `Msg::Shutdown`. The loop is
+    /// generic over `EventedPty`, which does not expose the child.
+    pub child_pid: u32,
 }
 
 // Replicated from alacritty_terminal's tty module, where they are pub(crate).
@@ -61,6 +69,11 @@ pub(crate) const READ_BUFFER_SIZE: usize = 0x10_0000;
 
 /// Max bytes to read from the PTY while the terminal is locked.
 const MAX_LOCKED_READ: usize = u16::MAX as usize;
+
+/// How long a shutting-down loop waits after SIGHUP before sending SIGKILL.
+/// Bounds teardown for a direct child that ignores SIGHUP or cannot act on it
+/// (traps it, is stopped, or is stuck on a tty write nobody else drains).
+pub(crate) const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
 
 /// Messages that may be sent to the `EventLoop`.
 #[derive(Debug)]
@@ -133,16 +146,38 @@ where
     /// Drain the channel.
     ///
     /// Returns `false` when a shutdown message was received.
+    // Deviation: keeps draining past Shutdown (a message left queued may have
+    // had its poller wake consumed already), and once shutting down ignores
+    // everything: the pane is gone, so input and resizes have no audience, and
+    // a repeated Shutdown changes nothing.
     fn drain_recv_channel(&mut self, state: &mut State) -> bool {
+        let mut shutdown = false;
         while let Some(msg) = self.rx.recv() {
             match msg {
+                _ if shutdown || state.shutdown.is_some() => (),
                 Msg::Input(input) => state.write_list.push_back(input),
                 Msg::Resize(window_size) => self.pty.on_resize(window_size),
-                Msg::Shutdown => return false,
+                Msg::Shutdown => shutdown = true,
             }
         }
 
-        true
+        !shutdown
+    }
+
+    /// Start a graceful shutdown: hang up the child and arm the SIGKILL
+    /// deadline. The loop keeps running (and reading, so a child blocked
+    /// writing to the tty can get to its SIGHUP handling) until the normal
+    /// child-exit event ends it. The child is only reaped by that event
+    /// (`next_child_event`'s try_wait), so its pid cannot be recycled while we
+    /// may still signal it.
+    #[cfg(unix)]
+    fn begin_shutdown(&mut self, state: &mut State) {
+        signal_child(self.hooks.child_pid, libc::SIGHUP);
+        // Upstream discarded unwritten input by breaking at once; do the same,
+        // so no write (and no write error) can end the loop before the child.
+        state.write_list.clear();
+        state.writing = None;
+        state.shutdown = Some(Shutdown { kill_at: Some(Instant::now() + SHUTDOWN_GRACE) });
     }
 
     #[inline]
@@ -253,7 +288,11 @@ where
         Ok(())
     }
 
-    pub fn spawn(mut self) -> JoinHandle<(Self, State)> {
+    // Deviation: upstream hands the loop back through `JoinHandle<(Self, State)>`,
+    // so its `Pty` (whose Drop SIGHUPs the child, blocks in wait() and only then
+    // closes the master) drops wherever the handle is joined. Here the thread
+    // always drops it itself, which is what alacritty gets by detaching.
+    pub fn spawn(mut self) -> JoinHandle<()> {
         thread::spawn_named("PTY reader", move || {
             let mut state = State::default();
             let mut buf = [0u8; READ_BUFFER_SIZE];
@@ -264,7 +303,7 @@ where
             // Register TTY through EventedRW interface.
             if let Err(err) = unsafe { self.pty.register(&self.poll, interest, poll_opts) } {
                 error!("Event loop registration error: {err}");
-                return (self, state);
+                return;
             }
 
             let mut events = Events::with_capacity(NonZeroUsize::new(1024).unwrap());
@@ -275,11 +314,20 @@ where
                 None
             };
 
+            // Deviation: set when the child-exit event reaped the child.
+            let mut child_reaped = false;
+
             'event_loop: loop {
                 // Wakeup the event loop when a synchronized update timeout was reached.
                 let handler = state.parser.sync_timeout();
-                let timeout =
-                    handler.sync_timeout().map(|st| st.saturating_duration_since(Instant::now()));
+                let sync_deadline = handler.sync_timeout();
+                // Deviation: while shutting down, also wake for the SIGKILL deadline.
+                let kill_deadline = state.shutdown.as_ref().and_then(|s| s.kill_at);
+                let deadline = match (sync_deadline, kill_deadline) {
+                    (Some(sync), Some(kill)) => Some(sync.min(kill)),
+                    (sync, kill) => sync.or(kill),
+                };
+                let timeout = deadline.map(|st| st.saturating_duration_since(Instant::now()));
 
                 events.clear();
                 if let Err(err) = self.poll.wait(&mut events, timeout) {
@@ -292,8 +340,24 @@ where
                     }
                 }
 
+                // Deviation: escalate a shutdown whose grace period has run out.
+                #[cfg(unix)]
+                if let Some(shutdown) = &mut state.shutdown {
+                    if shutdown.kill_at.is_some_and(|at| at <= Instant::now()) {
+                        shutdown.kill_at = None;
+                        signal_child(self.hooks.child_pid, libc::SIGKILL);
+                    }
+                }
+
                 // Handle synchronized update timeout.
-                if events.is_empty() && self.rx.peek().is_none() {
+                // Deviation: upstream's only timeout is the sync one, so it reads any
+                // empty wake as that. While shutting down the wake may be the kill
+                // deadline instead, so then the sync timer must actually be due.
+                if events.is_empty()
+                    && self.rx.peek().is_none()
+                    && (state.shutdown.is_none()
+                        || sync_deadline.is_some_and(|at| at <= Instant::now()))
+                {
                     let mut terminal = self.terminal.lock();
                     let mut handler = TermHandlerProxy {
                         term: &mut *terminal,
@@ -311,7 +375,11 @@ where
                 }
 
                 // Handle channel events, if there are any.
-                if !self.drain_recv_channel(&mut state) {
+                // Deviation: hang up and wait for the child instead of breaking.
+                if !self.drain_recv_channel(&mut state) && state.shutdown.is_none() {
+                    #[cfg(unix)]
+                    self.begin_shutdown(&mut state);
+                    #[cfg(not(unix))]
                     break;
                 }
 
@@ -329,6 +397,7 @@ where
                                 }
                                 self.terminal.lock().exit();
                                 self.event_proxy.send_event(Event::Wakeup);
+                                child_reaped = true;
                                 break 'event_loop;
                             }
                         },
@@ -346,7 +415,9 @@ where
                                     // with `EIO` if the client side hangs up.  In that case,
                                     // just loop back round for the inevitable `Exited` event.
                                     // This sucks, but checking the process is either racy or
-                                    // blocking.
+                                    // blocking. (During shutdown this is the usual way a
+                                    // hung-up child's exit shows up first, and the
+                                    // SIGKILL deadline still bounds the wait.)
                                     #[cfg(target_os = "linux")]
                                     if err.raw_os_error() == Some(libc::EIO) {
                                         continue;
@@ -381,9 +452,37 @@ where
             // The evented instances are not dropped here so deregister them explicitly.
             let _ = self.pty.deregister(&self.poll);
 
-            (self, state)
+            // Deviation: an I/O or poll error can end the loop mid-shutdown with the
+            // child still alive (it never got the exit event). Kill it so the
+            // `Pty::drop` wait below is not left to a child that ignores SIGHUP.
+            #[cfg(unix)]
+            if state.shutdown.is_some() && !child_reaped {
+                signal_child(self.hooks.child_pid, libc::SIGKILL);
+            }
+            #[cfg(not(unix))]
+            let _ = child_reaped;
+
+            // Drop the `Pty` (SIGHUP, reap, close the master) and the loop's
+            // terminal reference here, on this thread.
+            drop(state);
+            drop(self);
         })
     }
+}
+
+/// Send `signal` to the PTY's direct child. Only called while the child is
+/// unreaped (see `begin_shutdown`), so the pid still names it.
+#[cfg(unix)]
+fn signal_child(pid: u32, signal: libc::c_int) {
+    unsafe {
+        libc::kill(pid as libc::pid_t, signal);
+    }
+}
+
+/// Graceful-shutdown progress, present once `Msg::Shutdown` was received.
+struct Shutdown {
+    /// When to send SIGKILL; `None` once it has been sent.
+    kill_at: Option<Instant>,
 }
 
 /// Helper type which tracks how much of a buffer has been written.
@@ -467,6 +566,8 @@ pub struct State {
     write_list: VecDeque<Cow<'static, [u8]>>,
     writing: Option<Writing>,
     parser: ansi::Processor,
+    /// Deviation: graceful-shutdown progress (see `begin_shutdown`).
+    shutdown: Option<Shutdown>,
 }
 
 impl State {
@@ -668,5 +769,132 @@ mod tests {
         // Keep the sender alive so the above exercises the connected-empty path
         // (a dropped sender would make recv panic on Disconnected).
         drop(tx);
+    }
+
+    // Teardown regression tests on a real PTY (openpty, so no controlling tty
+    // is needed). Pane teardown may only signal the loop and hand off the Term;
+    // the loop thread hangs up, escalates, reaps and closes on its own.
+    #[cfg(unix)]
+    mod teardown {
+        use super::*;
+        use std::time::Duration;
+
+        use alacritty_terminal::event::VoidListener;
+        use alacritty_terminal::grid::Dimensions;
+        use alacritty_terminal::index::{Column, Line};
+        use alacritty_terminal::term::Config;
+        use alacritty_terminal::term::test::TermSize;
+
+        use crate::pane::{DropOffThread, PaneDefaults};
+
+        type TestTerm = Arc<FairMutex<Term<VoidListener>>>;
+
+        fn screen_text(term: &Term<VoidListener>) -> String {
+            let grid = term.grid();
+            let mut text = String::new();
+            for line in 0..grid.screen_lines() {
+                for col in 0..grid.columns() {
+                    text.push(grid[Line(line as i32)][Column(col)].c);
+                }
+            }
+            text
+        }
+
+        /// Run `sh -c script` under a spawned `EventLoop`, returning once the
+        /// script printed `ready` (so its setup, e.g. a trap, is in place).
+        fn spawn_ready(
+            script: &str,
+        ) -> (EventLoopSender, u32, DropOffThread<TestTerm>, JoinHandle<()>) {
+            let window_size =
+                WindowSize { num_lines: 24, num_cols: 80, cell_width: 8, cell_height: 16 };
+            let opts = tty::Options {
+                shell: Some(tty::Shell::new("/bin/sh".into(), vec!["-c".into(), script.into()])),
+                ..Default::default()
+            };
+            let pty = tty::new(&opts, window_size, 0).expect("open pty");
+            let child_pid = pty.child().id();
+            let term: TestTerm = Arc::new(FairMutex::new(Term::new(
+                Config::default(),
+                &TermSize::new(80, 24),
+                VoidListener,
+            )));
+            let hooks = PaneHooks {
+                clear_wipes_scrollback: Arc::new(AtomicBool::new(false)),
+                defaults: Arc::new(Mutex::new(PaneDefaults::default())),
+                child_pid,
+            };
+            let event_loop =
+                EventLoop::new(Arc::clone(&term), VoidListener, pty, false, false, hooks)
+                    .expect("create event loop");
+            let tx = event_loop.channel();
+            let thread = event_loop.spawn();
+
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !screen_text(&term.lock()).contains("ready") {
+                assert!(Instant::now() < deadline, "child never printed its ready marker");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            (tx, child_pid, DropOffThread::new(term), thread)
+        }
+
+        /// Tear down the way `Pane::drop` does (send Shutdown, drop the Term
+        /// handle) and check that returns at once; then wait for the child pid
+        /// to vanish (the loop thread reaps it, so not even a zombie is left)
+        /// and for the loop thread to end. Returns how long the child took.
+        fn teardown(
+            tx: EventLoopSender,
+            pid: u32,
+            term: DropOffThread<TestTerm>,
+            thread: JoinHandle<()>,
+        ) -> Duration {
+            let start = Instant::now();
+            let _ = tx.send(Msg::Shutdown);
+            drop(term);
+            let handoff = start.elapsed();
+            assert!(handoff < Duration::from_millis(200), "teardown blocked for {handoff:?}");
+
+            let deadline = start + SHUTDOWN_GRACE + Duration::from_secs(3);
+            let pid_gone = || {
+                let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+                rc == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            };
+            while !pid_gone() {
+                assert!(Instant::now() < deadline, "child {pid} still exists");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let gone = start.elapsed();
+            while !thread.is_finished() {
+                assert!(Instant::now() < deadline, "PTY loop thread never finished");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            thread.join().expect("PTY loop thread panicked");
+            gone
+        }
+
+        /// A child that ignores SIGHUP used to freeze the UI forever in
+        /// `Pty::drop`'s wait. Now the caller returns at once and the loop
+        /// SIGKILLs the child when the grace period runs out.
+        #[test]
+        #[ignore = "slow: waits out the 3 s SHUTDOWN_GRACE; run with \
+                    `cargo test -- --ignored shutdown_kills_child_that_ignores_sighup`"]
+        fn shutdown_kills_child_that_ignores_sighup() {
+            let (tx, pid, term, thread) =
+                spawn_ready("trap '' HUP; echo ready; while :; do sleep 1; done");
+            let gone = teardown(tx, pid, term, thread);
+            // It outlived the SIGHUP, so it was the SIGKILL that ended it.
+            assert!(
+                gone >= SHUTDOWN_GRACE - Duration::from_millis(50),
+                "child exited after {gone:?}, before the grace period ran out"
+            );
+        }
+
+        /// A child that exits on SIGHUP (the shell case) goes right away, without
+        /// waiting out the grace period.
+        #[test]
+        fn shutdown_hangs_up_child_promptly() {
+            let (tx, pid, term, thread) = spawn_ready("echo ready; while :; do sleep 1; done");
+            let gone = teardown(tx, pid, term, thread);
+            assert!(gone < SHUTDOWN_GRACE / 2, "child took {gone:?} to exit on SIGHUP");
+        }
     }
 }
