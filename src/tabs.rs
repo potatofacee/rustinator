@@ -7,6 +7,7 @@ use alacritty_terminal::term::Config as TermConfig;
 use egui;
 use winit::event_loop::EventLoopProxy;
 
+use crate::clipboard_read::{PasteRequest, Selection};
 use crate::config::{Config, SavedLayout, TerminalMeta};
 use crate::dialogs::DialogState;
 use crate::groups::{self, BroadcastScope};
@@ -379,6 +380,11 @@ pub(crate) struct TabManager {
     /// Latest pixels-per-point, used to convert point-space rects to physical
     /// pixels when clamping split sizes.
     pub ppp: f32,
+    /// Pastes asked for (`paste_from_clipboard`, `paste_primary`) and not yet
+    /// handed to the window's `PasteGate`, in request order. The selection is
+    /// read off the UI thread (`clipboard_read`), so a paste is a request
+    /// here and its text is sent when the read is done.
+    pub paste_requests: Vec<PasteRequest>,
 }
 
 impl TabManager {
@@ -391,6 +397,7 @@ impl TabManager {
             cell_w: 0.0,
             cell_h: 0.0,
             ppp: 1.0,
+            paste_requests: Vec::new(),
         }
     }
 
@@ -911,35 +918,26 @@ impl TabManager {
         }
     }
 
-    pub(crate) fn paste_from_clipboard(&self) {
-        let text = match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("clipboard read failed: {e}");
-                return;
-            }
-        };
-        // Route through the shared input-target selector under the current
-        // broadcast scope: `Off` -> focused pane only, `Group` -> the focused
-        // pane's group, `All` -> every non-read_only pane. read_only panes never
-        // receive pasted input.
-        for pane in self.active_tab().select_input_targets(self.broadcast_scope) {
-            pane.send_paste(&text);
-        }
+    /// Ask for a paste of the CLIPBOARD selection (`paste_requests`).
+    /// Its targets are the shared input-target selector's under the current
+    /// broadcast scope, taken now: `Off` -> focused pane only, `Group` -> the
+    /// focused pane's group, `All` -> every non-read_only pane. read_only
+    /// panes never receive pasted input.
+    pub(crate) fn paste_from_clipboard(&mut self) {
+        let targets = self.active_tab().select_input_targets(self.broadcast_scope);
+        let targets = targets.iter().map(|pane| pane.id).collect();
+        self.paste_requests.push(PasteRequest { selection: Selection::Clipboard, targets });
     }
 
     /// Middle-click paste of PRIMARY into `pane_id`'s broadcast targets:
     /// Terminator's `paste_clipboard` (terminal.py:1843-1847) pastes into
     /// `get_target_terms(self)`, the same fan-out as the keyboard Paste,
     /// measured from the clicked terminal. read_only panes never receive it.
-    pub(crate) fn paste_primary(&self, pane_id: PaneId) {
-        let text = match crate::pane_ui::read_primary() {
-            Some(t) => t,
-            None => return,
-        };
-        for pane in self.active_tab().input_targets_from(pane_id, self.broadcast_scope) {
-            pane.send_paste(&text);
-        }
+    /// Asked for like `paste_from_clipboard`.
+    pub(crate) fn paste_primary(&mut self, pane_id: PaneId) {
+        let targets = self.active_tab().input_targets_from(pane_id, self.broadcast_scope);
+        let targets = targets.iter().map(|pane| pane.id).collect();
+        self.paste_requests.push(PasteRequest { selection: Selection::Primary, targets });
     }
 
     /// Text dropped onto `pane_id` goes to its broadcast targets (Terminator

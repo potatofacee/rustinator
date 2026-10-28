@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex};
 use winit::keyboard::PhysicalKey;
 
 use crate::app_shared::{AppShared, ConfigDelta};
+use crate::clipboard_read::{self, PasteGate, PasteRead, Step};
 use crate::dialogs::{DialogAction, DialogState};
 use crate::font::{self, FontContext};
 use crate::gl_window::GlWindow;
@@ -201,6 +202,11 @@ pub(crate) struct AppWindow {
     /// cursor only blinks (and only arms its wake timer) while this is true.
     window_focused: bool,
     pub(crate) pending_raw_keys: Vec<RawTermKey>,
+    /// This window's keys and pastes in input order: `logic` moves
+    /// `pending_raw_keys` in, and keys behind a paste whose selection read is
+    /// still running wait there, so they reach the PTY after its text as they
+    /// did when the read blocked (`clipboard_read`).
+    pub(crate) paste_gate: PasteGate<RawTermKey>,
     /// The panes each held key's last press or repeat was sent to, by
     /// physical key, so its release reaches exactly those panes (for the
     /// kitty REPORT_EVENT_TYPES flag) — see `send_key_release`.
@@ -301,6 +307,7 @@ impl AppWindow {
             focus_regained: false,
             window_focused: true,
             pending_raw_keys: Vec::new(),
+            paste_gate: PasteGate::new(),
             key_press_targets: HashMap::new(),
         };
         window.apply_startup_layout(shared);
@@ -517,7 +524,7 @@ impl AppWindow {
     /// and VTE's scroll-on-keystroke jump follows it as after any key it did
     /// not scroll on. Returns whether bytes reached a PTY, and the panes the
     /// key itself was sent to.
-    fn run_key_builtin(&self, builtin: KeyBuiltin, rk: &RawTermKey, scroll_on_keystroke: bool) -> (bool, Vec<PaneId>) {
+    fn run_key_builtin(&mut self, builtin: KeyBuiltin, rk: &RawTermKey, scroll_on_keystroke: bool) -> (bool, Vec<PaneId>) {
         let scope = self.tab_mgr.broadcast_scope;
         let tab = self.tab_mgr.active_tab();
         match builtin {
@@ -535,12 +542,15 @@ impl AppWindow {
                 let sent = input::send_key(rk, &to_child, scroll_on_keystroke);
                 return (sent, to_child.iter().map(|pane| pane.id).collect());
             }
-            KeyBuiltin::PastePrimary => self.tab_mgr.paste_primary(tab.focused),
+            KeyBuiltin::PastePrimary => {
+                let focused = tab.focused;
+                self.tab_mgr.paste_primary(focused);
+            }
             KeyBuiltin::Copy => self.tab_mgr.copy_selection(&self.gl_window.egui_ctx),
             KeyBuiltin::PasteClipboard => self.tab_mgr.paste_from_clipboard(),
         }
         if scroll_on_keystroke {
-            for pane in tab.select_input_targets(scope) {
+            for pane in self.tab_mgr.active_tab().select_input_targets(scope) {
                 pane.scroll_to_bottom();
             }
         }
@@ -581,21 +591,71 @@ impl AppWindow {
         }
     }
 
-    /// The keys of a frame no pane gets presses from (a modal dialog or an
-    /// egui text field holds the keyboard): releases still complete presses
-    /// sent before, and every press here is recorded as consumed. Returns the
-    /// presses.
-    fn release_keys_only(&mut self, raw_keys: Vec<RawTermKey>) -> Vec<RawTermKey> {
-        let mut presses = Vec::with_capacity(raw_keys.len());
-        for rk in raw_keys {
-            if rk.is_press() {
-                self.record_key_press(&rk, Vec::new());
-                presses.push(rk);
-            } else {
-                self.send_key_release(&rk);
+    /// A key no pane gets presses from (a modal dialog or an egui text field
+    /// holds the keyboard): a release still completes a press sent before,
+    /// and a press is recorded as consumed. Returns the press.
+    fn release_key_only(&mut self, rk: RawTermKey) -> Option<RawTermKey> {
+        if rk.is_press() {
+            self.record_key_press(&rk, Vec::new());
+            Some(rk)
+        } else {
+            self.send_key_release(&rk);
+            None
+        }
+    }
+
+    /// The next key `paste_gate` releases, sending each finished paste ahead
+    /// of it; None when the gate is empty or holds at a paste still being read.
+    fn next_held_key(&mut self) -> Option<RawTermKey> {
+        loop {
+            match self.paste_gate.next()? {
+                Step::Key(rk) => return Some(rk),
+                Step::Paste { targets, text } => self.deliver_paste(&targets, text),
             }
         }
-        presses
+    }
+
+    /// Start the reads of the pastes asked for since the last call
+    /// (`TabManager::paste_requests`) and queue them in `paste_gate`:
+    /// `before_queued_keys` for the paste of the key routing just took, which
+    /// comes before the keys behind it, otherwise (a menu item, a
+    /// middle-click) after every key already queued. Reads are submitted in
+    /// request order, so the FIFO worker finishes them in that order too.
+    fn queue_paste_requests(&mut self, shared: &mut AppShared, before_queued_keys: bool) {
+        let requests = std::mem::take(&mut self.tab_mgr.paste_requests);
+        let reads: Vec<_> = requests
+            .into_iter()
+            .map(|req| {
+                let read = match shared.clipboard_reader.submit(req.selection) {
+                    Some(id) => PasteRead::Waiting(id),
+                    None => PasteRead::Done(clipboard_read::read_now(req.selection)),
+                };
+                (req.targets, read)
+            })
+            .collect();
+        if before_queued_keys {
+            for (targets, read) in reads.into_iter().rev() {
+                self.paste_gate.paste_before_queued(targets, read);
+            }
+        } else {
+            for (targets, read) in reads {
+                self.paste_gate.paste_after_queued(targets, read);
+            }
+        }
+    }
+
+    /// Send a finished paste to the panes it was asked for, those still open
+    /// and not read-only now; None (a failed or empty-handed read) sends
+    /// nothing.
+    fn deliver_paste(&self, targets: &[PaneId], text: Option<String>) {
+        let Some(text) = text else { return };
+        for tab in &self.tab_mgr.tabs {
+            for pane in tab.panes.values() {
+                if targets.contains(&pane.id) && !pane.read_only {
+                    pane.send_paste(&text);
+                }
+            }
+        }
     }
 
     /// Routes the 10 group/broadcast actions out of `execute_pane_actions`. Each
@@ -913,25 +973,31 @@ impl AppWindow {
                 egui_owns_keys = false;
             }
         }
+        // Keys reach the routing below through `paste_gate`, which holds the
+        // ones behind an unfinished paste for a later frame.
+        self.paste_gate.push_keys(std::mem::take(&mut self.pending_raw_keys));
         // A modal dialog holds the keyboard for as long as it is open
         // (Terminator's Gtk.Dialog MODAL), including the frame before its
         // field first draws and takes egui focus; its key events stay in
         // egui's input so the dialog itself still sees Escape.
         if self.tab_mgr.tabs.is_empty() || self.dialogs.modal_open() {
-            let raw_keys = std::mem::take(&mut self.pending_raw_keys);
-            self.release_keys_only(raw_keys);
+            while let Some(rk) = self.next_held_key() {
+                self.release_key_only(rk);
+            }
         } else if egui_owns_keys {
             // An in-window text field (search bar, tab label) has the keys.
             // Only the toplevel's own bindings still apply, as Terminator's
             // `Window.on_key_press` runs ahead of the focus widget.
-            let raw_keys = std::mem::take(&mut self.pending_raw_keys);
-            let raw_keys = self.release_keys_only(raw_keys);
-            let actions = input::process_window_keys(ctx, &shared.bindings, raw_keys);
+            let mut presses = Vec::new();
+            while let Some(rk) = self.next_held_key() {
+                presses.extend(self.release_key_only(rk));
+            }
+            let actions = input::process_window_keys(ctx, &shared.bindings, presses);
             self.execute_pane_actions(shared, ctx, actions);
         } else {
-            let raw_keys = std::mem::take(&mut self.pending_raw_keys);
-            self.route_raw_keys(shared, ctx, raw_keys);
+            self.route_raw_keys(shared, ctx);
         }
+        self.queue_paste_requests(shared, false);
     }
 
     /// True while an in-window text field is up and will hold egui keyboard
@@ -941,22 +1007,23 @@ impl AppWindow {
         self.dialogs.wants_text_input() || self.tab_bar.is_renaming()
     }
 
-    /// Route this frame's raw keys to bindings and PTYs one key at a time, in
-    /// arrival order. A binding runs before the next key is looked at, so a
-    /// key typed right after a focus-changing chord (split, tab switch,
-    /// Alt+arrow) reaches the pane focused *after* the chord — GTK delivers
-    /// each key event to the widget focused at that moment, and resolving the
-    /// targets once for the whole batch sent them to the previous pane.
+    /// Route the keys `paste_gate` releases to bindings and PTYs one key at a
+    /// time, in arrival order, stopping at a paste still being read: a paste
+    /// a key asks for goes out before the keys behind it. A binding runs
+    /// before the next key is looked at, so a key typed right after a
+    /// focus-changing chord (split, tab switch, Alt+arrow) reaches the pane
+    /// focused *after* the chord — GTK delivers each key event to the widget
+    /// focused at that moment, and resolving the targets once for the whole
+    /// batch sent them to the previous pane.
     ///
     /// Only a press (or repeat) is classified; a release goes where its press
     /// went (`send_key_release`), and a silent press (`RawTermKey::is_silent`:
     /// a bare modifier, a dead key) goes straight to the input targets for
     /// the kitty encoder, as neither can be a binding or a builtin.
-    fn route_raw_keys(&mut self, shared: &mut AppShared, ctx: &egui::Context, raw_keys: Vec<RawTermKey>) {
+    fn route_raw_keys(&mut self, shared: &mut AppShared, ctx: &egui::Context) {
         let scroll_on_keystroke = shared.user_config.active().scroll_on_keystroke;
         let mut sent_input = false;
-        let mut raw_keys = raw_keys.into_iter();
-        while let Some(rk) = raw_keys.next() {
+        while let Some(rk) = self.next_held_key() {
             // An earlier key may have closed the last tab (bug M1).
             if !can_process_more_actions(self.tab_mgr.tabs.len()) {
                 break;
@@ -988,13 +1055,16 @@ impl AppWindow {
                     self.record_key_press(&rk, Vec::new());
                     let text_field_before = self.text_field_open();
                     self.execute_pane_actions(shared, ctx, vec![action]);
+                    self.queue_paste_requests(shared, true);
                     // A dialog or text field the binding just opened owns the
                     // rest of the batch, exactly as the gate in `logic` would
                     // from the next frame on: no press reaches a PTY, while a
                     // release still goes where its press went (a key held
                     // across the chord, whose press was already sent).
                     if self.dialogs.modal_open() || (!text_field_before && self.text_field_open()) {
-                        self.release_keys_only(raw_keys.collect());
+                        while let Some(rk) = self.next_held_key() {
+                            self.release_key_only(rk);
+                        }
                         break;
                     }
                 }
@@ -1005,6 +1075,7 @@ impl AppWindow {
                         let (sent, ids) = self.run_key_builtin(builtin, &rk, scroll_on_keystroke);
                         sent_input |= sent;
                         self.record_key_press(&rk, ids);
+                        self.queue_paste_requests(shared, true);
                     }
                     None => {
                         let targets = tab.select_input_targets(self.tab_mgr.broadcast_scope);
@@ -1159,6 +1230,14 @@ impl AppWindow {
             if let Some((pane_id, name)) = self.pane_view.profile_switch_pending.take() {
                 self.switch_pane_profile(shared, pane_id, name);
             }
+        }
+
+        // A paste the context menu or a middle-click asked for comes after
+        // the keys already queued. One read inline (no worker) goes out now,
+        // unless an earlier paste still holds the queue.
+        self.queue_paste_requests(shared, false);
+        while let Some((targets, text)) = self.paste_gate.next_paste() {
+            self.deliver_paste(&targets, text);
         }
     }
 }

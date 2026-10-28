@@ -142,6 +142,26 @@ impl GlWindow {
         self.egui_winit.on_window_event(&self.window, event)
     }
 
+    /// `on_window_event` for a window whose keyboard the terminal owns unless
+    /// an egui text field has focus (the main and hotkey windows): a paste
+    /// chord is kept from egui-winit then, so it does not read the clipboard
+    /// for a paste nothing would use (`input::withhold_paste_chord_from_egui`).
+    /// The response is the one egui-winit gives that key when egui does not
+    /// want the keyboard. Both inputs are what egui-winit itself consults.
+    pub(crate) fn on_terminal_window_event(&mut self, event: &WindowEvent) -> egui_winit::EventResponse {
+        if let WindowEvent::KeyboardInput { event: key_event, .. } = event {
+            if crate::input::withhold_paste_chord_from_egui(
+                self.egui_winit.egui_input().modifiers,
+                &key_event.logical_key,
+                key_event.physical_key,
+                self.egui_ctx.egui_wants_keyboard_input(),
+            ) {
+                return egui_winit::EventResponse { consumed: false, repaint: true };
+            }
+        }
+        self.on_window_event(event)
+    }
+
     pub(crate) fn destroy(mut self, main_context: &PossiblyCurrentContext) {
         main_context.make_current(&self.gl_surface).ok();
         self.painter.destroy();

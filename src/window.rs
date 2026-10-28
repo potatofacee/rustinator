@@ -22,6 +22,19 @@ use crate::platform::{macos_activate_pid, macos_frontmost_pid, macos_order_windo
 pub enum UserEvent {
     Repaint,
     HotkeyTogglePressed,
+    /// A paste read finished on the clipboard-reader thread
+    /// (`clipboard_read::ClipboardReader`): its text, or None when there is
+    /// nothing to paste. Only the X11/Wayland builds run that thread.
+    #[cfg_attr(
+        not(any(
+            target_os = "linux",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd"
+        )),
+        allow(dead_code)
+    )]
+    ClipboardRead { id: u64, text: Option<String> },
 }
 
 struct PrefsWindowState {
@@ -512,6 +525,22 @@ impl ApplicationHandler<UserEvent> for WinitApp {
             UserEvent::Repaint => {
                 self.repaint_pending = true;
             }
+            UserEvent::ClipboardRead { id, text } => {
+                if let Some(win) = self.windows.values_mut().find(|w| w.paste_gate.waits_on(id)) {
+                    win.paste_gate.complete(id, text);
+                }
+                // The paste and the keys held behind it go out in the next
+                // `logic`, which runs in the hotkey dropdown's paint while it
+                // is up: a frame draining input, like a keystroke's.
+                self.repaint_pending = true;
+                match self.hotkey_window.as_mut().filter(|hk| hk.shown_at.is_some()) {
+                    Some(hk) => {
+                        hk.input_pending = true;
+                        hk.repaint_at = Some(Instant::now());
+                    }
+                    None => self.input_pending = true,
+                }
+            }
             UserEvent::HotkeyTogglePressed => {
                 if let Some(hk) = &mut self.hotkey_window {
                     if hk.shown_at.is_some() {
@@ -795,7 +824,7 @@ impl WinitApp {
             }
         }
 
-        let response = hk.gl_window.on_window_event(&event);
+        let response = hk.gl_window.on_terminal_window_event(&event);
         if response.repaint {
             hk.repaint_at = Some(Instant::now());
         }
@@ -965,7 +994,7 @@ impl WinitApp {
             _ => None,
         };
 
-        let response = win.gl_window.on_window_event(&event);
+        let response = win.gl_window.on_terminal_window_event(&event);
 
         if motion_repaint.unwrap_or(response.repaint) {
             self.repaint_pending = true;

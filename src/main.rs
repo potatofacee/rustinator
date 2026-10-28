@@ -1,5 +1,6 @@
 mod app_shared;
 mod app_window;
+mod clipboard_read;
 mod config;
 mod dialogs;
 mod font;

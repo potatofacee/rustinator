@@ -16,6 +16,7 @@ use alacritty_terminal::tty;
 use winit::event_loop::EventLoopProxy;
 
 use crate::app_window::FontView;
+use crate::clipboard_read::ClipboardReader;
 use crate::config::{self, Config};
 use crate::keybindings::BindingTable;
 use crate::pane::{PaneDefaults, PaneId};
@@ -64,6 +65,9 @@ pub(crate) struct AppShared {
     pub(crate) hotkey_changed: bool,
     pub(crate) cursor_blink_epoch: Instant,
     pub(crate) event_loop_proxy: EventLoopProxy<window::UserEvent>,
+    /// The paste reads' worker thread, one per process; each window's
+    /// `PasteGate` holds its keys behind the reads it asked for.
+    pub(crate) clipboard_reader: ClipboardReader,
     /// One process-wide `PaneId` source. Every new pane draws its id via
     /// `alloc_pane_id`, so two `TabManager`s that clone this `Arc` never collide.
     pub(crate) pane_id_alloc: Arc<AtomicU64>,
@@ -113,6 +117,7 @@ impl AppShared {
             preview_defaults: None,
             hotkey_changed: false,
             cursor_blink_epoch: Instant::now(),
+            clipboard_reader: ClipboardReader::new(event_loop_proxy.clone()),
             event_loop_proxy,
             pane_id_alloc,
         }
