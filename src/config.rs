@@ -540,9 +540,15 @@ impl Default for ScrollbackConfig {
     }
 }
 
+/// Scrollback cap ("infinite" included): every history line is allocated at
+/// full width (`columns * 24` bytes), and reflow/search walk all of it.
+pub const MAX_SCROLLBACK_LINES: usize = 200_000;
+
 impl ScrollbackConfig {
+    /// Lines of history the `Term` gets. Clamped here, not at deserialization,
+    /// so the user's file is left as written; every `Term` config reads this.
     pub fn effective_history(&self) -> usize {
-        if self.infinite { 1_000_000 } else { self.history }
+        if self.infinite { MAX_SCROLLBACK_LINES } else { self.history.min(MAX_SCROLLBACK_LINES) }
     }
 }
 
@@ -1278,7 +1284,32 @@ mod tests {
     #[test]
     fn effective_history_infinite() {
         let sc = ScrollbackConfig { history: 5000, infinite: true };
-        assert_eq!(sc.effective_history(), 1_000_000);
+        assert_eq!(sc.effective_history(), MAX_SCROLLBACK_LINES);
+    }
+
+    #[test]
+    fn effective_history_clamps_explicit_above_cap() {
+        let sc = ScrollbackConfig { history: MAX_SCROLLBACK_LINES + 1, infinite: false };
+        assert_eq!(sc.effective_history(), MAX_SCROLLBACK_LINES);
+        let sc = ScrollbackConfig { history: 5_000_000, infinite: false };
+        assert_eq!(sc.effective_history(), MAX_SCROLLBACK_LINES);
+    }
+
+    #[test]
+    fn effective_history_at_cap_unchanged() {
+        let sc = ScrollbackConfig { history: MAX_SCROLLBACK_LINES, infinite: false };
+        assert_eq!(sc.effective_history(), MAX_SCROLLBACK_LINES);
+    }
+
+    #[test]
+    fn effective_history_clamp_does_not_rewrite_config() {
+        let toml_src = "[scrollback]\nhistory = 5000000\n";
+        let mut cfg: Config = toml::from_str(toml_src).unwrap();
+        cfg.migrate_legacy();
+        cfg.ensure_consistent();
+        let p = cfg.active();
+        assert_eq!(p.scrollback.history, 5_000_000);
+        assert_eq!(p.scrollback.effective_history(), MAX_SCROLLBACK_LINES);
     }
 
     // ---- parse_hex edge cases ----

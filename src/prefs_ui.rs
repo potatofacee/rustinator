@@ -509,13 +509,16 @@ fn profile_tab_colors(
 fn profile_tab_behavior(ui: &mut egui::Ui, profile: &mut config::Profile) {
     ui.add_space(8.0);
     ui.label(egui::RichText::new("Scrolling").strong());
-    ui.checkbox(&mut profile.scrollback.infinite, "Infinite scrollback");
+    ui.checkbox(&mut profile.scrollback.infinite, "Infinite scrollback").on_hover_text(format!(
+        "Keeps up to {} lines of history.",
+        group_thousands(config::MAX_SCROLLBACK_LINES)
+    ));
     if !profile.scrollback.infinite {
         ui.horizontal(|ui| {
             ui.label("History (lines)");
             ui.add(
                 egui::DragValue::new(&mut profile.scrollback.history)
-                    .range(100..=1_000_000)
+                    .range(100..=config::MAX_SCROLLBACK_LINES)
                     .speed(100.0),
             );
         });
@@ -581,6 +584,19 @@ fn profile_tab_behavior(ui: &mut egui::Ui, profile: &mut config::Profile) {
     ui.label(egui::RichText::new("Compatibility").strong());
     erase_binding_combo(ui, "backspace_binding", "Backspace key generates", &mut profile.backspace_binding);
     erase_binding_combo(ui, "delete_binding", "Delete key generates", &mut profile.delete_binding);
+}
+
+/// `200000` -> `"200,000"`, for line counts shown in tooltips.
+fn group_thousands(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Terminator's "Backspace/Delete key generates" combobox
@@ -891,5 +907,14 @@ mod tests {
         );
         assert_eq!(cfg.active_profile, "A");
         assert_eq!(selected, 0);
+    }
+
+    #[test]
+    fn group_thousands_inserts_commas() {
+        assert_eq!(group_thousands(0), "0");
+        assert_eq!(group_thousands(999), "999");
+        assert_eq!(group_thousands(1_000), "1,000");
+        assert_eq!(group_thousands(200_000), "200,000");
+        assert_eq!(group_thousands(1_000_000), "1,000,000");
     }
 }
