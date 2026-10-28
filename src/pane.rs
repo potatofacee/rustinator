@@ -352,6 +352,31 @@ impl EventProxy {
     }
 }
 
+/// Publish whether a pane is on screen. Returns true when it just became
+/// visible with output its PTY thread skipped waking for (it saw `visible`
+/// false), so the caller must schedule the repaint that wake would have.
+///
+/// Store-buffer pair with `send_event(Wakeup)`: the PTY thread swaps
+/// `wake_pending` then loads `visible`; this swaps `visible` then loads
+/// `wake_pending`. All four are SeqCst, so they sit in one total order: if our
+/// swap precedes the PTY load, that load sees `visible == true` and wakes;
+/// otherwise the PTY swap (sequenced before its load) precedes our load, which
+/// then sees `wake_pending` and we wake. With Acquire/Release both loads may
+/// read stale values and the wake is lost. `dirty` additionally catches a pane
+/// marked dirty by the main thread but never snapshotted while hidden; the
+/// no-lost-wake guarantee rests on `wake_pending` alone.
+pub(crate) fn mark_visible(
+    visible: &AtomicBool,
+    wake_pending: &AtomicBool,
+    dirty: &AtomicBool,
+    now_visible: bool,
+) -> bool {
+    let was_visible = visible.swap(now_visible, Ordering::SeqCst);
+    now_visible
+        && !was_visible
+        && (wake_pending.load(Ordering::SeqCst) || dirty.load(Ordering::Acquire))
+}
+
 impl EventListener for EventProxy {
     fn send_event(&self, event: Event) {
         match event {
@@ -361,9 +386,9 @@ impl EventListener for EventProxy {
                 // Coalesce wakes: skip the winit user event if one is already
                 // in flight for this pane. Only wake the loop for visible
                 // panes — background panes stay dirty and repaint when their
-                // tab is next shown.
-                if !self.wake_pending.swap(true, Ordering::AcqRel)
-                    && self.visible.load(Ordering::Acquire)
+                // tab is next shown. SeqCst pairs with `mark_visible`; see there.
+                if !self.wake_pending.swap(true, Ordering::SeqCst)
+                    && self.visible.load(Ordering::SeqCst)
                 {
                     self.wake();
                 }
@@ -1299,6 +1324,11 @@ impl Pane {
         *self.terminal.lock().mode()
     }
 
+    /// See `mark_visible`: true when the pane needs a repaint it never got.
+    pub fn set_visible(&self, visible: bool) -> bool {
+        mark_visible(&self.visible, &self.wake_pending, &self.dirty, visible)
+    }
+
     pub fn send_focus_event(&self, focused: bool) {
         if let Some(bytes) = crate::input::focus_event_bytes(self.mode(), focused) {
             self.send_bytes(bytes);
@@ -2072,6 +2102,50 @@ mod tests {
         assert!(
             proxy.wake_pending.load(Ordering::Acquire),
             "Wakeup after a frame re-arms wake_pending"
+        );
+    }
+
+    #[test]
+    fn mark_visible_repaints_only_on_show_with_pending_output() {
+        // (visible, wake_pending, dirty) before -> (now_visible, needs repaint)
+        let flags = |v, w, d| (AtomicBool::new(v), AtomicBool::new(w), AtomicBool::new(d));
+
+        // Hidden -> visible with output the PTY thread skipped waking for:
+        // armed latch (output after the snapshot), or dirty alone.
+        for (w, d) in [(true, true), (true, false), (false, true)] {
+            let (v, wp, dt) = flags(false, w, d);
+            assert!(mark_visible(&v, &wp, &dt, true), "show with output ({w}, {d}) repaints");
+            assert!(v.load(Ordering::SeqCst), "show publishes visible");
+        }
+
+        // Hidden -> visible, nothing undelivered: the frame already has it.
+        let (v, wp, dt) = flags(false, false, false);
+        assert!(!mark_visible(&v, &wp, &dt, true), "show without output: no repaint");
+        assert!(v.load(Ordering::SeqCst));
+
+        // Visible -> visible: the PTY thread saw visible and woke itself.
+        let (v, wp, dt) = flags(true, true, true);
+        assert!(!mark_visible(&v, &wp, &dt, true), "stay visible: no repaint");
+
+        // Visible -> hidden (and hidden -> hidden): background panes never wake.
+        for was in [true, false] {
+            let (v, wp, dt) = flags(was, true, true);
+            assert!(!mark_visible(&v, &wp, &dt, false), "hide: no repaint");
+            assert!(!v.load(Ordering::SeqCst), "hide publishes hidden");
+        }
+
+        // Background output after hiding still skips the wake (latch armed,
+        // nothing sent: wake() is a no-op without a proxy, so check the latch
+        // and that showing then reports it).
+        let proxy = EventProxy::new(None, test_window_size());
+        proxy.wake_pending.store(false, Ordering::SeqCst);
+        mark_visible(&proxy.visible, &proxy.wake_pending, &proxy.dirty, false);
+        proxy.dirty.store(false, Ordering::SeqCst);
+        proxy.send_event(Event::Wakeup);
+        assert!(proxy.wake_pending.load(Ordering::SeqCst), "hidden Wakeup arms latch");
+        assert!(
+            mark_visible(&proxy.visible, &proxy.wake_pending, &proxy.dirty, true),
+            "showing a pane with skipped output repaints"
         );
     }
 

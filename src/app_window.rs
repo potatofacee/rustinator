@@ -939,15 +939,6 @@ impl AppWindow {
                 }
             }
         }
-        // Mark which panes are visible (active tab) so their PTY threads know
-        // whether to wake the event loop on output.
-        let active_tab = self.tab_mgr.active_tab;
-        for (idx, tab) in self.tab_mgr.tabs.iter().enumerate() {
-            let visible = idx == active_tab;
-            for pane in tab.panes.values() {
-                pane.visible.store(visible, std::sync::atomic::Ordering::Release);
-            }
-        }
         if shared.user_config.active().scroll_on_output {
             if let Some(tab) = self.tab_mgr.tabs.get(self.tab_mgr.active_tab) {
                 for pane in tab.panes.values() {
@@ -1238,6 +1229,28 @@ impl AppWindow {
         self.queue_paste_requests(shared, false);
         while let Some((targets, text)) = self.paste_gate.next_paste() {
             self.deliver_paste(&targets, text);
+        }
+        self.sync_pane_visibility(shared);
+    }
+
+    /// Mark which panes are visible (active tab) so their PTY threads know
+    /// whether to wake the event loop on output. Runs last in `ui`, after
+    /// every in-frame `active_tab` change (key bindings in `logic`, tab-bar
+    /// events, deferred pane actions), and `ui` runs in both the main and the
+    /// hotkey paint, whereas `logic` is skipped in the main one while the
+    /// dropdown is up. A newly shown pane whose output arrived while it was
+    /// still marked hidden gets the Repaint its PTY thread skipped.
+    fn sync_pane_visibility(&self, shared: &AppShared) {
+        let active_tab = self.tab_mgr.active_tab;
+        let mut needs_repaint = false;
+        for (idx, tab) in self.tab_mgr.tabs.iter().enumerate() {
+            let visible = idx == active_tab;
+            for pane in tab.panes.values() {
+                needs_repaint |= pane.set_visible(visible);
+            }
+        }
+        if needs_repaint {
+            shared.wake_main();
         }
     }
 }
