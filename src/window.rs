@@ -108,6 +108,9 @@ struct HotkeyWindowState {
     // When this window last painted; used by about_to_wait to cap its repaint
     // cadence to frame_interval.
     last_paint: Option<Instant>,
+    // Discrete input arrived since the last paint; its frame skips the
+    // render-cost stretch (see `effective_interval`).
+    input_pending: bool,
 }
 
 impl HotkeyWindowState {
@@ -149,6 +152,7 @@ impl HotkeyWindowState {
             shown_at: None,
             repaint_at: None,
             last_paint: None,
+            input_pending: false,
         }
     }
 
@@ -166,6 +170,7 @@ impl HotkeyWindowState {
         shared: &mut AppShared,
         main_context: &glutin::context::PossiblyCurrentContext,
     ) {
+        self.input_pending = false;
         let raw_input = self.gl_window.begin_frame(main_context);
         // Sampled before egui's pass, for the same reason as the main paint.
         let egui_owns_keys = self.gl_window.egui_ctx.egui_wants_keyboard_input();
@@ -298,6 +303,45 @@ fn governor_next_wake(
     }
 }
 
+/// Governed interval is stretched to this multiple of the last frame's render
+/// cost, capping rendering at roughly a third of a core under software GL.
+const PAINT_DUTY_FACTOR: u32 = 3;
+/// Most the render-cost stretch may add: one pathological frame (a swap stuck
+/// on a slow X server) must not hold the next frame, and the input it drains,
+/// for seconds.
+const MAX_PAINT_STRETCH: Duration = Duration::from_millis(250);
+
+/// The governed interval: `base`, stretched by the last frame's render cost
+/// (capped at `MAX_PAINT_STRETCH`), never below `base`. A frame carrying
+/// discrete input (`input_pending`) gets only `base`, since input is drained
+/// to the PTY inside the paint and the stretch would delay keystrokes. On a
+/// real GPU a frame costs ~1ms and `base` always wins.
+fn effective_interval(
+    base: Duration,
+    render_cost: Option<Duration>,
+    input_pending: bool,
+) -> Duration {
+    match render_cost {
+        Some(cost) if !input_pending => {
+            base.max((cost * PAINT_DUTY_FACTOR).min(MAX_PAINT_STRETCH))
+        }
+        _ => base,
+    }
+}
+
+/// Discrete user input (keystroke, IME commit, button press/release, wheel
+/// step) whose frame bypasses the render-cost stretch. Pointer motion is
+/// excluded: it streams continuously and must stay governed.
+fn is_discrete_input(event: &WindowEvent) -> bool {
+    matches!(
+        event,
+        WindowEvent::KeyboardInput { is_synthetic: false, .. }
+            | WindowEvent::Ime(winit::event::Ime::Commit(_))
+            | WindowEvent::MouseInput { .. }
+            | WindowEvent::MouseWheel { .. }
+    )
+}
+
 /// True when pointer motion at `pos` (egui points) cannot change anything
 /// visible: no button held (no selection/divider/tab drag), Ctrl not held (no
 /// URL hover underline), no egui overlay (menu, dialog, tooltip) under the
@@ -351,10 +395,15 @@ struct WinitApp {
     // Deadline egui asked for via repaint_delay (cursor blink etc). Folded
     // into the control flow in about_to_wait; never set on the loop directly.
     egui_repaint_at: Option<Instant>,
-    // Wall-clock cost of the last main-window paint. Stretches the governed
+    // Wall-clock cost of the last main-window render (end_frame: tessellate,
+    // paint incl. the panes' GL callbacks, swap). Stretches the governed
     // interval so a software rasterizer (llvmpipe over VNC) can't saturate a
-    // core no matter how slow frames are.
-    last_paint_cost: Option<Duration>,
+    // core. App work in logic/ui is excluded: one-off stalls there (clipboard
+    // reads, spawns, reflow) are not a per-frame cost.
+    last_render_cost: Option<Duration>,
+    // Discrete input reached the main window since its last paint; that
+    // frame skips the render-cost stretch (see `effective_interval`).
+    input_pending: bool,
     // Main window focus. Unfocused (and no hotkey dropdown shown) repaints
     // run at a reduced rate.
     main_focused: bool,
@@ -390,7 +439,8 @@ impl WinitApp {
             last_frame: None,
             frame_interval: Duration::from_micros(16_667), // ~60 fps
             egui_repaint_at: None,
-            last_paint_cost: None,
+            last_render_cost: None,
+            input_pending: false,
             main_focused: true,
             last_cursor_pos: None,
             cursor_in_quiet_rect: false,
@@ -533,7 +583,10 @@ impl ApplicationHandler<UserEvent> for WinitApp {
             return;
         }
         let now = Instant::now();
-        let interval = self.effective_frame_interval();
+        let interval = self.effective_frame_interval(self.input_pending);
+        let hotkey_interval = self.effective_frame_interval(
+            self.hotkey_window.as_ref().is_some_and(|hk| hk.input_pending),
+        );
 
         // Frame governor: sole authority for main-window redraws. Every repaint
         // source (PTY output, input events, egui animations, due deadlines) sets
@@ -568,11 +621,13 @@ impl ApplicationHandler<UserEvent> for WinitApp {
 
         // Hotkey window: its egui deadline, capped to the same cadence as the
         // main window so a continuous animation can't repaint at swap rate.
+        // Its own input flag decides the stretch bypass: it drains the keys
+        // typed into it in its own paint.
         if let Some(hk) = &mut self.hotkey_window {
             if hk.shown_at.is_some() {
                 if let Some(at) = hk.repaint_at {
                     let due = match hk.last_paint {
-                        Some(last) => at.max(last + interval),
+                        Some(last) => at.max(last + hotkey_interval),
                         None => at,
                     };
                     if due <= now {
@@ -679,6 +734,10 @@ impl WinitApp {
 
         if let WindowEvent::ModifiersChanged(mods) = &event {
             hk.current_modifiers = *mods;
+        }
+
+        if is_discrete_input(&event) {
+            hk.input_pending = true;
         }
 
         // `is_synthetic: false` — on X11 winit replays every physically held
@@ -838,6 +897,10 @@ impl WinitApp {
             }
         }
 
+        if is_discrete_input(&event) {
+            self.input_pending = true;
+        }
+
         // Synthetic focus-in replays are not keystrokes (see the hotkey site).
         if let WindowEvent::KeyboardInput { event: key_event, is_synthetic: false, .. } = &event {
             win.pending_raw_keys.push(encode_raw_key(key_event, self.current_modifiers));
@@ -986,29 +1049,22 @@ impl WinitApp {
     }
 
     // Governed frame interval for this moment: base cadence, slowed when the
-    // app is unfocused (nobody is watching closely), stretched by the last
-    // paint's cost so rendering is capped at roughly a third of a core when
-    // the GL stack rasterizes in software. On a real GPU a frame costs ~1ms
-    // and the base interval always wins.
-    fn effective_frame_interval(&self) -> Duration {
+    // app is unfocused (nobody is watching closely), then stretched by the
+    // last render's cost unless `input_pending` (see `effective_interval`).
+    fn effective_frame_interval(&self, input_pending: bool) -> Duration {
         const UNFOCUSED_INTERVAL: Duration = Duration::from_millis(100);
-        const PAINT_DUTY_FACTOR: u32 = 3;
         let active = self.main_focused
             || self.hotkey_window.as_ref().is_some_and(|hk| hk.shown_at.is_some());
         let base = if active { self.frame_interval } else { UNFOCUSED_INTERVAL };
-        match self.last_paint_cost {
-            Some(cost) => base.max(cost * PAINT_DUTY_FACTOR),
-            None => base,
-        }
+        effective_interval(base, self.last_render_cost, input_pending)
     }
 
     fn paint(&mut self, event_loop: &ActiveEventLoop) {
-        let paint_started = Instant::now();
-
         // This frame satisfies any pending repaint. Clearing here (not before)
         // lets work that arrives mid-paint re-arm the flag so the governor
-        // schedules the next frame.
+        // schedules the next frame. Likewise this frame drains pending input.
         self.repaint_pending = false;
+        self.input_pending = false;
 
         // Begin frame on the primary GlWindow (make-current + take input, the
         // same flow the prefs/hotkey windows use), then run logic+ui into the
@@ -1077,6 +1133,9 @@ impl WinitApp {
         // End frame on the primary GlWindow: handle_platform_output + tessellate
         // + clear + paint + swap. Its repaint deadline is already folded in by
         // apply_viewport_commands, so the returned value is intentionally unused.
+        // Only this section is timed as the render cost: the panes' GL draws
+        // are egui PaintCallbacks, which run inside end_frame's paint.
+        let render_started = Instant::now();
         {
             let gl = self.gl.as_ref().unwrap();
             let win = self
@@ -1088,7 +1147,7 @@ impl WinitApp {
 
         let paint_ended = Instant::now();
         self.last_frame = Some(paint_ended);
-        self.last_paint_cost = Some(paint_ended - paint_started);
+        self.last_render_cost = Some(paint_ended - render_started);
 
         self.manage_prefs_lifecycle(event_loop);
     }
@@ -1354,5 +1413,76 @@ mod tests {
         assert_eq!(d.next_wake, Some(egui_at));
         // The egui deadline is still in the future, so it is preserved.
         assert_eq!(d.egui_repaint_at, Some(egui_at));
+    }
+
+    const BASE: Duration = Duration::from_micros(16_667);
+    const UNFOCUSED: Duration = Duration::from_millis(100);
+
+    #[test]
+    fn interval_stretches_by_render_cost() {
+        // No render measured yet, or a GPU-fast render: base wins.
+        assert_eq!(effective_interval(BASE, None, false), BASE);
+        assert_eq!(effective_interval(BASE, Some(Duration::from_millis(1)), false), BASE);
+        // A 20ms software-GL render stretches to 3x its cost.
+        let d = effective_interval(BASE, Some(Duration::from_millis(20)), false);
+        assert_eq!(d, Duration::from_millis(60));
+    }
+
+    #[test]
+    fn interval_stretch_is_capped() {
+        // A 1.5s stuck swap must not hold the next frame for 4.5s.
+        let d = effective_interval(BASE, Some(Duration::from_millis(1500)), false);
+        assert_eq!(d, MAX_PAINT_STRETCH);
+        // Just under the cap is still the plain multiple.
+        let d = effective_interval(BASE, Some(Duration::from_millis(80)), false);
+        assert_eq!(d, Duration::from_millis(240));
+    }
+
+    #[test]
+    fn interval_input_bypasses_stretch() {
+        // A frame carrying discrete input waits only the base cadence, however
+        // slow the last render was.
+        let d = effective_interval(BASE, Some(Duration::from_millis(1500)), true);
+        assert_eq!(d, BASE);
+        let d = effective_interval(BASE, Some(Duration::from_millis(20)), true);
+        assert_eq!(d, BASE);
+    }
+
+    #[test]
+    fn interval_unfocused_base_still_applies() {
+        // The unfocused base is a floor: neither a cheap render, the input
+        // bypass, nor a cap below it can shorten it.
+        assert_eq!(effective_interval(UNFOCUSED, Some(Duration::from_millis(5)), false), UNFOCUSED);
+        assert_eq!(effective_interval(UNFOCUSED, Some(Duration::from_millis(1500)), true), UNFOCUSED);
+        let above_cap = MAX_PAINT_STRETCH * 2;
+        assert_eq!(effective_interval(above_cap, Some(Duration::from_secs(2)), false), above_cap);
+        // A render costlier than a third of the base still stretches it.
+        let d = effective_interval(UNFOCUSED, Some(Duration::from_millis(50)), false);
+        assert_eq!(d, Duration::from_millis(150));
+    }
+
+    #[test]
+    fn discrete_input_excludes_pointer_motion() {
+        use winit::event::{DeviceId, ElementState, MouseButton, MouseScrollDelta, TouchPhase};
+        let device_id = DeviceId::dummy();
+        for state in [ElementState::Pressed, ElementState::Released] {
+            let ev = WindowEvent::MouseInput { device_id, state, button: MouseButton::Left };
+            assert!(is_discrete_input(&ev));
+        }
+        let wheel = WindowEvent::MouseWheel {
+            device_id,
+            delta: MouseScrollDelta::LineDelta(0.0, 1.0),
+            phase: TouchPhase::Moved,
+        };
+        assert!(is_discrete_input(&wheel));
+        assert!(is_discrete_input(&WindowEvent::Ime(winit::event::Ime::Commit("x".into()))));
+        // Preedit is composition in progress, not a commit.
+        let preedit = WindowEvent::Ime(winit::event::Ime::Preedit("x".into(), None));
+        assert!(!is_discrete_input(&preedit));
+        let motion = WindowEvent::CursorMoved {
+            device_id,
+            position: winit::dpi::PhysicalPosition::new(1.0, 1.0),
+        };
+        assert!(!is_discrete_input(&motion));
     }
 }
