@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
-use crate::pty_event_loop::{EventLoop, EventLoopSender, Msg, PaneHooks};
+use crate::pty_event_loop::{EventLoop, EventLoopSender, LoopChannel, Msg, PaneHooks};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Boundary, Column, Direction as GridDir, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
@@ -960,11 +960,55 @@ fn scrub_foreign_term_vars(env: &mut std::collections::HashMap<String, String>) 
     }
 }
 
+/// Spawn the pane's child and start its PTY event loop on a worker thread,
+/// never the caller's. `tty::new` forks and std's `Command::spawn` then waits
+/// for the child to exec, and the child first chdirs into
+/// `opts.working_directory`: a cwd inherited from another pane (or `$HOME`)
+/// on a stalled NFS/FUSE/sshfs mount blocks that chdir, and so the spawn, for
+/// as long as the mount is stuck. Until the loop starts, whatever the pane
+/// sends waits in `channel`, in order (see `LoopChannel`); `child_pid` is set
+/// once the child exists. A failed spawn is logged and ends the pane the way a
+/// child exit does (`Term::exit`), with `spawn_failed` set first so the reaper
+/// closes it, as a failed spawn used to leave no pane at all.
+fn spawn_pty<U: EventListener + Send + 'static>(
+    opts: tty::Options,
+    window_size: WindowSize,
+    window_id: u64,
+    terminal: Arc<FairMutex<Term<U>>>,
+    event_proxy: U,
+    channel: LoopChannel,
+    clear_wipes_scrollback: Arc<AtomicBool>,
+    defaults: Arc<Mutex<PaneDefaults>>,
+    child_pid: Arc<OnceLock<u32>>,
+    spawn_failed: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    alacritty_terminal::thread::spawn_named("PTY spawn", move || {
+        let pty = match tty::new(&opts, window_size, window_id) {
+            Ok(pty) => pty,
+            Err(e) => {
+                eprintln!("failed to spawn pane: failed to open pty: {e}");
+                spawn_failed.store(true, Ordering::Release);
+                terminal.lock().exit();
+                return;
+            }
+        };
+        let pid = pty.child().id();
+        let _ = child_pid.set(pid);
+        let hooks = PaneHooks { clear_wipes_scrollback, defaults, child_pid: pid };
+        let event_loop = EventLoop::new(channel, terminal, event_proxy, pty, false, false, hooks);
+        // Detached, as in alacritty: the thread tears down its own Pty.
+        let _ = event_loop.spawn();
+    })
+}
+
 pub struct Pane {
     pub id: PaneId,
     pub terminal: TermHandle,
     pub pty_tx: EventLoopSender,
-    pub child_pid: u32,
+    /// Set by the spawn worker once the child exists (see `spawn_pty`).
+    pub child_pid: Arc<OnceLock<u32>>,
+    /// Set by the spawn worker when the child could not be spawned.
+    spawn_failed: Arc<AtomicBool>,
     pub cols: usize,
     pub lines: usize,
     pub dirty: Arc<AtomicBool>,
@@ -1064,34 +1108,33 @@ impl Pane {
         crate::shell_integration::inject_env(&mut pty_opts.env);
         ensure_utf8_locale(&mut pty_opts.env);
         pty_opts.working_directory = resolve_working_dir(working_dir);
-        let pty = tty::new(&pty_opts, window_size, id)
-            .map_err(|e| format!("failed to open pty: {e}"))?;
-        let child_pid = pty.child().id();
         let clear_wipes_scrollback = Arc::new(AtomicBool::new(defaults.clear_wipes_scrollback));
         let shared_defaults = Arc::new(Mutex::new(defaults));
-        let event_loop = EventLoop::new(
+        let channel = LoopChannel::new()
+            .map_err(|e| format!("failed to create pty event loop: {e}"))?;
+        let pty_tx = channel.sender();
+        *pty_writer.lock().unwrap() = Some(pty_tx.clone());
+        let child_pid = Arc::new(OnceLock::new());
+        let spawn_failed = Arc::new(AtomicBool::new(false));
+        let _ = spawn_pty(
+            pty_opts,
+            window_size,
+            id,
             Arc::clone(&terminal),
             proxy,
-            pty,
-            false,
-            false,
-            PaneHooks {
-                clear_wipes_scrollback: Arc::clone(&clear_wipes_scrollback),
-                defaults: Arc::clone(&shared_defaults),
-                child_pid,
-            },
-        )
-        .map_err(|e| format!("failed to create pty event loop: {e}"))?;
-        let pty_tx = event_loop.channel();
-        *pty_writer.lock().unwrap() = Some(pty_tx.clone());
-        // Detached, as in alacritty: the thread tears down its own Pty.
-        let _ = event_loop.spawn();
+            channel,
+            Arc::clone(&clear_wipes_scrollback),
+            Arc::clone(&shared_defaults),
+            Arc::clone(&child_pid),
+            Arc::clone(&spawn_failed),
+        );
 
         Ok(Self {
             id,
             terminal: TermHandle::new(terminal),
             pty_tx,
             child_pid,
+            spawn_failed,
             cols,
             lines,
             dirty,
@@ -1169,29 +1212,29 @@ impl Pane {
         // this a Dock-launched .app respawns the shell at `/` instead of $HOME.
         // (M11)
         pty_opts.working_directory = resolve_working_dir(None);
-        let pty = tty::new(&pty_opts, window_size, self.id)
-            .map_err(|e| format!("failed to open pty: {e}"))?;
-        let child_pid = pty.child().id();
-        let event_loop = EventLoop::new(
+        let channel = LoopChannel::new()
+            .map_err(|e| format!("failed to create pty event loop: {e}"))?;
+        let pty_tx = channel.sender();
+        *pty_writer.lock().unwrap() = Some(pty_tx.clone());
+        let child_pid = Arc::new(OnceLock::new());
+        let spawn_failed = Arc::new(AtomicBool::new(false));
+        let _ = spawn_pty(
+            pty_opts,
+            window_size,
+            self.id,
             Arc::clone(&terminal),
             proxy,
-            pty,
-            false,
-            false,
-            PaneHooks {
-                clear_wipes_scrollback: Arc::clone(&self.clear_wipes_scrollback),
-                defaults: Arc::clone(&self.shared_defaults),
-                child_pid,
-            },
-        )
-        .map_err(|e| format!("failed to create pty event loop: {e}"))?;
-        let pty_tx = event_loop.channel();
-        *pty_writer.lock().unwrap() = Some(pty_tx.clone());
-        let _ = event_loop.spawn();
+            channel,
+            Arc::clone(&self.clear_wipes_scrollback),
+            Arc::clone(&self.shared_defaults),
+            Arc::clone(&child_pid),
+            Arc::clone(&spawn_failed),
+        );
 
         self.terminal = TermHandle::new(terminal);
         self.pty_tx = pty_tx;
         self.child_pid = child_pid;
+        self.spawn_failed = spawn_failed;
         self.dirty = dirty;
         self.wake_pending = wake_pending;
         self.has_new_output = has_new_output;
@@ -1218,6 +1261,11 @@ impl Pane {
         self.dead.set(true);
     }
 
+    /// Whether the child could not be spawned. Meaningful once `exited` fires.
+    pub fn spawn_failed(&self) -> bool {
+        self.spawn_failed.load(Ordering::Acquire)
+    }
+
     /// Apply updated terminal options (scrollback history, semantic escape
     /// chars, etc.) to the live `Term`. `Term::set_options` replaces the config
     /// and calls `grid.update_history`, so scrollback changes take effect on
@@ -1234,8 +1282,10 @@ impl Pane {
         self.title.lock().unwrap().clone()
     }
 
+    /// None until the child exists: a pane still spawning has no cwd to
+    /// inherit, so a split from it starts in `$HOME`.
     pub fn cwd(&self) -> Option<std::path::PathBuf> {
-        pane_cwd(self.child_pid)
+        self.child_pid.get().and_then(|&pid| pane_cwd(pid))
     }
 
     pub fn resize(&mut self, cols: usize, lines: usize, cell_w: f32, cell_h: f32) {
@@ -3186,5 +3236,147 @@ mod tests {
             opts.shell,
             Some(tty::Shell::new(shell, vec!["-c".into(), "ls".into()])),
         );
+    }
+
+    // `spawn_pty` on a real PTY (openpty, so no controlling tty is needed):
+    // what a pane sends before its child exists must reach the child in order,
+    // and a failed spawn must end the pane like a child exit.
+    #[cfg(unix)]
+    mod spawn_pty {
+        use super::*;
+        use std::borrow::Cow;
+        use std::time::{Duration, Instant};
+
+        use alacritty_terminal::term::test::TermSize;
+
+        /// Records `Event::Exit`, the event a pane's reaper acts on.
+        #[derive(Clone, Default)]
+        struct ExitFlag(Arc<AtomicBool>);
+
+        impl EventListener for ExitFlag {
+            fn send_event(&self, event: Event) {
+                if matches!(event, Event::Exit) {
+                    self.0.store(true, Ordering::Release);
+                }
+            }
+        }
+
+        struct Spawned {
+            tx: EventLoopSender,
+            term: Arc<FairMutex<Term<ExitFlag>>>,
+            exited: ExitFlag,
+            child_pid: Arc<OnceLock<u32>>,
+            spawn_failed: Arc<AtomicBool>,
+            worker: std::thread::JoinHandle<()>,
+        }
+
+        /// Run `program args` through `spawn_pty` in `cwd`, after `queued`
+        /// was sent on the pane's sender (so before the child can exist).
+        fn spawn(program: &str, args: &[&str], cwd: Option<&std::path::Path>, queued: Vec<Msg>) -> Spawned {
+            let window_size =
+                WindowSize { num_lines: 24, num_cols: 80, cell_width: 8, cell_height: 16 };
+            let opts = tty::Options {
+                shell: Some(tty::Shell::new(program.into(), args.iter().map(|a| a.to_string()).collect())),
+                working_directory: cwd.map(std::path::Path::to_path_buf),
+                ..Default::default()
+            };
+            let channel = LoopChannel::new().expect("create loop channel");
+            let tx = channel.sender();
+            for msg in queued {
+                tx.send(msg).expect("queue before spawn");
+            }
+            let exited = ExitFlag::default();
+            let term = Arc::new(FairMutex::new(Term::new(
+                Config::default(),
+                &TermSize::new(80, 24),
+                exited.clone(),
+            )));
+            let child_pid = Arc::new(OnceLock::new());
+            let spawn_failed = Arc::new(AtomicBool::new(false));
+            let worker = super::super::spawn_pty(
+                opts,
+                window_size,
+                0,
+                Arc::clone(&term),
+                exited.clone(),
+                channel,
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(Mutex::new(PaneDefaults::default())),
+                Arc::clone(&child_pid),
+                Arc::clone(&spawn_failed),
+            );
+            Spawned { tx, term, exited, child_pid, spawn_failed, worker }
+        }
+
+        fn screen_text(term: &Term<ExitFlag>) -> String {
+            let grid = term.grid();
+            let mut text = String::new();
+            for line in 0..grid.screen_lines() {
+                for col in 0..grid.columns() {
+                    text.push(grid[Line(line as i32)][Column(col)].c);
+                }
+            }
+            text
+        }
+
+        fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !done() {
+                assert!(Instant::now() < deadline, "timed out waiting for {what}");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        /// Input and a resize sent before the spawn arrive in order once the
+        /// child runs, and the child runs in the requested cwd.
+        #[test]
+        fn queued_input_and_resize_reach_child_in_its_cwd() {
+            let cwd = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .canonicalize()
+                .expect("canonical src dir");
+            let resize = WindowSize { num_lines: 30, num_cols: 100, cell_width: 8, cell_height: 16 };
+            let s = spawn(
+                "/bin/sh",
+                &["-c", r#"read a; read b; printf 'got:%s%s size:%s cwd:%s\n' "$a" "$b" "$(stty size)" "$(pwd -P)"; read c"#],
+                Some(&cwd),
+                vec![
+                    Msg::Resize(resize),
+                    Msg::Input(Cow::Borrowed(b"one\n")),
+                    Msg::Input(Cow::Borrowed(b"two\n")),
+                ],
+            );
+            s.worker.join().expect("spawn worker panicked");
+            assert!(s.child_pid.get().is_some(), "child pid not published");
+            assert!(!s.spawn_failed.load(Ordering::Acquire));
+
+            let expected = format!("got:onetwo size:30 100 cwd:{}", cwd.display());
+            wait_for("child output", || screen_text(&s.term.lock()).contains(&expected));
+
+            // The child is blocked on `read c`; hang it up and let the loop end it.
+            s.tx.send(Msg::Shutdown).expect("send shutdown");
+            wait_for("child exit", || s.exited.0.load(Ordering::Acquire));
+        }
+
+        /// A shutdown sent before the spawn hangs the child up as soon as the
+        /// loop starts, instead of being lost and leaving the child running.
+        #[test]
+        fn queued_shutdown_ends_child_once_spawned() {
+            let s = spawn("/bin/sh", &["-c", "exec cat"], None, vec![Msg::Shutdown]);
+            s.worker.join().expect("spawn worker panicked");
+            wait_for("child exit", || s.exited.0.load(Ordering::Acquire));
+        }
+
+        /// A spawn that fails (here exec ENOENT) ends the pane like a child
+        /// exit, marked as a failed spawn, and later sends are dropped.
+        #[test]
+        fn spawn_failure_ends_pane_like_child_exit() {
+            let s = spawn("/nonexistent/rustinator-test-shell", &[], None, Vec::new());
+            s.worker.join().expect("spawn worker panicked");
+            assert!(s.spawn_failed.load(Ordering::Acquire));
+            assert!(s.exited.0.load(Ordering::Acquire));
+            assert!(s.child_pid.get().is_none());
+            assert!(s.tx.send(Msg::Input(Cow::Borrowed(b"x"))).is_err());
+        }
     }
 }

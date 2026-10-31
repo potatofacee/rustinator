@@ -1077,7 +1077,12 @@ impl TabManager {
             }
             match found {
                 Some((t, id)) => {
+                    // A pane whose child never spawned closes whatever the exit
+                    // action: holding or restarting it would hold or retry a
+                    // failure, and a spawn failure used to leave no pane at all.
+                    let spawn_failed = self.tabs[t].panes.get(&id).is_some_and(Pane::spawn_failed);
                     match exit_action {
+                        _ if spawn_failed => self.close_pane(t, id, egui_ctx, dialogs),
                         ExitAction::Close => self.close_pane(t, id, egui_ctx, dialogs),
                         ExitAction::Hold => {
                             if let Some(tab) = self.tabs.get_mut(t) {

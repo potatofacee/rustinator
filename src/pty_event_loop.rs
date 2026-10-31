@@ -13,7 +13,9 @@
 //! `JoinHandle<()>` and the thread drops the loop (and so the `Pty`) itself,
 //! and `Msg::Shutdown` hangs up the child and keeps the loop running until the
 //! child exits, escalating to SIGKILL after `SHUTDOWN_GRACE`, instead of
-//! breaking at once (see `begin_shutdown`). Re-sync this file when bumping
+//! breaking at once (see `begin_shutdown`). The loop's channel is a separate
+//! `LoopChannel` passed to `EventLoop::new`, so a pane holds its sender before
+//! the `Pty` exists (see `LoopChannel`). Re-sync this file when bumping
 //! alacritty_terminal.
 
 use std::borrow::Cow;
@@ -88,6 +90,29 @@ pub enum Msg {
     Resize(WindowSize),
 }
 
+/// Deviation: the loop's message channel and poller, created ahead of its
+/// `Pty`. Upstream builds both in `EventLoop::new`, so nothing can be sent
+/// before the child is spawned; here a pane takes its sender at once and
+/// spawns the child off the UI thread, and whatever it sends meanwhile (input,
+/// resizes, shutdown) waits in the channel, in order, until the loop starts.
+/// `notify` is sticky, so the loop's first poll wakes for it.
+pub struct LoopChannel {
+    tx: Sender<Msg>,
+    rx: Receiver<Msg>,
+    poll: Arc<Poller>,
+}
+
+impl LoopChannel {
+    pub fn new() -> io::Result<Self> {
+        let (tx, rx) = mpsc::channel();
+        Ok(Self { tx, rx, poll: Poller::new()?.into() })
+    }
+
+    pub fn sender(&self) -> EventLoopSender {
+        EventLoopSender { sender: self.tx.clone(), poller: Arc::clone(&self.poll) }
+    }
+}
+
 /// The main event loop.
 ///
 /// Handles all the PTY I/O and runs the PTY parser which updates terminal
@@ -114,18 +139,20 @@ where
     U: EventListener + Send + 'static,
 {
     /// Create a new event loop.
+    // Deviation: takes its channel (and so cannot fail) instead of creating
+    // one; see `LoopChannel`.
     pub fn new(
+        channel: LoopChannel,
         terminal: Arc<FairMutex<Term<U>>>,
         event_proxy: U,
         pty: T,
         drain_on_exit: bool,
         ref_test: bool,
         hooks: PaneHooks,
-    ) -> io::Result<EventLoop<T, U>> {
-        let (tx, rx) = mpsc::channel();
-        let poll: Arc<Poller> = Poller::new()?.into();
-        let sender = EventLoopSender { sender: tx.clone(), poller: Arc::clone(&poll) };
-        Ok(EventLoop {
+    ) -> EventLoop<T, U> {
+        let sender = channel.sender();
+        let LoopChannel { tx, rx, poll } = channel;
+        EventLoop {
             poll,
             pty,
             tx,
@@ -136,9 +163,12 @@ where
             ref_test,
             hooks,
             sender,
-        })
+        }
     }
 
+    // Unused here (panes take `LoopChannel::sender` before the loop exists);
+    // kept so the file stays a faithful copy of upstream for re-sync diffs.
+    #[allow(dead_code)]
     pub fn channel(&self) -> EventLoopSender {
         EventLoopSender { sender: self.tx.clone(), poller: self.poll.clone() }
     }
@@ -823,9 +853,9 @@ mod tests {
                 defaults: Arc::new(Mutex::new(PaneDefaults::default())),
                 child_pid,
             };
+            let channel = LoopChannel::new().expect("create loop channel");
             let event_loop =
-                EventLoop::new(Arc::clone(&term), VoidListener, pty, false, false, hooks)
-                    .expect("create event loop");
+                EventLoop::new(channel, Arc::clone(&term), VoidListener, pty, false, false, hooks);
             let tx = event_loop.channel();
             let thread = event_loop.spawn();
 
