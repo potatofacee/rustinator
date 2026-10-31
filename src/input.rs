@@ -7,6 +7,7 @@ use crate::keybindings::{Action, BindingTable};
 use crate::keyboard::{self, KeyInput};
 use crate::pane::Pane;
 
+#[derive(Clone)]
 pub(crate) struct RawTermKey {
     /// egui's name for the key, for binding lookup and the legacy DECCKM /
     /// erase rewrites; None for a character egui cannot name (é, ß,
@@ -106,12 +107,12 @@ pub(crate) fn send_key(rk: &RawTermKey, targets: &[&Pane], scroll_on_keystroke: 
 
 /// Strip this frame's key presses, text and pastes from egui's input once the
 /// raw path has routed them: the terminal owns the keyboard, so no egui widget
-/// may see them. egui-winit synthesizes `Event::Paste` (with the OS
-/// clipboard) for any Ctrl+V chord on Linux, bound or not, and for the
-/// XF86Paste key. The terminal's only paste source is the bound
-/// `Action::Paste`; every other chord is encoded by the raw path (plain
-/// Ctrl+V is 0x16, as under VTE), so the synthesized event is never fed to
-/// the PTY — it is only stripped here so no egui widget sees it either.
+/// may see them. egui-winit's paste chord never becomes an `Event::Paste`
+/// here (`is_egui_paste_chord`: it is withheld, and read only for a focused
+/// egui field); one a text field's paste injected (`TextPastes`) into a frame
+/// whose stale field focus `logic` dropped is stripped like the rest. The
+/// terminal's only paste source is the bound `Action::Paste`; every other
+/// chord is encoded by the raw path (plain Ctrl+V is 0x16, as under VTE).
 pub(crate) fn strip_egui_key_events(ctx: &egui::Context) {
     ctx.input_mut(|i| {
         i.events.retain(|ev| match ev {
@@ -123,33 +124,28 @@ pub(crate) fn strip_egui_key_events(ctx: &egui::Context) {
     });
 }
 
-/// Whether a key event is withheld from egui-winit: a chord it would take as
-/// its paste command while no egui widget wants the keyboard. egui-winit
-/// answers that chord by reading the OS clipboard on the UI thread (on X11 a
+/// Whether a key event is the chord egui-winit takes as its paste command,
+/// which it answers by reading the OS clipboard on the UI thread (on X11 a
 /// selection round trip of up to 4 s per target when the owner is slow, as an
-/// idle Xvnc clipboard bridge is), and the `Event::Paste` it builds would only
+/// idle Xvnc clipboard bridge is). Such events are withheld from egui-winit
+/// (`GlWindow::on_window_event`): with an egui text field focused the paste
+/// is read off the UI thread and injected as egui-winit's `Event::Paste`
+/// (`clipboard_read::TextPastes`); with none, the `Event::Paste` would only
 /// be stripped by `strip_egui_key_events`: the terminal's pastes come from
 /// its bindings, and plain Ctrl+V reaches the PTY as 0x16 through the raw key
 /// path, which is fed before egui-winit sees the event. Nothing else of the
 /// event matters to egui: a paste press returns before egui-winit records a
-/// key or text, and modifiers come from `ModifiersChanged`. Press and release
-/// are withheld alike.
+/// key or text, and modifiers come from `ModifiersChanged`.
 ///
 /// The chord test mirrors egui-winit 0.34 (`on_keyboard_input`,
 /// `is_paste_command`): the key is the logical key's egui name, else the
 /// physical key's, and `mods` is egui-winit's own modifier state, whose
-/// `command` is Ctrl, or Cmd on macOS. A named logical key other than
-/// Paste/Insert counts as some other egui key; egui-winit names nearly all of
-/// them, and one it does not merely keeps today's read.
-pub(crate) fn withhold_paste_chord_from_egui(
-    mods: egui::Modifiers,
-    logical: &Key,
-    physical: PhysicalKey,
-    egui_wants_keyboard: bool,
-) -> bool {
-    if egui_wants_keyboard {
-        return false;
-    }
+/// `command` is Ctrl, or Cmd on macOS. So: the Paste key; Ctrl+V and
+/// Ctrl+Shift+V (Cmd+V, Cmd+Shift+V on macOS); Shift+Insert on Windows only.
+/// A named logical key other than Paste/Insert counts as some other egui
+/// key; egui-winit names nearly all of them, and one it does not merely
+/// keeps egui-winit's own read.
+pub(crate) fn is_egui_paste_chord(mods: egui::Modifiers, logical: &Key, physical: PhysicalKey) -> bool {
     let from_logical = match logical {
         Key::Named(NamedKey::Paste) => Some(egui::Key::Paste),
         Key::Named(NamedKey::Insert) => Some(egui::Key::Insert),
@@ -1829,22 +1825,22 @@ mod tests {
         }
     }
 
-    fn withheld(mods: egui::Modifiers, logical: Key, physical: KeyCode, egui_focused: bool) -> bool {
-        withhold_paste_chord_from_egui(mods, &logical, PhysicalKey::Code(physical), egui_focused)
+    fn withheld(mods: egui::Modifiers, logical: Key, physical: KeyCode) -> bool {
+        is_egui_paste_chord(mods, &logical, PhysicalKey::Code(physical))
     }
 
     #[test]
-    fn paste_chords_are_withheld_from_egui_while_the_terminal_has_the_keyboard() {
+    fn paste_chords_are_withheld_from_egui() {
         let ch = |s: &str| Key::Character(s.into());
         // Ctrl+V (Cmd+V on macOS), and with Shift, the Terminator Paste chord.
-        assert!(withheld(command_mods(false), ch("v"), KeyCode::KeyV, false));
-        assert!(withheld(command_mods(true), ch("V"), KeyCode::KeyV, false));
+        assert!(withheld(command_mods(false), ch("v"), KeyCode::KeyV));
+        assert!(withheld(command_mods(true), ch("V"), KeyCode::KeyV));
         // The Paste (XF86Paste) key, any modifiers.
         let none = egui::Modifiers::NONE;
-        assert!(withheld(none, Key::Named(NamedKey::Paste), KeyCode::Paste, false));
+        assert!(withheld(none, Key::Named(NamedKey::Paste), KeyCode::Paste));
         // A layout without Latin letters: egui-winit falls back to the
         // physical key, so Ctrl+<the V key> is its paste command.
-        assert!(withheld(command_mods(false), ch("м"), KeyCode::KeyV, false));
+        assert!(withheld(command_mods(false), ch("м"), KeyCode::KeyV));
     }
 
     #[test]
@@ -1853,24 +1849,16 @@ mod tests {
         let none = egui::Modifiers::NONE;
         let shift = egui::Modifiers::SHIFT;
         // Plain and shifted V are typing, not a paste.
-        assert!(!withheld(none, ch("v"), KeyCode::KeyV, false));
-        assert!(!withheld(shift, ch("V"), KeyCode::KeyV, false));
+        assert!(!withheld(none, ch("v"), KeyCode::KeyV));
+        assert!(!withheld(shift, ch("V"), KeyCode::KeyV));
         // Ctrl+C, and Ctrl on the physical V key where the layout puts K
         // there (Dvorak): the logical key decides.
-        assert!(!withheld(command_mods(false), ch("c"), KeyCode::KeyC, false));
-        assert!(!withheld(command_mods(false), ch("k"), KeyCode::KeyV, false));
+        assert!(!withheld(command_mods(false), ch("c"), KeyCode::KeyC));
+        assert!(!withheld(command_mods(false), ch("k"), KeyCode::KeyV));
         // Shift+Insert is egui-winit's paste only on Windows.
         assert_eq!(
-            withheld(shift, Key::Named(NamedKey::Insert), KeyCode::Insert, false),
+            withheld(shift, Key::Named(NamedKey::Insert), KeyCode::Insert),
             cfg!(target_os = "windows")
         );
-    }
-
-    #[test]
-    fn paste_chords_reach_egui_while_an_egui_field_has_focus() {
-        let ch = |s: &str| Key::Character(s.into());
-        assert!(!withheld(command_mods(false), ch("v"), KeyCode::KeyV, true));
-        assert!(!withheld(command_mods(true), ch("V"), KeyCode::KeyV, true));
-        assert!(!withheld(egui::Modifiers::NONE, Key::Named(NamedKey::Paste), KeyCode::Paste, true));
     }
 }

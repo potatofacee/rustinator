@@ -605,22 +605,7 @@ impl ApplicationHandler<UserEvent> for WinitApp {
             UserEvent::Repaint => {
                 self.repaint_pending = true;
             }
-            UserEvent::ClipboardRead { id, text } => {
-                if let Some(win) = self.windows.values_mut().find(|w| w.paste_gate.waits_on(id)) {
-                    win.paste_gate.complete(id, text);
-                }
-                // The paste and the keys held behind it go out in the next
-                // `logic`, which runs in the hotkey dropdown's paint while it
-                // is up: a frame draining input, like a keystroke's.
-                self.repaint_pending = true;
-                match self.hotkey_window.as_mut().filter(|hk| hk.shown_at.is_some()) {
-                    Some(hk) => {
-                        hk.input_pending = true;
-                        hk.repaint_at = Some(Instant::now());
-                    }
-                    None => self.input_pending = true,
-                }
-            }
+            UserEvent::ClipboardRead { id, text } => self.clipboard_read_done(id, text),
             UserEvent::HotkeyTogglePressed => {
                 if let Some(hk) = &mut self.hotkey_window {
                     if hk.shown_at.is_some() {
@@ -808,11 +793,54 @@ impl ApplicationHandler<UserEvent> for WinitApp {
 }
 
 impl WinitApp {
+    /// A selection read finished: hand its text to the paste waiting on it,
+    /// a pane paste (`AppWindow::paste_gate`) or an egui text field's
+    /// (`GlWindow::text_pastes`), and run a frame of the window that sends it.
+    /// A read nothing waits on any more (its panes or field gone) is dropped.
+    fn clipboard_read_done(&mut self, id: u64, text: Option<String>) {
+        let hotkey_shown = self.hotkey_window.as_ref().is_some_and(|hk| hk.shown_at.is_some());
+        if let Some(win) = self.windows.values_mut().find(|w| w.paste_gate.waits_on(id)) {
+            win.paste_gate.complete(id, text);
+            // The paste and the keys held behind it go out in the next
+            // `logic`/`ui`, which run in the hotkey dropdown's paint while it
+            // is up: a frame draining input, like a keystroke's.
+            self.repaint_pending = true;
+            match self.hotkey_window.as_mut().filter(|_| hotkey_shown) {
+                Some(hk) => {
+                    hk.input_pending = true;
+                    hk.repaint_at = Some(Instant::now());
+                }
+                None => self.input_pending = true,
+            }
+        } else if let Some(win) = self.windows.values_mut().find(|w| w.gl_window.text_pastes.waits_on(id)) {
+            // The main window paints (its `ui`, egui's pass) while the
+            // dropdown is up too.
+            win.gl_window.text_pastes.complete(id, text);
+            self.repaint_pending = true;
+            self.input_pending = true;
+        } else if let Some(hk) = self.hotkey_window.as_mut().filter(|hk| hk.gl_window.text_pastes.waits_on(id)) {
+            // Delivered in its next paint; a hidden dropdown's waits for it
+            // to show, and it repaints then.
+            hk.gl_window.text_pastes.complete(id, text);
+            if hotkey_shown {
+                hk.input_pending = true;
+                hk.repaint_at = Some(Instant::now());
+            }
+        } else if let Some(prefs) = self.prefs.as_mut().filter(|p| p.gl_window.text_pastes.waits_on(id)) {
+            prefs.gl_window.text_pastes.complete(id, text);
+            prefs.gl_window.window.request_redraw();
+        }
+    }
+
     // Prefs window event handling, moved verbatim out of `window_event` so the
     // router stays a thin classify-and-dispatch.
     fn handle_prefs_window_event(&mut self, event: WindowEvent) {
         let mut prefs = self.prefs.take().unwrap();
-        let response = prefs.gl_window.on_window_event(&event);
+        let Some(shared) = self.shared.as_mut() else {
+            self.prefs = Some(prefs);
+            return;
+        };
+        let response = prefs.gl_window.on_window_event(&event, &mut shared.clipboard_reader);
         if response.repaint {
             prefs.gl_window.window.request_redraw();
         }
@@ -924,7 +952,11 @@ impl WinitApp {
             }
         }
 
-        let response = hk.gl_window.on_terminal_window_event(&event);
+        let Some(shared) = self.shared.as_mut() else {
+            self.hotkey_window = Some(hk);
+            return;
+        };
+        let response = hk.gl_window.on_window_event(&event, &mut shared.clipboard_reader);
         if response.repaint {
             hk.repaint_at = Some(Instant::now());
         }
@@ -1096,7 +1128,8 @@ impl WinitApp {
             _ => None,
         };
 
-        let response = win.gl_window.on_terminal_window_event(&event);
+        let Some(shared) = self.shared.as_mut() else { return };
+        let response = win.gl_window.on_window_event(&event, &mut shared.clipboard_reader);
 
         if motion_repaint.unwrap_or(response.repaint) {
             self.repaint_pending = true;

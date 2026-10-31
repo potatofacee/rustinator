@@ -220,20 +220,26 @@ pub fn ungroup_active_tab(tabs: &mut [Tab], active: usize) {
     }
 }
 
-/// Insert each broadcast target's 1-based index (among ALL panes, tree order)
-/// into that pane. Targets route through the same `select_input_targets` gate as
-/// keystrokes — no bypass. Mirrors `do_enumerate` (`terminator.py:576-590`).
-pub fn insert_index(tab_mgr: &TabManager, padded: bool) {
+/// Each broadcast target's 1-based index (among ALL panes, tree order), as
+/// the text to insert into that pane; the caller writes it as user input
+/// (behind a paste in flight to the pane, `AppWindow::send_input_to`).
+/// Targets route through the same `select_input_targets` gate as keystrokes
+/// — no bypass. Mirrors `do_enumerate` (`terminator.py:576-590`).
+pub fn insert_index(tab_mgr: &TabManager, padded: bool) -> Vec<(PaneId, Vec<u8>)> {
     let mut order: Vec<PaneId> = Vec::new();
     for tab in &tab_mgr.tabs {
         tab.layout.leaves_in_order(&mut order);
     }
     let total = order.len();
-    for pane in tab_mgr.active_tab().select_input_targets(tab_mgr.broadcast_scope) {
-        if let Some(pos) = order.iter().position(|&id| id == pane.id) {
-            pane.send_bytes(enumerate_text(pos + 1, total, padded).into_bytes());
-        }
-    }
+    tab_mgr
+        .active_tab()
+        .select_input_targets(tab_mgr.broadcast_scope)
+        .into_iter()
+        .filter_map(|pane| {
+            let pos = order.iter().position(|&id| id == pane.id)?;
+            Some((pane.id, enumerate_text(pos + 1, total, padded).into_bytes()))
+        })
+        .collect()
 }
 
 #[cfg(test)]

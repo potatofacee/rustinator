@@ -13,6 +13,8 @@ use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::ActiveEventLoop;
 use winit::window::{Window, WindowAttributes};
 
+use crate::clipboard_read::{self, ClipboardReader, PasteRead, Selection, TextPastes};
+
 pub(crate) struct GlWindow {
     pub(crate) window: Window,
     pub(crate) gl_surface: Surface<WindowSurface>,
@@ -22,6 +24,9 @@ pub(crate) struct GlWindow {
     /// Mouse buttons currently held, mirrored from `MouseInput`. While one is
     /// held the window has the implicit pointer grab (see `on_window_event`).
     held_mouse_buttons: HashSet<MouseButton>,
+    /// egui-winit's paste chord, typed into one of this window's egui text
+    /// fields, read off the UI thread (`on_window_event`, `begin_frame`).
+    pub(crate) text_pastes: TextPastes,
 }
 
 impl GlWindow {
@@ -119,6 +124,7 @@ impl GlWindow {
             egui_ctx,
             egui_winit,
             held_mouse_buttons: HashSet::new(),
+            text_pastes: TextPastes::new(),
         }
     }
 
@@ -135,31 +141,43 @@ impl GlWindow {
     /// with nothing held, and is forwarded as usual. Wayland sends no leave
     /// during a grab; a button held from outside the window is never seen
     /// pressed, so its crossings are forwarded unchanged.
-    pub(crate) fn on_window_event(&mut self, event: &WindowEvent) -> egui_winit::EventResponse {
+    ///
+    /// egui-winit's paste chord (`input::is_egui_paste_chord`) is kept from
+    /// egui-winit, press and release alike, so it never reads the clipboard
+    /// on the UI thread. Pressed while an egui widget has keyboard focus, the
+    /// selection is read on `reader`'s worker instead and its text injected
+    /// into that widget's frame as the `Event::Paste` egui-winit would have
+    /// pushed (`clipboard_read::TextPastes`); pressed with no widget focused
+    /// (the terminal has the keyboard), egui-winit's paste would go unused.
+    /// The response is the one egui-winit gives the key. A synthetic press
+    /// (winit's focus-in replay) is no keystroke, and egui-winit ignores it.
+    pub(crate) fn on_window_event(&mut self, event: &WindowEvent, reader: &mut ClipboardReader) -> egui_winit::EventResponse {
         if withheld_by_grab(&mut self.held_mouse_buttons, event) {
             return egui_winit::EventResponse { consumed: false, repaint: false };
         }
-        self.egui_winit.on_window_event(&self.window, event)
-    }
-
-    /// `on_window_event` for a window whose keyboard the terminal owns unless
-    /// an egui text field has focus (the main and hotkey windows): a paste
-    /// chord is kept from egui-winit then, so it does not read the clipboard
-    /// for a paste nothing would use (`input::withhold_paste_chord_from_egui`).
-    /// The response is the one egui-winit gives that key when egui does not
-    /// want the keyboard. Both inputs are what egui-winit itself consults.
-    pub(crate) fn on_terminal_window_event(&mut self, event: &WindowEvent) -> egui_winit::EventResponse {
-        if let WindowEvent::KeyboardInput { event: key_event, .. } = event {
-            if crate::input::withhold_paste_chord_from_egui(
+        if let WindowEvent::KeyboardInput { event: key_event, is_synthetic, .. } = event {
+            if crate::input::is_egui_paste_chord(
                 self.egui_winit.egui_input().modifiers,
                 &key_event.logical_key,
                 key_event.physical_key,
-                self.egui_ctx.egui_wants_keyboard_input(),
             ) {
-                return egui_winit::EventResponse { consumed: false, repaint: true };
+                let pressed = key_event.state == ElementState::Pressed;
+                if *is_synthetic && pressed {
+                    return egui_winit::EventResponse { consumed: false, repaint: true };
+                }
+                let focused = self.egui_ctx.memory(|m| m.focused());
+                if let (true, Some(widget)) = (pressed, focused) {
+                    let read = match reader.submit(Selection::Clipboard) {
+                        Some(id) => PasteRead::Waiting(id),
+                        None => PasteRead::Done(clipboard_read::read_now(Selection::Clipboard)),
+                    };
+                    let at = self.egui_winit.egui_input().events.len();
+                    self.text_pastes.chord(at, widget, read);
+                }
+                return egui_winit::EventResponse { consumed: focused.is_some(), repaint: true };
             }
         }
-        self.on_window_event(event)
+        self.egui_winit.on_window_event(&self.window, event)
     }
 
     pub(crate) fn destroy(mut self, main_context: &PossiblyCurrentContext) {
@@ -192,7 +210,13 @@ impl GlWindow {
         if let (Some(w), Some(h)) = (NonZeroU32::new(phys.width), NonZeroU32::new(phys.height)) {
             self.gl_surface.resize(main_context, w, h);
         }
-        self.egui_winit.take_egui_input(&self.window)
+        let mut raw_input = self.egui_winit.take_egui_input(&self.window);
+        // The widget focused as this frame's input arrived: egui moves focus
+        // only in a pass, and this is the state egui-winit consulted per key.
+        let focus = self.egui_ctx.memory(|m| m.focused());
+        let events = std::mem::take(&mut raw_input.events);
+        raw_input.events = self.text_pastes.filter_frame(focus, events);
+        raw_input
     }
 
     pub(crate) fn end_frame(

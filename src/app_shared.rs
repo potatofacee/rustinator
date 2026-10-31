@@ -65,8 +65,9 @@ pub(crate) struct AppShared {
     pub(crate) hotkey_changed: bool,
     pub(crate) cursor_blink_epoch: Instant,
     pub(crate) event_loop_proxy: EventLoopProxy<window::UserEvent>,
-    /// The paste reads' worker thread, one per process; each window's
-    /// `PasteGate` holds its keys behind the reads it asked for.
+    /// The paste reads' worker thread, one per process; each window holds a
+    /// pane's input behind the reads asked for it (`AppWindow::paste_gate`),
+    /// and each egui window a text field's (`GlWindow::text_pastes`).
     pub(crate) clipboard_reader: ClipboardReader,
     /// One process-wide `PaneId` source. Every new pane draws its id via
     /// `alloc_pane_id`, so two `TabManager`s that clone this `Arc` never collide.
