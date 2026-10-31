@@ -79,6 +79,13 @@ pub(crate) struct PaneViewCtx<'a> {
     pub renderer: &'a Arc<Mutex<Renderer>>,
     pub cursor_blink_epoch: Instant,
     pub window_focused: bool,
+    /// This window sizes the panes' grids (`Pane::resize` + SIGWINCH) to its
+    /// own pane rects. Exactly one window owns them at a time: two windows
+    /// drawing the same panes at different sizes would resize them back and
+    /// forth every frame, each one a full scrollback reflow and a SIGWINCH
+    /// whose redraw output schedules the next frame. A window that does not
+    /// own them draws the existing grid as is, clipped or padded to its rect.
+    pub owns_grid_size: bool,
     pub user_config: &'a Config,
     pub bindings: &'a BindingTable,
     pub egui_ctx: &'a egui::Context,
@@ -328,8 +335,13 @@ fn draw_title_bar(
     // inner_rect = shrink by FOCUS_BORDER, then pixel-space ÷ cell size) so the
     // bar never shows stale values from a previous frame.
     let ppp = ui.ctx().pixels_per_point();
+    // A window that does not own the grid size draws the grid as it is, so
+    // the bar shows that grid's real size, not what this rect would fit.
     let inner = terminal_rect.shrink(FOCUS_BORDER);
-    let (cols, lines) = grid_dims(inner, ppp, ctx.cell_w, ctx.cell_h);
+    let (cols, lines) = match ctx.tab_mgr.tabs[ctx.tab_mgr.active_tab].panes.get(&id) {
+        Some(pane) if !ctx.owns_grid_size => (pane.cols, pane.lines),
+        _ => grid_dims(inner, ppp, ctx.cell_w, ctx.cell_h),
+    };
     let scope = ctx.tab_mgr.broadcast_scope;
     let model = title_bar_model(
         ctx.tab_mgr.tabs[ctx.tab_mgr.active_tab].panes.get(&id),
@@ -1142,8 +1154,10 @@ fn paint_pane(
 
     let ppp = ui.ctx().pixels_per_point();
     let inner_rect = rect.shrink(FOCUS_BORDER);
-    let (new_cols, new_lines) = grid_dims(inner_rect, ppp, cell_w, cell_h);
-    pane.resize(new_cols, new_lines, cell_w, cell_h);
+    if ctx.owns_grid_size {
+        let (new_cols, new_lines) = grid_dims(inner_rect, ppp, cell_w, cell_h);
+        pane.resize(new_cols, new_lines, cell_w, cell_h);
+    }
 
     let frame = pane.frame(focused);
 
@@ -1664,6 +1678,13 @@ fn cell_at(p: egui::Pos2, rect: egui::Rect, ppp: f32, cell_w: f32, cell_h: f32) 
     (col.clamp(0, cols as i32 - 1), row.clamp(0, lines as i32 - 1))
 }
 
+/// Clamp a cell to a `cols` x `lines` grid (each at least one).
+fn confine_to_grid(col: i32, row: i32, cols: usize, lines: usize) -> (i32, i32) {
+    let max_col = cols.max(1) as i32 - 1;
+    let max_row = lines.max(1) as i32 - 1;
+    (col.clamp(0, max_col), row.clamp(0, max_row))
+}
+
 /// Which half of the cell the cursor sits in. Selection includes the anchor
 /// cell only when the cursor is on its right half, matching alacritty/vte.
 fn cell_side(p: egui::Pos2, rect: egui::Rect, ppp: f32, cell_w: f32) -> Side {
@@ -1697,6 +1718,13 @@ fn motion_report(
 /// of a double-width glyph (its WIDE_CHAR_SPACER column) back to the base
 /// column, matching alacritty's whole-glyph hit semantics. All downstream
 /// uses (selection, mouse-to-app, URL hit-test) get the authoritative column.
+///
+/// The cell is confined to the pane's actual grid as well as to the grid
+/// `inner_rect` fits: the two differ in a window that does not own the grid
+/// size (`PaneViewCtx::owns_grid_size`), which draws the grid clipped or
+/// padded, and for the one frame after the owner's rect changes, before
+/// `paint_pane` resizes it. A selection or mouse report must never name a
+/// cell the terminal does not have.
 fn cell_under(
     pane: Option<&crate::pane::Pane>,
     p: egui::Pos2,
@@ -1706,6 +1734,10 @@ fn cell_under(
     cell_h: f32,
 ) -> (i32, i32) {
     let (col, row) = cell_at(p, inner_rect, ppp, cell_w, cell_h);
+    let (col, row) = match pane {
+        Some(pane) => confine_to_grid(col, row, pane.cols, pane.lines),
+        None => (col, row),
+    };
     let col = pane
         .and_then(|p| p.cached.as_ref())
         .map(|frame| crate::pane::resolve_wide_click_col(&frame.cells, row, col))
@@ -2069,6 +2101,20 @@ mod tests {
         let tiny = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(4.0, 4.0));
         assert_eq!(grid_dims(tiny, 1.0, 10.0, 20.0), (1, 1));
         assert_eq!(cell_at(egui::pos2(50.0, 50.0), tiny, 1.0, 10.0, 20.0), (0, 0));
+    }
+
+    #[test]
+    fn confine_to_grid_clamps_to_the_panes_real_grid() {
+        // A window that does not own the grid size draws a 100x50 rect over
+        // an 80x24 grid: a pointer past the grid lands on its last cell.
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1000.0, 1000.0));
+        let (col, row) = cell_at(egui::pos2(950.0, 900.0), rect, 1.0, 10.0, 20.0);
+        assert_eq!((col, row), (95, 45));
+        assert_eq!(confine_to_grid(col, row, 80, 24), (79, 23));
+        // Inside the grid nothing moves.
+        assert_eq!(confine_to_grid(5, 7, 80, 24), (5, 7));
+        // A degenerate grid is still one cell.
+        assert_eq!(confine_to_grid(3, 3, 0, 0), (0, 0));
     }
 
     #[test]

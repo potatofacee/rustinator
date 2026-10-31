@@ -133,6 +133,10 @@ struct HotkeyWindowState {
     // Discrete input arrived since the last paint; its frame skips the
     // render-cost stretch (see `effective_interval`).
     input_pending: bool,
+    // OS focus of the dropdown itself, mirrored from its `Focused` events.
+    // Kept apart from the main window's (`WinitApp::main_focused`): both show
+    // the same panes, whose window focus is "either one is focused".
+    focused: bool,
 }
 
 impl HotkeyWindowState {
@@ -175,6 +179,7 @@ impl HotkeyWindowState {
             repaint_at: None,
             last_paint: None,
             input_pending: false,
+            focused: false,
         }
     }
 
@@ -186,6 +191,14 @@ impl HotkeyWindowState {
         self.gl_window.resize(main_context, width, height);
     }
 
+    /// Hide the dropdown. The caller must repaint the main window: grid-size
+    /// ownership of the shared panes returns to it (see `WinitApp::paint`),
+    /// and they keep the dropdown's size until it paints.
+    fn hide(&mut self) {
+        self.shown_at = None;
+        self.gl_window.window.set_visible(false);
+    }
+
     fn paint(
         &mut self,
         window: &mut AppWindow,
@@ -193,13 +206,17 @@ impl HotkeyWindowState {
         main_context: &glutin::context::PossiblyCurrentContext,
     ) {
         self.input_pending = false;
-        let raw_input = self.gl_window.begin_frame(main_context);
+        let mut raw_input = self.gl_window.begin_frame(main_context);
         // Sampled before egui's pass, for the same reason as the main paint.
         let egui_owns_keys = self.gl_window.egui_ctx.egui_wants_keyboard_input();
+        strip_tab_presses(&mut raw_input);
 
+        // While shown, the dropdown owns the panes' grid sizes: it is where
+        // the user is looking and typing. The main window, which draws the
+        // same panes in the same governed frames, draws them unresized.
         let full_output = self.gl_window.egui_ctx.run_ui(raw_input, |ui| {
             window.logic(shared, ui.ctx(), egui_owns_keys);
-            window.ui(shared, ui);
+            window.ui(shared, ui, true);
         });
 
         if window.fullscreen_pending {
@@ -227,6 +244,35 @@ impl HotkeyWindowState {
         self.repaint_at = self.gl_window.end_frame(main_context, full_output, clear_color);
         self.last_paint = Some(Instant::now());
     }
+}
+
+/// Remove Tab/Shift+Tab presses from a terminal window's egui input. egui
+/// moves keyboard focus between widgets on Tab in `begin_pass`, before
+/// `AppWindow::logic` can strip the key, so it would grab focus on a widget,
+/// after which `egui_wants_keyboard_input()` makes `logic` drop every terminal
+/// key until the window is refocused. The terminal gets Tab through the
+/// separate winit `pending_raw_keys` path, so removing it here costs nothing.
+fn strip_tab_presses(raw_input: &mut egui::RawInput) {
+    raw_input.events.retain(|ev| {
+        !matches!(ev, egui::Event::Key { key: egui::Key::Tab, pressed: true, .. })
+    });
+}
+
+/// The panes' window focus: focused while either OS window showing them (the
+/// main window or the hotkey dropdown) has focus. Each window's own focus is
+/// tracked apart, so one window's `Focused` event cannot overwrite the
+/// other's: the dropdown's map-time (X11 `map_notify`) or creation-time
+/// (macOS window delegate) `Focused(false)` arrives while the main window
+/// still has focus.
+fn panes_window_focused(main_focused: bool, hotkey_focused: bool) -> bool {
+    main_focused || hotkey_focused
+}
+
+/// The key that hides the hotkey dropdown: Shift+Escape exactly. A bare
+/// Escape belongs to the program in the dropdown (vim, fzf, an interrupt) or
+/// to an egui dialog open in it, as in the main window.
+fn is_hotkey_hide_key(logical_key: &Key, mods: ModifiersState) -> bool {
+    *logical_key == Key::Named(NamedKey::Escape) && mods == ModifiersState::SHIFT
 }
 
 // --- Pure routing/governor seams (unit-tested below) ---
@@ -578,8 +624,8 @@ impl ApplicationHandler<UserEvent> for WinitApp {
             UserEvent::HotkeyTogglePressed => {
                 if let Some(hk) = &mut self.hotkey_window {
                     if hk.shown_at.is_some() {
-                        hk.shown_at = None;
-                        hk.gl_window.window.set_visible(false);
+                        hk.hide();
+                        self.repaint_pending = true;
                         #[cfg(target_os = "macos")]
                         if let Some(pid) = self.hotkey_previous_app_pid.take() {
                             macos_activate_pid(pid);
@@ -826,14 +872,16 @@ impl WinitApp {
         // xinput2_focused); those are not keystrokes and GTK never produced
         // them, so the raw path must drop them exactly as egui-winit does.
         if let WindowEvent::KeyboardInput { event: key_event, is_synthetic: false, .. } = &event {
+            // Shift+Escape hides the dropdown; a bare Escape goes on to the
+            // terminal (or to an egui dialog open in the dropdown) like any
+            // other key.
             if key_event.state.is_pressed()
-                && key_event.logical_key == Key::Named(NamedKey::Escape)
-                && hk.current_modifiers.state().is_empty()
+                && is_hotkey_hide_key(&key_event.logical_key, hk.current_modifiers.state())
             {
                 // Consumed here: its release reaches no pane.
                 win.forget_key_press(key_event.physical_key);
-                hk.shown_at = None;
-                hk.gl_window.window.set_visible(false);
+                hk.hide();
+                self.repaint_pending = true;
                 #[cfg(target_os = "macos")]
                 if let Some(pid) = self.hotkey_previous_app_pid.take() {
                     macos_activate_pid(pid);
@@ -894,8 +942,8 @@ impl WinitApp {
     fn hotkey_apply_unconsumed(&mut self, hk: &mut HotkeyWindowState, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => {
-                hk.shown_at = None;
-                hk.gl_window.window.set_visible(false);
+                hk.hide();
+                self.repaint_pending = true;
             }
             WindowEvent::Resized(size) => {
                 if let Some(gl) = &self.gl {
@@ -914,16 +962,18 @@ impl WinitApp {
                 {
                     hk.current_modifiers = winit::event::Modifiers::default();
                 }
+                hk.focused = focused;
+                let any_focused = panes_window_focused(self.main_focused, hk.focused);
                 self.main_window_id
                     .and_then(|id| self.windows.get_mut(&id))
                     .unwrap()
-                    .notify_focus(focused);
+                    .notify_focus(focused, any_focused);
                 if !focused && self.hotkey_hide_on_focus_loss {
                     let dominated_by_grace = hk.shown_at
                         .is_some_and(|t| t.elapsed().as_millis() < 500);
                     if !dominated_by_grace {
-                        hk.shown_at = None;
-                        hk.gl_window.window.set_visible(false);
+                        hk.hide();
+                        self.repaint_pending = true;
                         #[cfg(target_os = "macos")]
                         if let Some(pid) = self.hotkey_previous_app_pid.take() {
                             macos_activate_pid(pid);
@@ -1100,7 +1150,8 @@ impl WinitApp {
                 {
                     self.current_modifiers = winit::event::Modifiers::default();
                 }
-                win.notify_focus(focused);
+                let hotkey_focused = self.hotkey_window.as_ref().is_some_and(|hk| hk.focused);
+                win.notify_focus(focused, panes_window_focused(focused, hotkey_focused));
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.last_cursor_pos = Some(position);
@@ -1167,15 +1218,7 @@ impl WinitApp {
             // dialog's closing Escape to the PTY and strip it from the dialog.
             // This is the state egui-winit itself consulted per key event.
             let egui_owns_keys = win.gl_window.egui_ctx.egui_wants_keyboard_input();
-            // Keep egui's focus traversal from eating Tab/Shift+Tab. egui decides
-            // focus movement in begin_pass from these events, before app.logic can
-            // strip them, so it grabs keyboard focus on a widget — after which
-            // `egui_wants_keyboard_input()` makes app.logic drop all terminal keys
-            // until the window is refocused. The terminal gets Tab via the separate
-            // winit pending_raw_keys path, so removing it here costs nothing.
-            raw_input.events.retain(|ev| {
-                !matches!(ev, egui::Event::Key { key: egui::Key::Tab, pressed: true, .. })
-            });
+            strip_tab_presses(&mut raw_input);
             let clear_color = win.clear_color();
 
             {
@@ -1189,6 +1232,9 @@ impl WinitApp {
             // the shared pending-key queue out from under the hotkey window). It
             // MUST, however, keep running `app.ui` so the main window keeps
             // painting its terminal content instead of going blank while it is up.
+            // It draws the panes without resizing them then: the dropdown owns
+            // their grid sizes while shown (see `PaneViewCtx::owns_grid_size`),
+            // and this paint takes them back on its first frame after the hide.
             let hotkey_visible = self.hotkey_window.as_ref()
                 .is_some_and(|hk| hk.shown_at.is_some());
             // egui::Context is a cheap Arc handle; clone it so the closure can
@@ -1198,7 +1244,7 @@ impl WinitApp {
                 if !hotkey_visible {
                     win.logic(shared, ui.ctx(), egui_owns_keys);
                 }
-                win.ui(shared, ui);
+                win.ui(shared, ui, !hotkey_visible);
             });
             (full_output, clear_color)
         };
@@ -1386,6 +1432,85 @@ mod tests {
 
     fn wid(n: u64) -> WindowId {
         WindowId::from(n)
+    }
+
+    fn key_event(key: egui::Key, pressed: bool, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::Key { key, physical_key: None, pressed, repeat: false, modifiers }
+    }
+
+    #[test]
+    fn strip_tab_presses_drops_tab_and_shift_tab_presses_only() {
+        let mut raw = egui::RawInput::default();
+        raw.events = vec![
+            key_event(egui::Key::Tab, true, egui::Modifiers::NONE),
+            key_event(egui::Key::Tab, true, egui::Modifiers::SHIFT),
+            key_event(egui::Key::Tab, false, egui::Modifiers::NONE),
+            key_event(egui::Key::Escape, true, egui::Modifiers::NONE),
+            egui::Event::Text("a".into()),
+        ];
+        strip_tab_presses(&mut raw);
+        assert_eq!(
+            raw.events,
+            vec![
+                key_event(egui::Key::Tab, false, egui::Modifiers::NONE),
+                key_event(egui::Key::Escape, true, egui::Modifiers::NONE),
+                egui::Event::Text("a".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn hotkey_hides_on_shift_escape_only() {
+        let esc = Key::Named(NamedKey::Escape);
+        assert!(is_hotkey_hide_key(&esc, ModifiersState::SHIFT));
+        // A bare Escape is the terminal's (vim, fzf, an interrupt).
+        assert!(!is_hotkey_hide_key(&esc, ModifiersState::empty()));
+        assert!(!is_hotkey_hide_key(&esc, ModifiersState::SHIFT | ModifiersState::CONTROL));
+        assert!(!is_hotkey_hide_key(&esc, ModifiersState::CONTROL));
+        assert!(!is_hotkey_hide_key(&Key::Named(NamedKey::Tab), ModifiersState::SHIFT));
+    }
+
+    /// Replay `Focused` events from the two windows through the same steps
+    /// the handlers take; returns the focus reports the pane would get.
+    fn replay_focus(events: &[(WindowKind, bool)]) -> (bool, Vec<bool>) {
+        let (mut main, mut hotkey, mut panes) = (true, false, true);
+        let mut reports = Vec::new();
+        for &(kind, focused) in events {
+            match kind {
+                WindowKind::Terminal => main = focused,
+                WindowKind::Hotkey => hotkey = focused,
+                _ => unreachable!(),
+            }
+            let any = panes_window_focused(main, hotkey);
+            if let Some(report) = crate::app_window::focus_change(panes, any) {
+                panes = report;
+                reports.push(report);
+            }
+        }
+        (panes, reports)
+    }
+
+    #[test]
+    fn dropdown_map_time_focus_loss_leaves_the_main_windows_focus() {
+        use WindowKind::{Hotkey, Terminal};
+        // X11 show: the dropdown's map_notify re-issues Focused(false) while
+        // the main window still has focus, then focus moves over.
+        let (panes, reports) = replay_focus(&[(Hotkey, false), (Terminal, false), (Hotkey, true)]);
+        assert!(panes);
+        assert_eq!(reports, vec![false, true]);
+        // The WM refuses the dropdown focus: the main window keeps it.
+        let (panes, reports) = replay_focus(&[(Hotkey, false)]);
+        assert!(panes);
+        assert!(reports.is_empty());
+        // Focus-in delivered ahead of the old window's focus-out: no flicker.
+        let (panes, reports) = replay_focus(&[(Hotkey, true), (Terminal, false)]);
+        assert!(panes);
+        assert!(reports.is_empty());
+        // Dropdown hides and another app takes focus.
+        let (panes, reports) =
+            replay_focus(&[(Terminal, false), (Hotkey, true), (Hotkey, false)]);
+        assert!(!panes);
+        assert_eq!(reports, vec![false, true, false]);
     }
 
     #[test]

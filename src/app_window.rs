@@ -221,6 +221,14 @@ fn can_process_more_actions(tab_count: usize) -> bool {
     tab_count != 0
 }
 
+/// The focus state to apply and report (`\e[I`/`\e[O`) when the panes' window
+/// focus goes from `current` to `any_focused`, or None when it is unchanged:
+/// a repeated event (X11 re-issues `Focused` on map), or one window losing
+/// focus while the other window showing these panes holds it, reports nothing.
+pub(crate) fn focus_change(current: bool, any_focused: bool) -> Option<bool> {
+    (current != any_focused).then_some(any_focused)
+}
+
 /// Push a profile's render defaults onto a single pane: the struct copy, the
 /// PTY-shared copy, and the `clear_wipes_scrollback` atomic the PTY parser
 /// reads — then mark the pane dirty and drop its cached frame. Shared by the
@@ -568,7 +576,7 @@ impl AppWindow {
     }
 
     /// A press the window consumed before it reached the key routing (the
-    /// hotkey window's Escape): its release goes nowhere.
+    /// hotkey window's Shift+Escape): its release goes nowhere.
     pub(crate) fn forget_key_press(&mut self, physical_key: PhysicalKey) {
         self.key_press_targets.remove(&physical_key);
     }
@@ -896,14 +904,26 @@ impl AppWindow {
         [0.0, 0.0, 0.0, 0.0]
     }
 
-    pub(crate) fn notify_focus(&mut self, focused: bool) {
-        self.window_focused = focused;
-        if focused {
+    /// An OS window showing this window's panes (the main window or the
+    /// hotkey dropdown) gained (`gained`) or lost focus; `any_focused` is
+    /// whether any of those windows holds focus now. The panes' focus state —
+    /// cursor blink/shape and the focus-in/out report (`\e[I`/`\e[O`) — follows
+    /// `any_focused` and changes only when it does, so one window's event
+    /// cannot overwrite the other's state (the dropdown's map-time
+    /// `Focused(false)` while the main window still has focus). The stale
+    /// egui-focus clear (`focus_regained`) is per egui context, so any window
+    /// gaining focus arms it.
+    pub(crate) fn notify_focus(&mut self, gained: bool, any_focused: bool) {
+        if gained {
             self.focus_regained = true;
         }
+        let Some(report) = focus_change(self.window_focused, any_focused) else {
+            return;
+        };
+        self.window_focused = report;
         if let Some(tab) = self.tab_mgr.tabs.get(self.tab_mgr.active_tab) {
             if let Some(pane) = tab.panes.get(&tab.focused) {
-                pane.send_focus_event(focused);
+                pane.send_focus_event(report);
             }
         }
     }
@@ -1085,7 +1105,10 @@ impl AppWindow {
         }
     }
 
-    pub(crate) fn ui(&mut self, shared: &mut AppShared, ui: &mut egui::Ui) {
+    /// `owns_grid_size`: this paint sizes the panes' grids to its pane rects
+    /// (see `PaneViewCtx::owns_grid_size`). The main window and the hotkey
+    /// dropdown both draw this window's panes; only one of them may.
+    pub(crate) fn ui(&mut self, shared: &mut AppShared, ui: &mut egui::Ui, owns_grid_size: bool) {
         let pane_count = self.tab_mgr.total_alive_panes();
         match self.dialogs.draw_close_dialog(ui.ctx(), pane_count) {
             DialogAction::ConfirmCloseAndDisable => {
@@ -1202,6 +1225,7 @@ impl AppWindow {
                 renderer: &self.renderer,
                 cursor_blink_epoch: shared.cursor_blink_epoch,
                 window_focused: self.window_focused,
+                owns_grid_size,
                 user_config: view_config,
                 bindings: &shared.bindings,
                 egui_ctx: &egui_ctx,
