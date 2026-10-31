@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -55,6 +56,9 @@ pub(crate) struct PaneViewState {
     /// `Action` (that enum is Copy/Hash); it is staged here and applied by the
     /// App after `draw_panes`, exactly like `layout_restore_pending`.
     pub profile_switch_pending: Option<(PaneId, ProfileName)>,
+    /// Panes drawn in this window's egui context, so `prune_closed_panes` can
+    /// drop their egui state once they are gone.
+    drawn_panes: HashSet<PaneId>,
 }
 
 impl PaneViewState {
@@ -67,7 +71,84 @@ impl PaneViewState {
             layout_restore_pending: None,
             pending_external_drop: None,
             profile_switch_pending: None,
+            drawn_panes: HashSet::new(),
         }
+    }
+}
+
+/// egui ids of one pane's widgets, temp data and context menu. Keyed by the
+/// pane's process-unique `PaneId` alone: they used to include the tab's index,
+/// which shifts when an earlier tab closes or tabs are reordered, orphaning
+/// the old entries (egui never drops temp data on its own) and changing the
+/// pane's widget ids under it. `prune_closed_panes` removes a closed pane's
+/// temp data.
+#[derive(Clone, Copy)]
+struct PaneEguiIds {
+    surface: egui::Id,
+    title_bar: egui::Id,
+    scrollbar: egui::Id,
+    /// `HeldButtons` temp data.
+    buttons: egui::Id,
+    /// `ClickInfo` temp data.
+    clicks: egui::Id,
+    /// Last reported motion cell, `(i32, i32)` temp data.
+    motion_cell: egui::Id,
+    /// Wheel carry, `f32` temp data.
+    wheel: egui::Id,
+    /// The context menu's popup (its `Area` and root `MenuState`).
+    menu: egui::Id,
+}
+
+impl PaneEguiIds {
+    fn new(pane: PaneId) -> Self {
+        Self {
+            surface: egui::Id::new(("pane", pane)),
+            title_bar: egui::Id::new(("title_bar", pane)),
+            scrollbar: egui::Id::new(("scrollbar", pane)),
+            buttons: egui::Id::new(("pane_buttons", pane)),
+            clicks: egui::Id::new(("pane_clicks", pane)),
+            motion_cell: egui::Id::new(("pane_motion_cell", pane)),
+            wheel: egui::Id::new(("pane_wheel", pane)),
+            menu: egui::Id::new(("pane_menu", pane)),
+        }
+    }
+}
+
+/// Drop the egui temp data of panes drawn here that no tab of this window
+/// holds any more (closed, or moved to another window, whose egui context
+/// starts them afresh). Runs every frame, so it covers every way a pane goes.
+///
+/// The context menu's `Area` state cannot be removed: egui has no public API
+/// for it. It is one small entry per pane that ever opened its menu, and with
+/// the pane-id key it no longer multiplies as the pane's tab index changes.
+fn prune_closed_panes(state: &mut PaneViewState, tab_mgr: &TabManager, egui_ctx: &egui::Context) {
+    let live = |id: &PaneId| tab_mgr.tabs.iter().any(|t| t.panes.contains_key(id));
+    if state.drawn_panes.iter().all(live) {
+        return;
+    }
+    let gone: Vec<PaneId> = state.drawn_panes.iter().copied().filter(|id| !live(id)).collect();
+    // Submenu state (the Profiles submenu) is keyed by ids inside the menu,
+    // which this cannot name; egui itself resets every `MenuState` by type when
+    // a menu closes, and a menu that is not shown resets its state anyway, so
+    // do the same while no popup is open.
+    let no_popup_open = !egui::Popup::is_any_open(egui_ctx);
+    egui_ctx.data_mut(|d| {
+        for &pane in &gone {
+            let ids = PaneEguiIds::new(pane);
+            d.remove::<HeldButtons>(ids.buttons);
+            d.remove::<ClickInfo>(ids.clicks);
+            d.remove::<(i32, i32)>(ids.motion_cell);
+            d.remove::<f32>(ids.wheel);
+            d.remove::<egui::containers::menu::MenuState>(
+                ids.menu.with(egui::containers::menu::MenuState::ID),
+            );
+        }
+        if no_popup_open {
+            d.remove_by_type::<egui::containers::menu::MenuState>();
+        }
+    });
+    for pane in gone {
+        state.drawn_panes.remove(&pane);
     }
 }
 
@@ -97,6 +178,7 @@ pub(crate) fn draw_panes(
     ctx: &mut PaneViewCtx<'_>,
     ui: &mut egui::Ui,
 ) -> Vec<Action> {
+    prune_closed_panes(state, ctx.tab_mgr, ui.ctx());
     let root_rect = ui.available_rect_before_wrap();
     state.last_root_rect = Some(root_rect);
     state.quiet_rects.clear();
@@ -201,6 +283,8 @@ fn draw_leaf(
     }
 
     pane_drop_rects.push((id, rect));
+    state.drawn_panes.insert(id);
+    let egui_ids = PaneEguiIds::new(id);
 
     let reports_any_motion = ctx.tab_mgr.tabs[ctx.tab_mgr.active_tab]
         .panes
@@ -216,7 +300,7 @@ fn draw_leaf(
 
     let response = ui.interact(
         terminal_rect,
-        egui::Id::new(("pane", ctx.tab_mgr.active_tab, id)),
+        egui_ids.surface,
         egui::Sense::click_and_drag(),
     );
 
@@ -281,6 +365,7 @@ fn draw_leaf(
     };
     let scope = ctx.tab_mgr.broadcast_scope;
     egui::Popup::context_menu(&response)
+        .id(egui_ids.menu)
         .open_memory(open_cmd)
         .show(|ui| {
             build_context_menu(
@@ -315,7 +400,7 @@ fn draw_title_bar(
 
     let title_resp = ui.interact(
         title_rect,
-        egui::Id::new(("title_bar", ctx.tab_mgr.active_tab, id)),
+        PaneEguiIds::new(id).title_bar,
         egui::Sense::click_and_drag(),
     );
     // Focus moves through `set_focused_pane` so the pane losing it gets its
@@ -564,7 +649,8 @@ fn handle_pane_mouse(
     });
     let mut down = buttons_down_before(down_at_end, &events);
 
-    let held_id = egui::Id::new(("pane_buttons", tab_idx, pane_id));
+    let egui_ids = PaneEguiIds::new(pane_id);
+    let held_id = egui_ids.buttons;
     let mut held: HeldButtons = ui.ctx().data(|d| d.get_temp(held_id)).unwrap_or_default();
     let held_before = held;
     // A release the pane never saw (its tab was hidden, a popup had the
@@ -576,14 +662,14 @@ fn handle_pane_mouse(
         }
     }
     let was_selecting = held.0[0] == Some(PressOwner::Selection);
-    let clicks_id = egui::Id::new(("pane_clicks", tab_idx, pane_id));
+    let clicks_id = egui_ids.clicks;
     let mut clicks: ClickInfo = ui.ctx().data(|d| d.get_temp(clicks_id)).unwrap_or_default();
     let clicks_before = clicks;
-    let motion_id = egui::Id::new(("pane_motion_cell", tab_idx, pane_id));
+    let motion_id = egui_ids.motion_cell;
     // The fraction of a wheel notch left over by earlier events (VTE's
     // `m_mouse_smooth_scroll_delta`), kept in egui temp data like the rest of
     // the pane's pointer state; see `wheel_action`.
-    let wheel_id = egui::Id::new(("pane_wheel", tab_idx, pane_id));
+    let wheel_id = egui_ids.wheel;
     let mut wheel_carry: f32 = ui.ctx().data(|d| d.get_temp(wheel_id)).unwrap_or(0.0);
     let wheel_carry_before = wheel_carry;
 
@@ -1069,7 +1155,6 @@ fn apply_external_drop(
 
 fn paint_scrollbar(
     ui: &mut egui::Ui,
-    tab_idx: usize,
     tab: &crate::tabs::Tab,
     pane_id: PaneId,
     inner_rect: egui::Rect,
@@ -1093,7 +1178,7 @@ fn paint_scrollbar(
                 egui::vec2(sb_width, thumb_h),
             );
 
-            let sb_id = egui::Id::new(("scrollbar", tab_idx, pane_id));
+            let sb_id = PaneEguiIds::new(pane_id).scrollbar;
             let resp = ui.interact(track, sb_id, egui::Sense::click_and_drag());
 
             let hovered = resp.hovered() || resp.dragged();
@@ -1494,7 +1579,7 @@ fn paint_pane(
         callback: Arc::new(cb),
     });
 
-    paint_scrollbar(ui, ctx.tab_mgr.active_tab, &ctx.tab_mgr.tabs[ctx.tab_mgr.active_tab], pane_id, inner_rect);
+    paint_scrollbar(ui, &ctx.tab_mgr.tabs[ctx.tab_mgr.active_tab], pane_id, inner_rect);
 
     static SHOW_FOCUS_BORDER: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         std::env::var("RUSTINATOR_NO_FOCUS_BORDER").is_err()
