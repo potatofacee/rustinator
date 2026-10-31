@@ -12,6 +12,7 @@ mod input;
 mod keybindings;
 mod keyboard;
 mod layout;
+mod logging;
 mod mouse;
 mod pane;
 mod pane_ui;
@@ -32,13 +33,13 @@ pub mod window;
 pub(crate) use input::RawTermKey;
 
 fn main() {
-    let _ = env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("info"),
-    )
-    .try_init();
+    let logs_on_stderr = logging::init();
 
     if let Err(e) = window::run() {
-        eprintln!("fatal: {e}");
+        log::error!("fatal: {e}");
+        if !logs_on_stderr {
+            eprintln!("fatal: {e}");
+        }
         std::process::exit(1);
     }
 }
