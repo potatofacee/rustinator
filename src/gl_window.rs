@@ -169,7 +169,13 @@ impl GlWindow {
                 if let (true, Some(widget)) = (pressed, focused) {
                     let read = match reader.submit(Selection::Clipboard) {
                         Some(id) => PasteRead::Waiting(id),
-                        None => PasteRead::Done(clipboard_read::read_now(Selection::Clipboard)),
+                        None => {
+                            let _phase = crate::watchdog::phase(
+                                crate::watchdog::Phase::ClipboardRead,
+                                Selection::Clipboard.watchdog_detail(),
+                            );
+                            PasteRead::Done(clipboard_read::read_now(Selection::Clipboard))
+                        }
                     };
                     let at = self.egui_winit.egui_input().events.len();
                     self.text_pastes.chord(at, widget, read);
@@ -225,8 +231,14 @@ impl GlWindow {
         full_output: egui::FullOutput,
         clear_color: [f32; 4],
     ) -> Option<Instant> {
-        self.egui_winit
-            .handle_platform_output(&self.window, full_output.platform_output);
+        use crate::watchdog::{Phase, phase};
+
+        {
+            // Cursor icon, IME, and the clipboard writes egui queued (copy).
+            let _phase = phase(Phase::PlatformOutput, 0);
+            self.egui_winit
+                .handle_platform_output(&self.window, full_output.platform_output);
+        }
 
         let mut repaint_at = None;
         if let Some(vp_out) = full_output.viewport_output.get(&self.egui_ctx.viewport_id()) {
@@ -242,16 +254,24 @@ impl GlWindow {
         let screen_size: [u32; 2] = self.window.inner_size().into();
         let pixels_per_point = egui_winit::pixels_per_point(&self.egui_ctx, &self.window);
 
-        let clipped_primitives = self.egui_ctx.tessellate(full_output.shapes, pixels_per_point);
+        let clipped_primitives = {
+            let _phase = phase(Phase::Tessellate, 0);
+            self.egui_ctx.tessellate(full_output.shapes, pixels_per_point)
+        };
 
-        self.painter.clear(screen_size, clear_color);
-        self.painter.paint_and_update_textures(
-            screen_size,
-            pixels_per_point,
-            &clipped_primitives,
-            &full_output.textures_delta,
-        );
+        {
+            // Includes the panes' GL draws (egui paint callbacks).
+            let _phase = phase(Phase::GlPaint, 0);
+            self.painter.clear(screen_size, clear_color);
+            self.painter.paint_and_update_textures(
+                screen_size,
+                pixels_per_point,
+                &clipped_primitives,
+                &full_output.textures_delta,
+            );
+        }
 
+        let _phase = phase(Phase::SwapBuffers, 0);
         self.swap_buffers(main_context);
 
         repaint_at

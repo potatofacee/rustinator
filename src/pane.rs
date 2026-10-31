@@ -71,7 +71,12 @@ fn reap_off_thread(value: Box<dyn Send>) {
         let (tx, rx) = mpsc::channel::<Box<dyn Send>>();
         std::thread::Builder::new()
             .name("term reaper".into())
-            .spawn(move || rx.into_iter().for_each(drop))
+            .spawn(move || {
+                for value in rx {
+                    let _activity = crate::watchdog::activity(crate::watchdog::Activity::ReaperDrop, 0);
+                    drop(value);
+                }
+            })
             .ok()
             .map(|_| tx)
     });
@@ -1071,6 +1076,7 @@ fn spawn_pty<U: EventListener + Send + 'static>(
     paused: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
     alacritty_terminal::thread::spawn_named("PTY spawn", move || {
+        let spawning = crate::watchdog::activity(crate::watchdog::Activity::PtySpawn, 0);
         // `tty::new` is `openpty` + `tty::from_fd`; on macOS the PTY is opened
         // here instead (see `open_pty_cloexec`).
         #[cfg(target_os = "macos")]
@@ -1078,6 +1084,7 @@ fn spawn_pty<U: EventListener + Send + 'static>(
             .and_then(|(master, slave)| tty::from_fd(&opts, window_id, master, slave));
         #[cfg(not(target_os = "macos"))]
         let pty = tty::new(&opts, window_size, window_id);
+        drop(spawning);
         let pty = match pty {
             Ok(pty) => pty,
             Err(e) => {
@@ -1175,6 +1182,9 @@ pub struct Pane {
     pub title: Arc<Mutex<Option<String>>>,
     pub visible: Arc<AtomicBool>,
     pub cached: Option<Arc<Frame>>,
+    /// Scrollback lines at the last snapshot, for the hang watchdog's report
+    /// (read without the terminal lock; stale for a hidden pane).
+    history_lines: AtomicUsize,
     /// Focus state the cached frame was rendered with; a change forces a
     /// re-snapshot so the inactive color factors are (un)applied.
     last_focused: bool,
@@ -1326,6 +1336,7 @@ impl Pane {
             title,
             visible,
             cached: None,
+            history_lines: AtomicUsize::new(0),
             last_focused: false,
             clear_wipes_scrollback,
             defaults,
@@ -1376,6 +1387,7 @@ impl Pane {
             title: Arc::clone(&proxy.title),
             visible: Arc::clone(&proxy.visible),
             cached: None,
+            history_lines: AtomicUsize::new(0),
             last_focused: false,
             clear_wipes_scrollback: Arc::new(AtomicBool::new(false)),
             defaults,
@@ -1749,6 +1761,11 @@ impl Pane {
         mark_visible(&self.visible, &self.wake_pending, &self.dirty, visible)
     }
 
+    /// Scrollback lines as of the last snapshot. No lock.
+    pub fn history_lines(&self) -> usize {
+        self.history_lines.load(Ordering::Relaxed)
+    }
+
     pub fn send_focus_event(&self, focused: bool) {
         if let Some(bytes) = crate::input::focus_event_bytes(self.mode(), focused) {
             self.send_bytes(bytes);
@@ -1978,6 +1995,7 @@ impl Pane {
     /// selection colors, and non-default cell backgrounds are left untouched.
     pub fn snapshot(&self, focused: bool) -> Frame {
         let term = self.terminal.lock();
+        self.history_lines.store(term.grid().history_size(), Ordering::Relaxed);
         let lines = term.screen_lines() as i32;
         let content = term.renderable_content();
         let palette = content.colors;

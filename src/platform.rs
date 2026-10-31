@@ -12,6 +12,7 @@ use winit::window::Window;
 /// `wait()` would also work, but would live as long as the launched window.
 /// stdio and session are inherited, as with a plain `spawn`.
 pub(crate) fn spawn_detached(cmd: &mut Command) {
+    let _phase = crate::watchdog::phase(crate::watchdog::Phase::LaunchProcess, 0);
     if let Err(e) = detach(cmd) {
         log::warn!("failed to launch {:?}: {e}", cmd.get_program());
     }

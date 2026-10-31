@@ -110,6 +110,10 @@ pub struct GlobalConfig {
     /// iTerm2's "Esc+". Read only on macOS (`Config::option_types_characters`).
     #[serde(default)]
     pub macos_option_types_characters: bool,
+    /// Log a report when the UI thread stops responding for over 2 s
+    /// (`crate::watchdog`). Off: the watchdog thread is not running.
+    #[serde(default = "default_true")]
+    pub hang_watchdog: bool,
 }
 
 /// Where the tab bar is positioned. `Hidden` suppresses the panel entirely.
@@ -392,6 +396,7 @@ impl Default for GlobalConfig {
             smart_copy: true,
             disable_mouse_paste: false,
             macos_option_types_characters: false,
+            hang_watchdog: true,
         }
     }
 }
@@ -1097,6 +1102,22 @@ mod tests {
         // Old config missing the key: Option is Alt.
         let cfg: Config = toml::from_str("[global]\nconfirm_on_close = false\n").unwrap();
         assert!(!cfg.global.macos_option_types_characters);
+    }
+
+    #[test]
+    fn hang_watchdog_is_global_and_defaults_on() {
+        assert!(GlobalConfig::default().hang_watchdog);
+
+        let mut cfg = Config::default();
+        cfg.global.hang_watchdog = false;
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        assert!(text.contains("hang_watchdog = false"));
+        let parsed: Config = toml::from_str(&text).unwrap();
+        assert!(!parsed.global.hang_watchdog);
+
+        // Old config missing the key: on.
+        let cfg: Config = toml::from_str("[global]\nconfirm_on_close = false\n").unwrap();
+        assert!(cfg.global.hang_watchdog);
     }
 
     // R-034: Ctrl+wheel zoom can be turned off. Per profile in Terminator

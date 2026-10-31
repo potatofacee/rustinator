@@ -30,6 +30,7 @@ mod tabs;
 mod term_gate;
 mod term_handler;
 mod title_bar;
+mod watchdog;
 pub mod window;
 
 pub(crate) use input::RawTermKey;

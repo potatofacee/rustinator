@@ -35,6 +35,16 @@ pub(crate) enum Selection {
     Primary,
 }
 
+impl Selection {
+    /// The hang watchdog's detail for a read of this selection.
+    pub(crate) fn watchdog_detail(self) -> u64 {
+        match self {
+            Selection::Clipboard => crate::watchdog::SELECTION_CLIPBOARD,
+            Selection::Primary => crate::watchdog::SELECTION_PRIMARY,
+        }
+    }
+}
+
 /// A paste asked for by an action, with its targets resolved when it was
 /// asked for, as the blocking read did. They are looked up again when the
 /// text arrives, and panes gone by then are skipped.
@@ -128,7 +138,12 @@ mod reader {
                 for job in rx {
                     // Every job is answered, a panicking read included, so a
                     // paste the gate holds keys behind always completes.
+                    let activity = crate::watchdog::activity(
+                        crate::watchdog::Activity::ClipboardRead,
+                        job.selection.watchdog_detail(),
+                    );
                     let text = std::panic::catch_unwind(|| read_now(job.selection)).unwrap_or(None);
+                    drop(activity);
                     if proxy.send_event(UserEvent::ClipboardRead { id: job.id, text }).is_err() {
                         return; // the event loop is gone
                     }

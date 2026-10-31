@@ -31,6 +31,7 @@ use crate::profile::{self, defaults_from_profile, ProfileName};
 use crate::renderer::Renderer;
 use crate::tab_bar::{self, TabBarState, TabBarView};
 use crate::tabs::{self, FocusDir, PaneFactory, TabManager};
+use crate::watchdog::{self, Phase};
 use crate::RawTermKey;
 
 /// Per-window font state: cell metrics, the live zoom/DPI multipliers, and the
@@ -394,7 +395,10 @@ impl AppWindow {
                 Action::NextTab => self.tab_mgr.switch_tab(1),
                 Action::PrevTab => self.tab_mgr.switch_tab(-1),
                 Action::OpenPrefs => shared.open_prefs(),
-                Action::Copy => self.tab_mgr.copy_selection(&self.gl_window.egui_ctx),
+                Action::Copy => {
+                    let _phase = watchdog::phase(Phase::Copy, self.tab_mgr.active_tab().focused);
+                    self.tab_mgr.copy_selection(&self.gl_window.egui_ctx)
+                }
                 Action::Paste => self.tab_mgr.paste_from_clipboard(),
                 // `key_paste_selection` (terminal.py:2034-2035): PRIMARY into
                 // the same broadcast targets as Paste.
@@ -419,9 +423,18 @@ impl AppWindow {
                 | Action::InsertNumber | Action::InsertPadded => self.dispatch_group_action(action),
                 Action::NextProfile | Action::PreviousProfile => self.dispatch_profile_action(shared, action),
                 Action::ToggleSearch => self.tab_mgr.toggle_search(&mut self.dialogs),
-                Action::ZoomIn => self.font.adjust_font_size(1.0, &self.renderer, shared.base_size, &shared.user_config.active().font.family.clone(), &mut self.tab_mgr),
-                Action::ZoomOut => self.font.adjust_font_size(-1.0, &self.renderer, shared.base_size, &shared.user_config.active().font.family.clone(), &mut self.tab_mgr),
-                Action::ZoomReset => self.font.reset_font_size(&self.renderer, shared.base_size, &shared.user_config.active().font.family.clone(), &mut self.tab_mgr),
+                Action::ZoomIn => {
+                    let _phase = watchdog::phase(Phase::FontChange, 0);
+                    self.font.adjust_font_size(1.0, &self.renderer, shared.base_size, &shared.user_config.active().font.family.clone(), &mut self.tab_mgr)
+                }
+                Action::ZoomOut => {
+                    let _phase = watchdog::phase(Phase::FontChange, 0);
+                    self.font.adjust_font_size(-1.0, &self.renderer, shared.base_size, &shared.user_config.active().font.family.clone(), &mut self.tab_mgr)
+                }
+                Action::ZoomReset => {
+                    let _phase = watchdog::phase(Phase::FontChange, 0);
+                    self.font.reset_font_size(&self.renderer, shared.base_size, &shared.user_config.active().font.family.clone(), &mut self.tab_mgr)
+                }
                 Action::CloseWindow => {
                     if self.should_confirm_close(shared) {
                         self.dialogs.close_dialog_open = true;
@@ -671,7 +684,10 @@ impl AppWindow {
             }
             let read = match shared.clipboard_reader.submit(req.selection) {
                 Some(id) => PasteRead::Waiting(id),
-                None => PasteRead::Done(clipboard_read::read_now(req.selection)),
+                None => {
+                    let _phase = watchdog::phase(Phase::ClipboardRead, req.selection.watchdog_detail());
+                    PasteRead::Done(clipboard_read::read_now(req.selection))
+                }
             };
             self.paste_gate.paste(&req.targets, read);
         }
@@ -690,7 +706,10 @@ impl AppWindow {
         while let Some((id, step)) = self.paste_gate.next() {
             let Some(pane) = self.pane(id) else { continue };
             match step {
-                Step::Paste(Some(text)) if !pane.read_only => pane.send_paste(&text),
+                Step::Paste(Some(text)) if !pane.read_only => {
+                    let _phase = watchdog::phase(Phase::Paste, text.len() as u64);
+                    pane.send_paste(&text)
+                }
                 Step::Paste(_) => {}
                 Step::Input(HeldInput::Key(rk)) if rk.is_press() => {
                     sent_input |= input::send_key(&rk, &[pane], scroll_on_keystroke);
@@ -860,6 +879,7 @@ impl AppWindow {
     /// code updated `base_size`/`size_override` only inside the reload `Ok` arm.
     pub(crate) fn apply_config(&mut self, shared: &mut AppShared, delta: &ConfigDelta) {
         if let Some(fr) = &delta.font_reload {
+            let _phase = watchdog::phase(Phase::FontChange, 0);
             match self.font.reload_font(&fr.family, fr.size, &self.renderer) {
                 Ok(()) => {
                     // M10: a prefs size change is the new zoom anchor. Update the
@@ -900,8 +920,10 @@ impl AppWindow {
         let result = shared.prefs.draw(ui, &shared.bindings);
         match result {
             PrefsResult::Applied(config) => {
+                let _phase = watchdog::phase(Phase::PrefsApply, 0);
                 let delta = shared.apply_global(config);
                 self.apply_config(shared, &delta);
+                let _save = watchdog::phase(Phase::ConfigSave, 0);
                 match shared.user_config.save() {
                     Ok(path) => shared.prefs.status = Some(format!("Saved to {}", path.display())),
                     Err(e) => shared.prefs.status = Some(format!("Save failed: {e}")),
@@ -989,7 +1011,10 @@ impl AppWindow {
         }
         let factory = shared.pane_factory(&self.font);
         let exit_action = shared.user_config.active().exit_action;
-        self.tab_mgr.reap_exited(exit_action, &self.gl_window.egui_ctx, &mut self.dialogs, &factory);
+        {
+            let _phase = watchdog::phase(Phase::ReapExited, 0);
+            self.tab_mgr.reap_exited(exit_action, &self.gl_window.egui_ctx, &mut self.dialogs, &factory);
+        }
         // Scaled zoom invariant: drop the global font multiplier once the active
         // tab is no longer zoomed.
         self.sync_zoom_scale(shared);
@@ -1189,7 +1214,10 @@ impl AppWindow {
         let layout_names: Vec<String> =
             shared.user_config.layouts.iter().map(|l| l.name.clone()).collect();
         match self.dialogs.draw_layout_launcher(ui.ctx(), &layout_names) {
-            DialogAction::LaunchLayout(name) => self.restore_named_layout(shared, &name),
+            DialogAction::LaunchLayout(name) => {
+                let _phase = watchdog::phase(Phase::LayoutRestore, 0);
+                self.restore_named_layout(shared, &name)
+            }
             _ => {}
         }
         // New-group naming dialog: assign the typed name to the one pane whose
@@ -1245,6 +1273,7 @@ impl AppWindow {
             if self.pending_zoom_steps != 0 {
                 let steps = self.pending_zoom_steps;
                 self.pending_zoom_steps = 0;
+                let _phase = watchdog::phase(Phase::FontChange, 0);
                 let family = shared.user_config.active().font.family.clone();
                 self.font.adjust_font_size(steps as f32, &self.renderer, shared.base_size, &family, &mut self.tab_mgr);
             }
@@ -1281,6 +1310,7 @@ impl AppWindow {
             self.execute_pane_actions(shared, ui.ctx(), deferred);
 
             if let Some(saved) = self.pane_view.layout_restore_pending.take() {
+                let _phase = watchdog::phase(Phase::LayoutRestore, 0);
                 let factory = shared.pane_factory(&self.font);
                 self.tab_mgr
                     .restore_layout(&saved, &factory, &shared.user_config);
@@ -1306,16 +1336,21 @@ impl AppWindow {
     /// events, deferred pane actions), and `ui` runs in both the main and the
     /// hotkey paint, whereas `logic` is skipped in the main one while the
     /// dropdown is up. A newly shown pane whose output arrived while it was
-    /// still marked hidden gets the Repaint its PTY thread skipped.
+    /// still marked hidden gets the Repaint its PTY thread skipped. Also
+    /// hands the hang watchdog the pane count and scrollback size.
     fn sync_pane_visibility(&self, shared: &AppShared) {
         let active_tab = self.tab_mgr.active_tab;
         let mut needs_repaint = false;
+        let (mut panes, mut history_lines) = (0, 0);
         for (idx, tab) in self.tab_mgr.tabs.iter().enumerate() {
             let visible = idx == active_tab;
             for pane in tab.panes.values() {
                 needs_repaint |= pane.set_visible(visible);
+                panes += 1;
+                history_lines += pane.history_lines();
             }
         }
+        watchdog::publish_panes(panes, history_lines);
         if needs_repaint {
             shared.wake_main();
         }

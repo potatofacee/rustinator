@@ -49,6 +49,7 @@ use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::{Term, TermMode};
 
 use crate::pty_event_loop::EventLoopSender;
+use crate::watchdog::{self, Activity};
 
 /// What the UI thread reads from a terminal every frame (its mode and
 /// `Pane::scroll_info`'s scroll position) and on every key press
@@ -223,6 +224,13 @@ impl<T> TermGate<T> {
         prepare: impl FnOnce(&mut Term<T>),
         work: impl FnOnce(&mut Term<T>) -> R,
     ) -> std::thread::Result<R> {
+        let mut activity = watchdog::activity(
+            Activity::GateWait,
+            match kind {
+                HoldKind::Search => watchdog::HOLD_SEARCH,
+                HoldKind::Reflow => watchdog::HOLD_REFLOW,
+            },
+        );
         let mut state = self.gate();
         while state.held.is_some() {
             state = self.released.wait(state).unwrap_or_else(PoisonError::into_inner);
@@ -235,7 +243,13 @@ impl<T> TermGate<T> {
         let lease = terminal.lease();
         let mut term = terminal.lock_unfair();
         let prepared = catch_unwind(AssertUnwindSafe(|| prepare(&mut term)));
-        state.held = Some(Held { kind, view: TermView::of(&term) });
+        let view = TermView::of(&term);
+        let holding = match kind {
+            HoldKind::Search => Activity::GateHoldSearch,
+            HoldKind::Reflow => Activity::GateHoldReflow,
+        };
+        activity.set(holding, view.history as u64);
+        state.held = Some(Held { kind, view });
         drop(state);
 
         let result = prepared.and_then(|()| catch_unwind(AssertUnwindSafe(|| work(&mut term))));

@@ -15,6 +15,7 @@ use crate::gl_window::GlWindow;
 use crate::input::encode_raw_key;
 use crate::pane_ui::ExternalDrop;
 use crate::platform::apply_hotkey_geometry;
+use crate::watchdog::{self, Phase};
 #[cfg(target_os = "macos")]
 use crate::platform::{macos_activate_pid, macos_frontmost_pid, macos_order_window_back};
 
@@ -542,6 +543,12 @@ impl WinitApp {
 }
 
 impl ApplicationHandler<UserEvent> for WinitApp {
+    // The loop woke from its wait: the hang watchdog times this iteration
+    // until `about_to_wait` ends it (waiting for events is not a stall).
+    fn new_events(&mut self, _event_loop: &ActiveEventLoop, _cause: winit::event::StartCause) {
+        watchdog::ui_busy();
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.main_window_id.is_some() {
             return;
@@ -602,6 +609,13 @@ impl ApplicationHandler<UserEvent> for WinitApp {
     }
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
+        watchdog::ui_event();
+        let kind = match &event {
+            UserEvent::Repaint => watchdog::USER_EVENT_REPAINT,
+            UserEvent::ClipboardRead { .. } => watchdog::USER_EVENT_CLIPBOARD,
+            UserEvent::HotkeyTogglePressed => watchdog::USER_EVENT_HOTKEY,
+        };
+        let _phase = watchdog::phase(Phase::UserEvent, kind);
         match event {
             UserEvent::Repaint => {
                 self.repaint_pending = true;
@@ -653,30 +667,39 @@ impl ApplicationHandler<UserEvent> for WinitApp {
         window_id: WindowId,
         event: WindowEvent,
     ) {
+        watchdog::ui_event();
         if self.shutting_down {
             return;
         }
         let prefs_id = self.prefs.as_ref().map(|p| p.gl_window.window.id());
         let hotkey_id = self.hotkey_window.as_ref().map(|h| h.gl_window.window.id());
         let kind = classify(window_id, prefs_id, hotkey_id, self.main_window_id);
+        let event_code = watchdog::event_code(&event);
 
         if kind == WindowKind::Prefs {
+            let _phase = watchdog::phase(Phase::PrefsEvent, event_code);
             self.handle_prefs_window_event(event);
             return;
         }
 
         if kind == WindowKind::Hotkey {
+            let _phase = watchdog::phase(Phase::HotkeyEvent, event_code);
             self.handle_hotkey_window_event(event);
             return;
         }
 
+        let _phase = watchdog::phase(Phase::MainEvent, event_code);
         self.handle_main_window_event(event_loop, event);
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Last handler before winit waits: the iteration ends on every
+        // return path, after the governor's work below.
+        let _idle = watchdog::idle_on_return();
         if self.shutting_down {
             return;
         }
+        let _phase = watchdog::phase(Phase::AboutToWait, 0);
         let now = Instant::now();
         let interval = self.effective_frame_interval(self.input_pending);
         let hotkey_interval = self.effective_frame_interval(
@@ -867,6 +890,7 @@ impl WinitApp {
                         if let Some(win) =
                             self.main_window_id.and_then(|id| self.windows.get_mut(&id))
                         {
+                            let _phase = watchdog::phase(Phase::PrefsPaint, 0);
                             prefs.paint(win, shared, gl.context());
                             win.gl_window.make_current(gl.context());
                         }
@@ -1024,6 +1048,7 @@ impl WinitApp {
                         if let Some(win) =
                             self.main_window_id.and_then(|id| self.windows.get_mut(&id))
                         {
+                            let _phase = watchdog::phase(Phase::HotkeyPaint, 0);
                             hk.paint(win, shared, gl.context());
                             win.gl_window.make_current(gl.context());
                         }
@@ -1250,7 +1275,10 @@ impl WinitApp {
                 .get_mut(&self.main_window_id.unwrap())
                 .unwrap();
 
-            let mut raw_input = win.gl_window.begin_frame(gl.context());
+            let mut raw_input = {
+                let _phase = watchdog::phase(Phase::BeginFrame, 0);
+                win.gl_window.begin_frame(gl.context())
+            };
             // Who owns this frame's keys is the focus state they arrived under,
             // sampled before egui's pass: `begin_pass` reacts to the very keys
             // being routed (an unmodified Escape drops a TextEdit's focus), so
@@ -1282,8 +1310,10 @@ impl WinitApp {
             let egui_ctx = win.gl_window.egui_ctx.clone();
             let full_output = egui_ctx.run_ui(raw_input, |ui| {
                 if !hotkey_visible {
+                    let _phase = watchdog::phase(Phase::Logic, 0);
                     win.logic(shared, ui.ctx(), egui_owns_keys);
                 }
+                let _phase = watchdog::phase(Phase::Ui, 0);
                 win.ui(shared, ui, !hotkey_visible);
             });
             (full_output, clear_color)
@@ -1304,6 +1334,7 @@ impl WinitApp {
         // are egui PaintCallbacks, which run inside end_frame's paint.
         let render_started = Instant::now();
         {
+            let _phase = watchdog::phase(Phase::EndFrame, 0);
             let gl = self.gl.as_ref().unwrap();
             let win = self
                 .windows
@@ -1377,6 +1408,7 @@ impl WinitApp {
             return;
         }
         shared.hotkey_changed = false;
+        let _phase = watchdog::phase(Phase::WindowSetup, 0);
         let gl = self.gl.as_ref().unwrap();
         let win = self.windows.get(&self.main_window_id.unwrap()).unwrap();
         let hk_cfg = &shared.user_config.hotkey_window;
@@ -1446,6 +1478,7 @@ impl WinitApp {
         let gl = self.gl.as_ref().unwrap();
         let win = self.windows.get(&self.main_window_id.unwrap()).unwrap();
         if shared.prefs.open && self.prefs.is_none() {
+            let _phase = watchdog::phase(Phase::WindowSetup, 0);
             self.prefs = Some(PrefsWindowState::new(
                 event_loop,
                 &gl.gl_display,
@@ -1455,6 +1488,7 @@ impl WinitApp {
             ));
             win.gl_window.make_current(gl.context());
         } else if !shared.prefs.open && self.prefs.is_some() {
+            let _phase = watchdog::phase(Phase::WindowSetup, 0);
             if let Some(prefs) = self.prefs.take() {
                 prefs.destroy(gl.context());
             }

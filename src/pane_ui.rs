@@ -763,6 +763,10 @@ fn handle_pane_mouse(
                         pane.update_selection(col, row, side);
                         match pane.selection_text() {
                             Some(text) if !text.is_empty() => {
+                                let _phase = crate::watchdog::phase(
+                                    crate::watchdog::Phase::PrimaryWrite,
+                                    text.len() as u64,
+                                );
                                 write_primary(&text);
                                 if user_config.active().copy_on_selection {
                                     egui_ctx.copy_text(text);
@@ -1241,10 +1245,14 @@ fn paint_pane(
     let inner_rect = rect.shrink(FOCUS_BORDER);
     if ctx.owns_grid_size {
         let (new_cols, new_lines) = grid_dims(inner_rect, ppp, cell_w, cell_h);
+        let _phase = crate::watchdog::phase(crate::watchdog::Phase::PaneResize, pane_id);
         pane.resize(new_cols, new_lines, cell_w, cell_h);
     }
 
-    let frame = pane.frame(focused);
+    let frame = {
+        let _phase = crate::watchdog::phase(crate::watchdog::Phase::PaneFrame, pane_id);
+        pane.frame(focused)
+    };
 
     let should_blink = cursor_blink_enabled || frame.cursor_blink_requested;
     // Blink only while the pane and the window are focused and keyboard input

@@ -24,8 +24,10 @@
 //! background thread holds the terminal for a long scrollback search or
 //! reflow: it then drops read interest and leaves the terminal alone (no
 //! `pty_read`, no sync-timeout flush), so instead of blocking on the lock it
-//! keeps writing input, resizing and shutting down. Re-sync this file when
-//! bumping alacritty_terminal.
+//! keeps writing input, resizing and shutting down. The sections that hold
+//! or wait for the terminal, and the `Pty` drop, are marked for the hang
+//! watchdog (`watchdog::activity`). Re-sync this file when bumping
+//! alacritty_terminal.
 
 use std::borrow::Cow;
 use std::collections::VecDeque;
@@ -49,6 +51,7 @@ use polling::{Event as PollingEvent, Events, PollMode, Poller};
 
 use crate::pane::PaneDefaults;
 use crate::term_handler::TermHandlerProxy;
+use crate::watchdog::{self, Activity};
 
 /// Per-pane state the main thread hands this loop (mostly shared with its
 /// parse-time handler proxy). Bundled so `EventLoop::new` stays close to
@@ -276,10 +279,13 @@ where
         if !child_reaped {
             signal_child(self.hooks.child_pid, libc::SIGKILL);
         }
+        let pid = self.hooks.child_pid as u64;
         let EventLoop { pty, terminal, event_proxy, .. } = self;
         // `Pty::drop`: SIGHUP, reap, close the master.
+        let mut activity = watchdog::activity(Activity::PtyReap, pid);
         drop(pty);
         if !child_reaped {
+            activity.set(Activity::PtyExit, pid);
             terminal.lock().exit();
             event_proxy.send_event(Event::Wakeup);
         }
@@ -298,6 +304,9 @@ where
         let mut unprocessed = 0;
         let mut processed = 0;
 
+        // Deviation: marked for the hang watchdog until the lease and the
+        // lock are let go.
+        let _activity = watchdog::activity(Activity::PtyRead, self.hooks.child_pid as u64);
         // Reserve the next terminal lock for PTY reading.
         let _terminal_lease = Some(self.terminal.lease());
         let mut terminal = None;
@@ -486,6 +495,7 @@ where
                     && ((state.shutdown.is_none() && interest.readable)
                         || sync_deadline.is_some_and(|at| at <= Instant::now()))
                 {
+                    let _activity = watchdog::activity(Activity::SyncFlush, self.hooks.child_pid as u64);
                     let mut terminal = self.terminal.lock();
                     let mut handler = TermHandlerProxy {
                         term: &mut *terminal,
@@ -524,6 +534,8 @@ where
                                 if self.drain_on_exit {
                                     let _ = self.pty_read(&mut state, &mut buf, pipe.as_mut());
                                 }
+                                let _activity =
+                                    watchdog::activity(Activity::PtyExit, self.hooks.child_pid as u64);
                                 self.terminal.lock().exit();
                                 self.event_proxy.send_event(Event::Wakeup);
                                 child_reaped = true;

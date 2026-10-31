@@ -83,6 +83,7 @@ impl AppShared {
         tty::setup_env();
 
         let user_config = Config::load();
+        crate::watchdog::configure(user_config.global.hang_watchdog);
         let profile = user_config.active();
         let base_size = profile.font.size;
 
@@ -183,6 +184,7 @@ impl AppShared {
         let old_profile = self.user_config.active().clone();
         let old_hk = self.user_config.hotkey_window.clone();
         self.user_config = new_config;
+        crate::watchdog::configure(self.user_config.global.hang_watchdog);
         self.prefs.draft = self.user_config.clone();
         let profile = self.user_config.active().clone();
         let new_hk = &self.user_config.hotkey_window;

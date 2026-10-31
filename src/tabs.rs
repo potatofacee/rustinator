@@ -14,6 +14,7 @@ use crate::groups::{self, BroadcastScope};
 use crate::layout::{self, Direction, Node};
 use crate::pane::{Pane, PaneDefaults, PaneId};
 use crate::profile::{self, ProfileName, SpawnCommand};
+use crate::watchdog::{self, Phase};
 
 pub(crate) const INITIAL_COLS: u16 = 100;
 pub(crate) const INITIAL_LINES: u16 = 32;
@@ -446,6 +447,7 @@ impl TabManager {
         command: SpawnCommand,
         factory: &PaneFactory,
     ) -> Option<Pane> {
+        let _phase = watchdog::phase(Phase::Spawn, id);
         match Pane::spawn(
             id,
             cols,
@@ -520,6 +522,7 @@ impl TabManager {
 
     pub(crate) fn close_focused(&mut self, egui_ctx: &egui::Context, dialogs: &mut DialogState) {
         let target = self.active_tab_mut().focused;
+        let _phase = watchdog::phase(Phase::ClosePane, target);
 
         // Capture the pre-removal leaf order and which side of its parent split
         // `target` sits on, so we can focus the pane that actually expands into
@@ -575,6 +578,7 @@ impl TabManager {
         if idx >= self.tabs.len() {
             return;
         }
+        let _phase = watchdog::phase(Phase::CloseTab, idx as u64);
         // Closing the active tab is the only case that moves focus onto a
         // different pane; closing a background tab leaves the viewed pane
         // focused (its index may shift, but its focus state does not change).
@@ -604,6 +608,7 @@ impl TabManager {
         if tab_idx >= self.tabs.len() {
             return;
         }
+        let _phase = watchdog::phase(Phase::ClosePane, pane_id);
         let is_active_tab = tab_idx == self.active_tab;
         let tab = &mut self.tabs[tab_idx];
         let result = tab.layout.remove_leaf(pane_id);
@@ -931,6 +936,7 @@ impl TabManager {
     /// terminal.py:1415-1416 feeds `get_target_terms(self)` from the drop
     /// target). read_only panes never receive it.
     pub(crate) fn paste_text_into_pane(&self, pane_id: PaneId, text: &str) {
+        let _phase = watchdog::phase(Phase::Paste, text.len() as u64);
         for pane in self.active_tab().input_targets_from(pane_id, self.broadcast_scope) {
             pane.send_paste(text);
         }
@@ -956,6 +962,7 @@ impl TabManager {
         wake: &EventLoopProxy<crate::window::UserEvent>,
     ) {
         let Some(pane) = self.search_pane(dialogs) else { return };
+        let _phase = watchdog::phase(Phase::Search, 0);
         pane.search(&dialogs.search_query, backward, Some(wake.clone()));
     }
 
@@ -1108,6 +1115,7 @@ impl TabManager {
                                 Some(p) => p,
                                 None => break,
                             };
+                            let _phase = watchdog::phase(Phase::Respawn, id);
                             if pane.respawn(
                                 factory.cell_w,
                                 factory.cell_h,

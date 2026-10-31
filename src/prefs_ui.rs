@@ -193,6 +193,12 @@ fn draw_prefs_global(ui: &mut egui::Ui, cfg: &mut Config) {
         "Smart copy (Ctrl+Shift+C sends Ctrl+C when no selection)",
     );
     ui.checkbox(&mut cfg.global.disable_mouse_paste, "Disable mouse paste");
+    ui.checkbox(&mut cfg.global.hang_watchdog, "Log a report when the window freezes")
+        .on_hover_text(
+            "A background thread checks four times a second whether the window has stopped \
+             responding. After 2 seconds it writes what it was doing, and what the other \
+             threads were doing, to the log file. Nothing is logged otherwise.",
+        );
     if cfg!(target_os = "macos") {
         ui.checkbox(
             &mut cfg.global.macos_option_types_characters,
