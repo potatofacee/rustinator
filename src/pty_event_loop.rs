@@ -14,7 +14,10 @@
 //! `JoinHandle<()>` and the thread drops the loop (and so the `Pty`) itself,
 //! and `Msg::Shutdown` hangs up the child and keeps the loop running until the
 //! child exits, escalating to SIGKILL after `SHUTDOWN_GRACE`, instead of
-//! breaking at once (see `begin_shutdown`). The loop's channel is a separate
+//! breaking at once (see `begin_shutdown`); a PTY read/write error takes the
+//! same path instead of ending the loop (see `pty_io_failed`), and a loop that
+//! ends without reaping its child kills it and still reports `Term::exit`
+//! (see `finish`). The loop's channel is a separate
 //! `LoopChannel` passed to `EventLoop::new`, so a pane holds its sender before
 //! the `Pty` exists (see `LoopChannel`). Re-sync this file when bumping
 //! alacritty_terminal.
@@ -215,6 +218,55 @@ where
         state.shutdown = Some(Shutdown { kill_at: Some(Instant::now() + SHUTDOWN_GRACE) });
     }
 
+    /// Deviation: upstream breaks out of the loop on a PTY read/write error,
+    /// and its `Pty::drop` then SIGHUPs the child and blocks in `wait()`: a
+    /// child that ignores SIGHUP hangs this thread for good, and as the
+    /// child-exit event never comes, `Term::exit` is never called and the pane
+    /// never closes. Instead stop doing I/O on the PTY and shut down as for
+    /// `Msg::Shutdown`, so the child-exit event ends the loop as usual.
+    ///
+    /// The PTY fd is re-armed oneshot with no interest: kqueue drops both of
+    /// its filters, and epoll, which always reports HUP/ERR, reports them at
+    /// most once. Level-triggered, a hung-up or failing fd would wake the loop
+    /// in a busy spin until the child is gone. Returns false when even that
+    /// fails; the caller then breaks out and `finish` kills the child.
+    #[cfg(unix)]
+    fn pty_io_failed(&mut self, state: &mut State, interest: &mut PollingEvent) -> bool {
+        if state.io_failed {
+            return true;
+        }
+        state.io_failed = true;
+        interest.readable = false;
+        interest.writable = false;
+        if let Err(err) = self.pty.reregister(&self.poll, *interest, PollMode::Oneshot) {
+            error!("Event loop reregistration error: {err}");
+            return false;
+        }
+        if state.shutdown.is_none() {
+            self.begin_shutdown(state);
+        }
+        true
+    }
+
+    /// Deviation: teardown, on the loop thread. A loop that ends without the
+    /// child-exit event (a poll or registration error) kills the child first,
+    /// so `Pty::drop`'s `wait()` cannot be left to a child that ignores SIGHUP,
+    /// and reports `Term::exit` after the reap as the exit event would have,
+    /// so the pane still closes.
+    fn finish(self, child_reaped: bool) {
+        #[cfg(unix)]
+        if !child_reaped {
+            signal_child(self.hooks.child_pid, libc::SIGKILL);
+        }
+        let EventLoop { pty, terminal, event_proxy, .. } = self;
+        // `Pty::drop`: SIGHUP, reap, close the master.
+        drop(pty);
+        if !child_reaped {
+            terminal.lock().exit();
+            event_proxy.send_event(Event::Wakeup);
+        }
+    }
+
     #[inline]
     fn pty_read<X>(
         &mut self,
@@ -339,6 +391,8 @@ where
             // Register TTY through EventedRW interface.
             if let Err(err) = unsafe { self.pty.register(&self.poll, interest, poll_opts) } {
                 error!("Event loop registration error: {err}");
+                // Deviation: was a bare return, leaving the child to `Pty::drop`.
+                self.finish(false);
                 return;
             }
 
@@ -440,6 +494,11 @@ where
                         },
 
                         PTY_READ_WRITE_TOKEN => {
+                            // Deviation: no more I/O once it has failed (see `pty_io_failed`).
+                            if state.io_failed {
+                                continue;
+                            }
+
                             if event.is_interrupt() {
                                 // Don't try to do I/O on a dead PTY.
                                 continue;
@@ -461,6 +520,11 @@ where
                                     }
 
                                     error!("Error reading from PTY in event loop: {err}");
+                                    // Deviation: shut down instead of breaking.
+                                    #[cfg(unix)]
+                                    if self.pty_io_failed(&mut state, &mut interest) {
+                                        continue;
+                                    }
                                     break 'event_loop;
                                 }
                             }
@@ -468,6 +532,11 @@ where
                             if event.writable {
                                 if let Err(err) = self.pty_write(&mut state) {
                                     error!("Error writing to PTY in event loop: {err}");
+                                    // Deviation: shut down instead of breaking.
+                                    #[cfg(unix)]
+                                    if self.pty_io_failed(&mut state, &mut interest) {
+                                        continue;
+                                    }
                                     break 'event_loop;
                                 }
                             }
@@ -477,8 +546,9 @@ where
                 }
 
                 // Register write interest if necessary.
+                // Deviation: not once I/O has failed; the fd stays disarmed.
                 let needs_write = state.needs_write();
-                if needs_write != interest.writable {
+                if !state.io_failed && needs_write != interest.writable {
                     interest.writable = needs_write;
 
                     // Re-register with new interest.
@@ -489,20 +559,11 @@ where
             // The evented instances are not dropped here so deregister them explicitly.
             let _ = self.pty.deregister(&self.poll);
 
-            // Deviation: an I/O or poll error can end the loop mid-shutdown with the
-            // child still alive (it never got the exit event). Kill it so the
-            // `Pty::drop` wait below is not left to a child that ignores SIGHUP.
-            #[cfg(unix)]
-            if state.shutdown.is_some() && !child_reaped {
-                signal_child(self.hooks.child_pid, libc::SIGKILL);
-            }
-            #[cfg(not(unix))]
-            let _ = child_reaped;
-
             // Drop the `Pty` (SIGHUP, reap, close the master) and the loop's
-            // terminal reference here, on this thread.
+            // terminal reference here, on this thread. A poll error can end the
+            // loop with the child alive; `finish` kills it and reports the exit.
             drop(state);
-            drop(self);
+            self.finish(child_reaped);
         })
     }
 }
@@ -605,6 +666,8 @@ pub struct State {
     parser: ansi::Processor,
     /// Deviation: graceful-shutdown progress (see `begin_shutdown`).
     shutdown: Option<Shutdown>,
+    /// Deviation: a PTY read/write failed; no more I/O (see `pty_io_failed`).
+    io_failed: bool,
 }
 
 impl State {
@@ -933,6 +996,155 @@ mod tests {
             let (tx, pid, term, thread) = spawn_ready("echo ready; while :; do sleep 1; done");
             let gone = teardown(tx, pid, term, thread);
             assert!(gone < SHUTDOWN_GRACE / 2, "child took {gone:?} to exit on SIGHUP");
+        }
+
+        /// A real `Pty` whose reads all fail, to drive the loop's I/O error path
+        /// while the child is alive. Polling, writes and child events go to the
+        /// real PTY.
+        struct FailingReads {
+            pty: tty::Pty,
+            reader: FailRead,
+        }
+
+        struct FailRead;
+
+        impl Read for FailRead {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::other("injected read failure"))
+            }
+        }
+
+        impl tty::EventedReadWrite for FailingReads {
+            type Reader = FailRead;
+            type Writer = File;
+
+            unsafe fn register(
+                &mut self,
+                poll: &Arc<Poller>,
+                interest: PollingEvent,
+                mode: PollMode,
+            ) -> io::Result<()> {
+                unsafe { self.pty.register(poll, interest, mode) }
+            }
+
+            fn reregister(
+                &mut self,
+                poll: &Arc<Poller>,
+                interest: PollingEvent,
+                mode: PollMode,
+            ) -> io::Result<()> {
+                self.pty.reregister(poll, interest, mode)
+            }
+
+            fn deregister(&mut self, poll: &Arc<Poller>) -> io::Result<()> {
+                self.pty.deregister(poll)
+            }
+
+            fn reader(&mut self) -> &mut FailRead {
+                &mut self.reader
+            }
+
+            fn writer(&mut self) -> &mut File {
+                self.pty.writer()
+            }
+        }
+
+        impl tty::EventedPty for FailingReads {
+            fn next_child_event(&mut self) -> Option<tty::ChildEvent> {
+                self.pty.next_child_event()
+            }
+        }
+
+        impl event::OnResize for FailingReads {
+            fn on_resize(&mut self, window_size: WindowSize) {
+                self.pty.on_resize(window_size)
+            }
+        }
+
+        /// Records whether the terminal reported its exit (`Term::exit`).
+        #[derive(Clone)]
+        struct ExitFlag(Arc<AtomicBool>);
+
+        impl EventListener for ExitFlag {
+            fn send_event(&self, event: Event) {
+                if matches!(event, Event::Exit) {
+                    self.0.store(true, Ordering::SeqCst);
+                }
+            }
+        }
+
+        /// Run `sh -c script` under a loop whose PTY reads fail, and wait for
+        /// the terminal's exit report, the child's reap and the loop's end.
+        /// Returns how long the exit report took. Upstream broke out of the
+        /// loop on the error: `Term::exit` never came (the pane never closed)
+        /// and `Pty::drop` blocked in `wait()` while the child lived.
+        fn run_until_read_error_exit(script: &str) -> Duration {
+            let window_size =
+                WindowSize { num_lines: 24, num_cols: 80, cell_width: 8, cell_height: 16 };
+            let opts = tty::Options {
+                shell: Some(tty::Shell::new("/bin/sh".into(), vec!["-c".into(), script.into()])),
+                ..Default::default()
+            };
+            let pty = tty::new(&opts, window_size, 0).expect("open pty");
+            let pid = pty.child().id();
+            let exited = Arc::new(AtomicBool::new(false));
+            let listener = ExitFlag(Arc::clone(&exited));
+            let term = Arc::new(FairMutex::new(Term::new(
+                Config::default(),
+                &TermSize::new(80, 24),
+                listener.clone(),
+            )));
+            let hooks = PaneHooks {
+                clear_wipes_scrollback: Arc::new(AtomicBool::new(false)),
+                history_limit: Arc::new(AtomicUsize::new(Config::default().scrolling_history)),
+                defaults: Arc::new(Mutex::new(PaneDefaults::default())),
+                child_pid: pid,
+            };
+            let channel = LoopChannel::new().expect("create loop channel");
+            let pty = FailingReads { pty, reader: FailRead };
+            let event_loop = EventLoop::new(channel, term, listener, pty, false, false, hooks);
+            let start = Instant::now();
+            let thread = event_loop.spawn();
+
+            let deadline = start + SHUTDOWN_GRACE + Duration::from_secs(3);
+            while !exited.load(Ordering::SeqCst) {
+                assert!(Instant::now() < deadline, "terminal exit was never reported");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let took = start.elapsed();
+            while !thread.is_finished() {
+                assert!(Instant::now() < deadline, "PTY loop thread never finished");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            thread.join().expect("PTY loop thread panicked");
+            let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+            assert!(
+                rc == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH),
+                "child {pid} was not reaped"
+            );
+            took
+        }
+
+        /// A PTY read error with the child alive hangs the child up as a
+        /// shutdown does, and the pane still gets its exit.
+        #[test]
+        fn read_error_hangs_up_child_and_reports_exit() {
+            let took = run_until_read_error_exit("echo x; while :; do sleep 1; done");
+            assert!(took < SHUTDOWN_GRACE / 2, "exit took {took:?}");
+        }
+
+        /// The same for a child that ignores SIGHUP: the grace period runs out
+        /// and SIGKILL ends it, instead of `Pty::drop` waiting forever.
+        #[test]
+        #[ignore = "slow: waits out the 3 s SHUTDOWN_GRACE; run with \
+                    `cargo test -- --ignored read_error_kills_child_that_ignores_sighup`"]
+        fn read_error_kills_child_that_ignores_sighup() {
+            let took =
+                run_until_read_error_exit("trap '' HUP; echo x; while :; do sleep 1; done");
+            assert!(
+                took >= SHUTDOWN_GRACE - Duration::from_millis(50),
+                "exit after {took:?}, before the grace period ran out"
+            );
         }
     }
 }
