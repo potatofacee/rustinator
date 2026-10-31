@@ -598,6 +598,7 @@ impl ApplicationHandler<UserEvent> for WinitApp {
         self.gl = Some(shared_gl);
         self.shared = Some(shared);
         self.windows.insert(main_id, window);
+        self.apply_option_as_alt();
     }
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
@@ -870,6 +871,8 @@ impl WinitApp {
                             win.gl_window.make_current(gl.context());
                         }
                     }
+                    // A Save in this paint may have changed the Option setting.
+                    self.apply_option_as_alt();
                 }
                 _ => {}
             }
@@ -917,7 +920,9 @@ impl WinitApp {
                 self.hotkey_window = Some(hk);
                 return;
             }
-            win.pending_raw_keys.push(encode_raw_key(key_event, hk.current_modifiers));
+            let option_types_characters =
+                self.shared.as_ref().is_some_and(|s| s.user_config.option_types_characters());
+            win.pending_raw_keys.push(encode_raw_key(key_event, hk.current_modifiers, option_types_characters));
         }
 
         if let WindowEvent::MouseWheel { delta, .. } = &event {
@@ -1066,7 +1071,9 @@ impl WinitApp {
 
         // Synthetic focus-in replays are not keystrokes (see the hotkey site).
         if let WindowEvent::KeyboardInput { event: key_event, is_synthetic: false, .. } = &event {
-            win.pending_raw_keys.push(encode_raw_key(key_event, self.current_modifiers));
+            let option_types_characters =
+                self.shared.as_ref().is_some_and(|s| s.user_config.option_types_characters());
+            win.pending_raw_keys.push(encode_raw_key(key_event, self.current_modifiers, option_types_characters));
         }
 
         // Ctrl+wheel zooms before egui sees the event; every other wheel
@@ -1406,6 +1413,27 @@ impl WinitApp {
             if let Some(old_hk) = self.hotkey_window.take() {
                 old_hk.destroy(gl.context());
                 win.gl_window.make_current(gl.context());
+            }
+        }
+        // A rebuilt dropdown is a new window, with winit's default Option.
+        self.apply_option_as_alt();
+    }
+
+    /// Point winit's Option handling on every terminal window (the primary
+    /// and the hotkey dropdown) at the "Option key types special characters"
+    /// setting: Option is Alt unless it is on (`platform::macos_set_option_as_alt`).
+    /// The prefs window keeps winit's default, so its text fields type
+    /// Option's characters as any Mac text field does. Nothing to do
+    /// elsewhere: off macOS winit's Alt never composes.
+    fn apply_option_as_alt(&self) {
+        #[cfg(target_os = "macos")]
+        if let Some(shared) = &self.shared {
+            let option_types_characters = shared.user_config.option_types_characters();
+            for win in self.windows.values() {
+                crate::platform::macos_set_option_as_alt(&win.gl_window.window, option_types_characters);
+            }
+            if let Some(hk) = &self.hotkey_window {
+                crate::platform::macos_set_option_as_alt(&hk.gl_window.window, option_types_characters);
             }
         }
     }

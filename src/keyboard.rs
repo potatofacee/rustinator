@@ -143,9 +143,12 @@ fn key_release(key: &KeyInput, mods: ModifiersState, mode: TermMode) -> Vec<u8> 
     }
 }
 
-/// alacritty `Processor::alt_send_esc`. Rustinator has no macOS
-/// `option_as_alt` setting, so Alt is Alt on every platform (alacritty's
-/// non-macOS arm), as the legacy encoding already treats it.
+/// alacritty `Processor::alt_send_esc`, its non-macOS arm: Alt is Alt
+/// whenever it reaches here. On macOS Option-as-Alt is winit's rewrite
+/// (`platform::macos_set_option_as_alt`), and an Option chord that typed its
+/// character under "Option key types special characters" arrives with Alt
+/// already taken out of `mods` (`input::option_composes`), which is what
+/// alacritty's macOS arm does for a key `option_as_alt` does not cover.
 fn alt_send_esc(key: &KeyInput, text: &str, mods: ModifiersState) -> bool {
     let alt_send_esc = mods.alt_key();
     match key.logical_key {

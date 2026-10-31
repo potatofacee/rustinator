@@ -1,6 +1,5 @@
 use alacritty_terminal::term::TermMode;
 use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
-use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 
 use crate::config::EraseBinding;
 use crate::keybindings::{Action, BindingTable};
@@ -376,28 +375,91 @@ pub(crate) fn focus_event_bytes(mode: TermMode, focused: bool) -> Option<Vec<u8>
 /// Everything the key routing needs about one winit key event. A release
 /// carries no egui name and no legacy bytes: it matches no binding and has
 /// no legacy encoding, only a kitty report (`keyboard::encode`).
-pub(crate) fn encode_raw_key(event: &winit::event::KeyEvent, modifiers: winit::event::Modifiers) -> RawTermKey {
-    let mods = winit_mods_to_egui(modifiers);
-    let state = modifiers.state();
-    let input = KeyInput::from_event(event);
-    if !event.state.is_pressed() {
+///
+/// `option_types_characters` is `Config::option_types_characters` (false
+/// off macOS). Option-as-Alt itself, the default, needs nothing here: winit
+/// already gives Option chords the unmodified character (see
+/// `platform::macos_set_option_as_alt`), so Option+B arrives as `b` with Alt
+/// held and goes out as `ESC b`, exactly as Alt+B does on Linux.
+pub(crate) fn encode_raw_key(
+    event: &winit::event::KeyEvent,
+    modifiers: winit::event::Modifiers,
+    option_types_characters: bool,
+) -> RawTermKey {
+    raw_key_from_input(KeyInput::from_event(event), modifiers.state(), option_types_characters)
+}
+
+/// `encode_raw_key` on the event's fields (a `KeyEvent` cannot be built
+/// outside winit, a `KeyInput` can, so this is the part the tests drive).
+fn raw_key_from_input(input: KeyInput, state: ModifiersState, option_types_characters: bool) -> RawTermKey {
+    // An Option chord that typed its character has no Alt in it (see
+    // `option_composes`), for the bindings, the legacy bytes and the kitty
+    // encoder alike; its release is judged the same way so the kitty report
+    // of the release matches the press.
+    let composed = option_composes(
+        option_types_characters,
+        state,
+        &input.logical_key,
+        input.text_with_all_modifiers.as_deref(),
+    );
+    let state = if composed { state - ModifiersState::ALT } else { state };
+    let mods = winit_mods_to_egui(state.into());
+    if !input.state.is_pressed() {
         return RawTermKey { key: None, shifted_key: None, mods, legacy_bytes: Vec::new(), input, wmods: state };
+    }
+    if composed {
+        // The composed text as typed, no ESC; no egui name, so no binding or
+        // VTE builtin can claim it (Option+L types `¬`, it is not Alt+L).
+        let legacy_bytes = input.text_with_all_modifiers.clone().unwrap_or_default().into_bytes();
+        return RawTermKey { key: None, shifted_key: None, mods, legacy_bytes, input, wmods: state };
     }
     let alt = state.alt_key();
     let ctrl = state.control_key();
     let shift = state.shift_key();
     let inert = cmd_is_inert(mods);
 
-    let unmod = event.key_without_modifiers();
-    let ctrl_latin = ctrl_latin_fallback(&unmod, event.physical_key, ctrl);
-    let key = match &unmod {
+    let unmod = &input.key_without_modifiers;
+    let ctrl_latin = ctrl_latin_fallback(unmod, input.physical_key, ctrl);
+    let key = match unmod {
         Key::Character(c) => char_to_egui_key(c).or_else(|| ctrl_latin.and_then(char_key)),
         Key::Named(named) => named_to_egui_key(*named),
         _ => None,
     };
-    let shifted_key = shifted_char_key(&event.logical_key, shift, key);
-    let legacy_bytes = legacy_key_bytes(event, &unmod, ctrl_latin, inert, shift, alt, ctrl);
+    let shifted_key = shifted_char_key(&input.logical_key, shift, key);
+    let legacy_bytes = legacy_key_bytes(&input, ctrl_latin, inert, shift, alt, ctrl);
     RawTermKey { key, shifted_key, mods, legacy_bytes, input, wmods: state }
+}
+
+/// Whether Option typed this key's character itself rather than acting as
+/// Alt: the "Option key types special characters" setting is on
+/// (`option_types_characters`, macOS only), Option is held without Ctrl or
+/// Cmd (with either, macOS reads the chord as a shortcut, and winit's
+/// `replace_event` makes the same exception), and the key is one Option
+/// types with — a character key (`logical_key` is then the composed
+/// character, Option+B is `∫`), a dead key (Option+E), or a named key whose
+/// text is not its own (Option+Space types U+00A0).
+///
+/// Such a key goes out as its composed text with no ESC, carries no Alt into
+/// the kitty encoder (alacritty's `alt_send_esc` masks Alt for a key
+/// `option_as_alt` does not cover) and matches no binding. Every other named
+/// key (arrows, Backspace, Enter, F-keys) keeps Alt and encodes as on Linux,
+/// so Option+Left still moves between panes.
+pub(crate) fn option_composes(
+    option_types_characters: bool,
+    mods: ModifiersState,
+    logical: &Key,
+    text: Option<&str>,
+) -> bool {
+    if !option_types_characters || !mods.alt_key() || mods.control_key() || mods.super_key() {
+        return false;
+    }
+    match logical {
+        Key::Character(_) | Key::Dead(_) => true,
+        Key::Named(named) => text.is_some_and(|text| {
+            !text.is_empty() && !text.chars().any(char::is_control) && named.to_text() != Some(text)
+        }),
+        Key::Unidentified(_) => false,
+    }
 }
 
 /// The character key Shift turned this press into, when it is a different
@@ -415,15 +477,15 @@ fn shifted_char_key(logical: &Key, shift: bool, key: Option<egui::Key>) -> Optio
 /// The bytes a key press sends under the legacy (non-kitty) encoding; empty
 /// for a press that types nothing (an inert Cmd chord, a bare modifier key).
 fn legacy_key_bytes(
-    event: &winit::event::KeyEvent,
-    unmod: &Key,
+    input: &KeyInput,
     ctrl_latin: Option<char>,
     inert: bool,
     shift: bool,
     alt: bool,
     ctrl: bool,
 ) -> Vec<u8> {
-    if let Key::Named(named) = &event.logical_key {
+    let unmod = &input.key_without_modifiers;
+    if let Key::Named(named) = &input.logical_key {
         if let Some(bytes) = named_logical_key_bytes(*named, inert, shift, alt, ctrl) {
             return bytes;
         }
@@ -454,7 +516,7 @@ fn legacy_key_bytes(
         }
     }
 
-    if let Some(text) = event.text_with_all_modifiers() {
+    if let Some(text) = input.text_with_all_modifiers.as_deref() {
         if !text.is_empty() {
             let mut bytes = text.as_bytes().to_vec();
             if alt {
@@ -1872,5 +1934,164 @@ mod tests {
         if cfg!(all(unix, not(target_os = "macos"))) {
             assert!(!withheld(command_mods(true), Key::Named(NamedKey::Insert), KeyCode::Insert));
         }
+    }
+
+    /// A macOS key event as winit delivers it: `logical` and `text` are what
+    /// the key typed (with Option-as-Alt on, winit's `replace_event` has
+    /// already made them the unmodified character), `unmod` is
+    /// `key_without_modifiers`.
+    fn mac_key(logical: Key, unmod: Key, text: Option<&str>, code: KeyCode) -> KeyInput {
+        KeyInput {
+            logical_key: logical,
+            key_without_modifiers: unmod,
+            text_with_all_modifiers: text.map(str::to_owned),
+            location: winit::keyboard::KeyLocation::Standard,
+            physical_key: PhysicalKey::Code(code),
+            state: winit::event::ElementState::Pressed,
+            repeat: false,
+        }
+    }
+
+    fn ch(c: &str) -> Key {
+        Key::Character(c.into())
+    }
+
+    fn named(n: NamedKey) -> Key {
+        Key::Named(n)
+    }
+
+    const ALT: ModifiersState = ModifiersState::ALT;
+
+    /// The legacy bytes a press sends, the decision under test: the key as
+    /// winit gives it, the modifiers, and the "Option types characters" flag.
+    fn bytes(input: KeyInput, mods: ModifiersState, option_types_characters: bool) -> Vec<u8> {
+        raw_key_from_input(input, mods, option_types_characters).legacy_bytes
+    }
+
+    #[test]
+    fn option_as_alt_sends_esc_and_the_unmodified_character() {
+        // Option is Alt (the default): winit hands over the layout's own
+        // character with Alt held, so Option chords encode as Alt does on
+        // Linux — shell word motion (Alt+B/F/Backspace/.) works.
+        let b = mac_key(ch("b"), ch("b"), Some("b"), KeyCode::KeyB);
+        assert_eq!(bytes(b.clone(), ALT, false), b"\x1bb");
+        let shift_b = mac_key(ch("B"), ch("b"), Some("B"), KeyCode::KeyB);
+        assert_eq!(bytes(shift_b, ALT | ModifiersState::SHIFT, false), b"\x1bB");
+        let dot = mac_key(ch("."), ch("."), Some("."), KeyCode::Period);
+        assert_eq!(bytes(dot, ALT, false), b"\x1b.");
+        // A dead key under Option (Option+E on US) is plain `e` once winit
+        // has rewritten it.
+        let e = mac_key(ch("e"), ch("e"), Some("e"), KeyCode::KeyE);
+        assert_eq!(bytes(e, ALT, false), b"\x1be");
+        let rk = raw_key_from_input(b, ALT, false);
+        assert_eq!(rk.key, Some(egui::Key::B));
+        assert!(rk.mods.alt);
+        assert_eq!(rk.wmods, ALT);
+    }
+
+    #[test]
+    fn option_as_alt_named_keys_encode_with_alt_as_on_linux() {
+        let bs = mac_key(named(NamedKey::Backspace), named(NamedKey::Backspace), Some("\x7f"), KeyCode::Backspace);
+        assert_eq!(bytes(bs, ALT, false), b"\x1b\x7f");
+        let left = mac_key(named(NamedKey::ArrowLeft), named(NamedKey::ArrowLeft), None, KeyCode::ArrowLeft);
+        assert_eq!(bytes(left, ALT, false), b"\x1b[1;3D");
+        let enter = mac_key(named(NamedKey::Enter), named(NamedKey::Enter), Some("\r"), KeyCode::Enter);
+        assert_eq!(bytes(enter, ALT, false), b"\x1b\r");
+        let space = mac_key(named(NamedKey::Space), named(NamedKey::Space), Some(" "), KeyCode::Space);
+        assert_eq!(bytes(space, ALT, false), b"\x1b ");
+    }
+
+    #[test]
+    fn option_as_alt_keeps_the_alt_bindings() {
+        let bindings = BindingTable::new(true);
+        let l = raw_key_from_input(mac_key(ch("l"), ch("l"), Some("l"), KeyCode::KeyL), ALT, false);
+        assert_eq!(classify_key(&bindings, &l, false, false), Some(Action::LayoutLauncher));
+        let left = mac_key(named(NamedKey::ArrowLeft), named(NamedKey::ArrowLeft), None, KeyCode::ArrowLeft);
+        let left = raw_key_from_input(left, ALT, false);
+        assert_eq!(classify_key(&bindings, &left, false, false), Some(Action::GoLeft));
+    }
+
+    #[test]
+    fn option_typing_characters_sends_the_composed_text_without_esc() {
+        // "Option key types special characters" on: winit leaves macOS's
+        // composition alone, Option+B types `∫`, and that is all that is sent.
+        let b = mac_key(ch("∫"), ch("b"), Some("∫"), KeyCode::KeyB);
+        let rk = raw_key_from_input(b, ALT, true);
+        assert_eq!(rk.legacy_bytes, "∫".as_bytes());
+        assert_eq!(rk.key, None);
+        assert_eq!(rk.shifted_key, None);
+        assert!(!rk.mods.alt);
+        assert_eq!(rk.wmods, ModifiersState::empty());
+        let shift_b = mac_key(ch("ı"), ch("b"), Some("ı"), KeyCode::KeyB);
+        assert_eq!(bytes(shift_b, ALT | ModifiersState::SHIFT, true), "ı".as_bytes());
+        // Option+Space types a no-break space.
+        let space = mac_key(named(NamedKey::Space), named(NamedKey::Space), Some("\u{a0}"), KeyCode::Space);
+        assert_eq!(bytes(space, ALT, true), "\u{a0}".as_bytes());
+        // A dead key types nothing by itself (no IME to finish it): silent.
+        let dead = mac_key(Key::Dead(Some('´')), ch("e"), None, KeyCode::KeyE);
+        assert!(raw_key_from_input(dead, ALT, true).is_silent());
+    }
+
+    #[test]
+    fn option_typing_characters_leaves_named_keys_and_shortcuts_alone() {
+        // Keys Option types nothing with keep Alt, as on Linux.
+        let left = mac_key(named(NamedKey::ArrowLeft), named(NamedKey::ArrowLeft), None, KeyCode::ArrowLeft);
+        assert_eq!(bytes(left, ALT, true), b"\x1b[1;3D");
+        let bs = mac_key(named(NamedKey::Backspace), named(NamedKey::Backspace), Some("\x7f"), KeyCode::Backspace);
+        assert_eq!(bytes(bs, ALT, true), b"\x1b\x7f");
+        // Ctrl or Cmd in the chord: a shortcut, not composition.
+        assert!(!option_composes(true, ALT | ModifiersState::CONTROL, &ch("b"), Some("\x02")));
+        assert!(!option_composes(true, ALT | ModifiersState::SUPER, &ch("b"), Some("b")));
+        // No Option, or the setting off: nothing composes.
+        assert!(!option_composes(true, ModifiersState::empty(), &ch("b"), Some("b")));
+        assert!(!option_composes(false, ALT, &ch("∫"), Some("∫")));
+        // Named keys with their own text or none keep Alt.
+        assert!(!option_composes(true, ALT, &named(NamedKey::Enter), Some("\r")));
+        assert!(!option_composes(true, ALT, &named(NamedKey::Space), Some(" ")));
+        assert!(!option_composes(true, ALT, &named(NamedKey::ArrowUp), None));
+    }
+
+    #[test]
+    fn option_typing_characters_disarms_option_bindings_on_text_keys_only() {
+        let bindings = BindingTable::new(true);
+        // Option+L types `¬`: not Alt+L.
+        let l = raw_key_from_input(mac_key(ch("¬"), ch("l"), Some("¬"), KeyCode::KeyL), ALT, true);
+        assert_eq!(classify_key(&bindings, &l, false, false), None);
+        assert_eq!(l.legacy_bytes, "¬".as_bytes());
+        // Option+Left types nothing: still Alt+Left.
+        let left = mac_key(named(NamedKey::ArrowLeft), named(NamedKey::ArrowLeft), None, KeyCode::ArrowLeft);
+        let left = raw_key_from_input(left, ALT, true);
+        assert_eq!(classify_key(&bindings, &left, false, false), Some(Action::GoLeft));
+    }
+
+    #[test]
+    fn option_keys_under_the_kitty_protocol() {
+        let disambiguate = TermMode::DISAMBIGUATE_ESC_CODES;
+        // Option-as-Alt: the alt modifier and the base key.
+        let b = raw_key_from_input(mac_key(ch("b"), ch("b"), Some("b"), KeyCode::KeyB), ALT, false);
+        assert_eq!(keyboard::encode(&b.input, b.wmods, disambiguate), Some(b"\x1b[98;3u".to_vec()));
+        // Typing characters: no Alt, so the text goes out as text.
+        let b = raw_key_from_input(mac_key(ch("∫"), ch("b"), Some("∫"), KeyCode::KeyB), ALT, true);
+        assert_eq!(keyboard::encode(&b.input, b.wmods, disambiguate), None);
+        assert_eq!(b.legacy_bytes, "∫".as_bytes());
+        // Its release carries no Alt either, matching the press.
+        let mut release = mac_key(ch("∫"), ch("b"), Some("∫"), KeyCode::KeyB);
+        release.state = winit::event::ElementState::Released;
+        let release = raw_key_from_input(release, ALT, true);
+        assert_eq!(release.wmods, ModifiersState::empty());
+        let all = TermMode::REPORT_ALL_KEYS_AS_ESC | TermMode::REPORT_EVENT_TYPES;
+        assert_eq!(
+            keyboard::encode(&release.input, release.wmods, all),
+            Some(format!("\x1b[{};1:3u", u32::from('∫')).into_bytes())
+        );
+    }
+
+    #[test]
+    fn linux_alt_and_ctrl_unchanged_with_the_flag_off() {
+        // Off macOS the flag is always false (`Config::option_types_characters`).
+        let b = mac_key(ch("b"), ch("b"), Some("b"), KeyCode::KeyB);
+        assert_eq!(bytes(b, ALT, false), b"\x1bb");
+        let ctrl_c = mac_key(ch("c"), ch("c"), Some("\x03"), KeyCode::KeyC);
+        assert_eq!(bytes(ctrl_c, ModifiersState::CONTROL, false), [0x03]);
     }
 }

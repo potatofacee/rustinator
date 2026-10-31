@@ -133,6 +133,26 @@ pub(crate) fn macos_activate_pid(pid: i32) {
     }
 }
 
+/// Make Option act as Alt in a terminal window, unless the "Option key types
+/// special characters" setting is on. With `OptionAsAlt::Both` winit rebuilds
+/// every Option keyDown/keyUp without Ctrl or Cmd from the key's
+/// `charactersIgnoringModifiers` (winit 0.30 `platform_impl/macos/view.rs`
+/// `replace_event`, ahead of `interpretKeyEvents` and `create_key_event`), so
+/// `logical_key` and `text_with_all_modifiers` are the layout's own character
+/// with Shift applied (Option+B is `b`, Option+Shift+B is `B`, Option+E is `e`,
+/// not a dead key) while Alt stays in the modifiers: the key encodes as Alt+B
+/// does on Linux (`ESC b`, kitty `CSI 98;3u`). alacritty does the same with
+/// its `option_as_alt` setting. Without it (`OptionAsAlt::None`, winit's
+/// default) Option composes and `input::option_composes` takes over.
+#[cfg(target_os = "macos")]
+pub(crate) fn macos_set_option_as_alt(window: &Window, option_types_characters: bool) {
+    use winit::platform::macos::{OptionAsAlt, WindowExtMacOS};
+    let option_as_alt = if option_types_characters { OptionAsAlt::None } else { OptionAsAlt::Both };
+    if window.option_as_alt() != option_as_alt {
+        window.set_option_as_alt(option_as_alt);
+    }
+}
+
 #[cfg(target_os = "macos")]
 pub(crate) fn macos_order_window_back(window: &Window) {
     use objc2::runtime::AnyObject;

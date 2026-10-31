@@ -104,6 +104,12 @@ pub struct GlobalConfig {
     /// paste — the keyboard Paste action ignores it (terminal.py:1843-1847).
     #[serde(default)]
     pub disable_mouse_paste: bool,
+    /// macOS only: Option types the layout's special characters (Option+B is
+    /// `∫`) instead of acting as Alt. Off by default, so Option is Linux's Alt
+    /// (Option+B sends `ESC b`), as alacritty's `option_as_alt = "Both"` and
+    /// iTerm2's "Esc+". Read only on macOS (`Config::option_types_characters`).
+    #[serde(default)]
+    pub macos_option_types_characters: bool,
 }
 
 /// Where the tab bar is positioned. `Hidden` suppresses the panel entirely.
@@ -385,6 +391,7 @@ impl Default for GlobalConfig {
             startup_layout: None,
             smart_copy: true,
             disable_mouse_paste: false,
+            macos_option_types_characters: false,
         }
     }
 }
@@ -674,6 +681,13 @@ impl Config {
             .iter()
             .find(|p| p.name == self.active_profile)
             .unwrap_or(&self.profiles[0])
+    }
+
+    /// Whether Option types characters rather than acting as Alt: the
+    /// `macos_option_types_characters` setting, on macOS only. Elsewhere there
+    /// is no composing Option key and Alt is always Alt, whatever the file says.
+    pub fn option_types_characters(&self) -> bool {
+        cfg!(target_os = "macos") && self.global.macos_option_types_characters
     }
 
     #[allow(dead_code)]
@@ -1064,6 +1078,25 @@ mod tests {
         // Old config missing the key gets Terminator's default.
         let cfg: Config = toml::from_str("[global]\nconfirm_on_close = false\n").unwrap();
         assert!(!cfg.global.disable_mouse_paste);
+    }
+
+    #[test]
+    fn macos_option_types_characters_is_global_and_defaults_off() {
+        assert!(!GlobalConfig::default().macos_option_types_characters);
+        assert!(!Config::default().option_types_characters());
+
+        let mut cfg = Config::default();
+        cfg.global.macos_option_types_characters = true;
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        assert!(text.contains("macos_option_types_characters = true"));
+        let parsed: Config = toml::from_str(&text).unwrap();
+        assert!(parsed.global.macos_option_types_characters);
+        // Only macOS has an Option key that composes; elsewhere Alt stays Alt.
+        assert_eq!(parsed.option_types_characters(), cfg!(target_os = "macos"));
+
+        // Old config missing the key: Option is Alt.
+        let cfg: Config = toml::from_str("[global]\nconfirm_on_close = false\n").unwrap();
+        assert!(!cfg.global.macos_option_types_characters);
     }
 
     // R-034: Ctrl+wheel zoom can be turned off. Per profile in Terminator

@@ -193,6 +193,17 @@ fn draw_prefs_global(ui: &mut egui::Ui, cfg: &mut Config) {
         "Smart copy (Ctrl+Shift+C sends Ctrl+C when no selection)",
     );
     ui.checkbox(&mut cfg.global.disable_mouse_paste, "Disable mouse paste");
+    if cfg!(target_os = "macos") {
+        ui.checkbox(
+            &mut cfg.global.macos_option_types_characters,
+            "Option key types special characters",
+        )
+        .on_hover_text(
+            "Off: Option acts as Alt, as on Linux (Option+B sends Esc b for shell word \
+             motion, and the Alt key bindings work). On: Option types characters (Option+A is å) \
+             and Option-only bindings don't fire for keys that type one.",
+        );
+    }
 
     ui.add_space(16.0);
     ui.heading("Hotkey Window");
