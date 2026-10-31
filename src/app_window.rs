@@ -1138,8 +1138,13 @@ impl AppWindow {
         }
         self.update_window_title();
         match self.dialogs.draw_search(ui) {
-            DialogAction::SearchNext => self.tab_mgr.run_search(false, &self.dialogs),
-            DialogAction::SearchPrev => self.tab_mgr.run_search(true, &self.dialogs),
+            DialogAction::SearchNext => {
+                self.tab_mgr.run_search(false, &self.dialogs, &shared.event_loop_proxy)
+            }
+            DialogAction::SearchPrev => {
+                self.tab_mgr.run_search(true, &self.dialogs, &shared.event_loop_proxy)
+            }
+            DialogAction::CloseSearch => self.tab_mgr.cancel_search(&self.dialogs),
             _ => {}
         }
 

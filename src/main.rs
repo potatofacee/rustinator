@@ -21,6 +21,7 @@ mod presets;
 mod profile;
 mod pty_event_loop;
 mod renderer;
+mod search;
 mod shell_integration;
 mod tab_bar;
 mod tabs;

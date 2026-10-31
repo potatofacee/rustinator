@@ -885,22 +885,9 @@ impl TabManager {
     }
 
     pub(crate) fn reset_focused_terminal(&mut self, clear: bool) {
-        use alacritty_terminal::vte::ansi::{ClearMode, Handler};
         let tab = &mut self.tabs[self.active_tab];
         if let Some(pane) = tab.panes.get_mut(&tab.focused) {
-            {
-                let mut term = pane.terminal.lock();
-                // reset_state already blanks both grids and wipes scrollback
-                // (Grid::reset calls clear_history), so the clear variant's
-                // extra calls are belt-and-braces against semantics changes.
-                Handler::reset_state(&mut *term);
-                if clear {
-                    Handler::clear_screen(&mut *term, ClearMode::All);
-                    Handler::clear_screen(&mut *term, ClearMode::Saved);
-                }
-            }
-            pane.dirty.store(true, std::sync::atomic::Ordering::Release);
-            pane.cached = None;
+            pane.reset_terminal(clear);
         }
     }
 
@@ -952,6 +939,7 @@ impl TabManager {
     pub(crate) fn toggle_search(&mut self, dialogs: &mut DialogState) {
         if dialogs.search_open {
             dialogs.search_open = false;
+            self.cancel_search(dialogs);
             return;
         }
         dialogs.search_open = true;
@@ -961,13 +949,26 @@ impl TabManager {
         dialogs.search_pane = Some((tab_idx, focused));
     }
 
-    pub(crate) fn run_search(&self, backward: bool, dialogs: &DialogState) {
-        let Some((tab_idx, pane_id)) = dialogs.search_pane else { return };
-        if tab_idx >= self.tabs.len() {
-            return;
+    pub(crate) fn run_search(
+        &self,
+        backward: bool,
+        dialogs: &DialogState,
+        wake: &EventLoopProxy<crate::window::UserEvent>,
+    ) {
+        let Some(pane) = self.search_pane(dialogs) else { return };
+        pane.search(&dialogs.search_query, backward, Some(wake.clone()));
+    }
+
+    /// The search bar closed: a search still running selects nothing.
+    pub(crate) fn cancel_search(&self, dialogs: &DialogState) {
+        if let Some(pane) = self.search_pane(dialogs) {
+            pane.cancel_search();
         }
-        let Some(pane) = self.tabs[tab_idx].panes.get(&pane_id) else { return };
-        pane.search(&dialogs.search_query, backward);
+    }
+
+    fn search_pane(&self, dialogs: &DialogState) -> Option<&Pane> {
+        let (tab_idx, pane_id) = dialogs.search_pane?;
+        self.tabs.get(tab_idx)?.panes.get(&pane_id)
     }
 
     pub(crate) fn save_layout(&self, name: String, user_config: &mut Config) {

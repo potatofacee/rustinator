@@ -5,9 +5,8 @@ use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use crate::pty_event_loop::{EventLoop, EventLoopSender, LoopChannel, Msg, PaneHooks};
 use alacritty_terminal::grid::{Dimensions, Scroll};
-use alacritty_terminal::index::{Boundary, Column, Direction as GridDir, Line, Point, Side};
+use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
-use alacritty_terminal::term::search::RegexSearch;
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::TermMode;
 use alacritty_terminal::term::cell::Flags;
@@ -22,6 +21,9 @@ use crate::keyboard;
 use crate::RawTermKey;
 use crate::mouse::{self, MouseButton, MouseKind, MouseMods};
 use crate::profile::{ProfileName, SpawnCommand};
+use crate::search::{SearchJob, SearchSlot, TermView};
+use crate::window::UserEvent;
+use winit::event_loop::EventLoopProxy;
 
 pub type PaneId = u64;
 
@@ -79,6 +81,37 @@ fn reap_off_thread(value: Box<dyn Send>) {
         }
         None => drop(value),
     }
+}
+
+/// `Handler::reset_state`, with the scrollback freed on the reaper thread.
+///
+/// `reset_state` clears history in place (`Grid::reset` -> `clear_history`),
+/// dropping every row of it under the terminal lock: up to
+/// `MAX_SCROLLBACK_LINES` rows, minutes if swapped out. Instead, the primary
+/// grid is swapped for an empty `Grid::new` of the same size and history
+/// limit first, and the old one goes to the reaper. That leaves nothing
+/// `reset_state` can observe changed: it replaces the cursors, display
+/// offset and every visible cell with defaults, which is what a new grid
+/// holds, and the rows it would have dropped are gone either way.
+///
+/// The primary grid is the inactive one on the alternate screen, which only
+/// `swap_alt` reaches. `reset_state` would swap back itself, and everything
+/// else `swap_alt` touches (keyboard mode stacks and bits, the ALT_SCREEN
+/// bit, selection, damage) it resets. The alternate grid never has history
+/// (`Term::new` gives it none and `set_options` sizes only the primary's).
+///
+/// `history_limit` must be the `scrolling_history` the terminal was built
+/// or last `set_options` with (`Pane::history_limit`).
+pub(crate) fn reset_state_reaping_history<T: EventListener>(term: &mut Term<T>, history_limit: usize) {
+    use alacritty_terminal::grid::Grid;
+    use alacritty_terminal::vte::ansi::Handler;
+    if term.mode().contains(TermMode::ALT_SCREEN) {
+        term.swap_alt();
+    }
+    let empty = Grid::new(term.screen_lines(), term.columns(), history_limit);
+    let history = std::mem::replace(term.grid_mut(), empty);
+    Handler::reset_state(term);
+    reap_off_thread(Box::new(history));
 }
 
 // Xterm-ish ANSI palette (NamedColor::Black..BrightWhite = 0..15).
@@ -589,7 +622,7 @@ fn point_from_grid(col: i32, row: i32, display_offset: i32) -> Point {
     Point::new(Line(row - display_offset), Column(col.max(0) as usize))
 }
 
-fn escape_regex(s: &str) -> String {
+pub(crate) fn escape_regex(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
         if matches!(
@@ -1058,6 +1091,14 @@ pub struct Pane {
     /// while `dead` is a persistent status. A dead pane's PTY channel is
     /// closed, so input must be a no-op rather than silently dropped.
     dead: Cell<bool>,
+    /// Scrollback search state shared with the search thread; replaced with
+    /// `terminal` on respawn. See `crate::search`.
+    search: Arc<SearchSlot>,
+    /// The `scrolling_history` the terminal was built or last `set_options`
+    /// with: its primary grid's `max_scroll_limit`, which the grid does not
+    /// expose. `reset_terminal` builds the grid that replaces the old one
+    /// with it.
+    history_limit: Cell<usize>,
 }
 
 impl Pane {
@@ -1093,6 +1134,7 @@ impl Pane {
         let pending_clipboard_store = Arc::clone(&proxy.pending_clipboard_store);
 
         let dims = TermDims { cols, lines };
+        let history_limit = term_config.scrolling_history;
         let term = Term::new(term_config, &dims, proxy.clone());
         let terminal = Arc::new(FairMutex::new(term));
 
@@ -1156,6 +1198,8 @@ impl Pane {
             profile,
             spawn_command,
             dead: Cell::new(false),
+            search: Arc::default(),
+            history_limit: Cell::new(history_limit),
         })
     }
 
@@ -1191,6 +1235,7 @@ impl Pane {
         let pending_clipboard_store = Arc::clone(&proxy.pending_clipboard_store);
 
         let dims = TermDims { cols: self.cols, lines: self.lines };
+        let history_limit = term_config.scrolling_history;
         let term = Term::new(term_config, &dims, proxy.clone());
         let terminal = Arc::new(FairMutex::new(term));
 
@@ -1245,6 +1290,8 @@ impl Pane {
         self.pending_clipboard_store = pending_clipboard_store;
         self.cached = None;
         self.dead.set(false);
+        self.search = Arc::default();
+        self.history_limit.set(history_limit);
 
         Ok(())
     }
@@ -1266,6 +1313,26 @@ impl Pane {
         self.spawn_failed.load(Ordering::Acquire)
     }
 
+    /// Terminator's Reset (`clear` false) and Reset and Clear: a full
+    /// terminal reset, whose scrollback frees on the reaper thread
+    /// (`reset_state_reaping_history`).
+    pub fn reset_terminal(&mut self, clear: bool) {
+        use alacritty_terminal::vte::ansi::{ClearMode, Handler};
+        {
+            let mut term = self.terminal.lock();
+            // reset_state already blanks both grids and wipes scrollback
+            // (Grid::reset calls clear_history), so the clear variant's
+            // extra calls are belt-and-braces against semantics changes.
+            reset_state_reaping_history(&mut term, self.history_limit.get());
+            if clear {
+                Handler::clear_screen(&mut *term, ClearMode::All);
+                Handler::clear_screen(&mut *term, ClearMode::Saved);
+            }
+        }
+        self.dirty.store(true, Ordering::Release);
+        self.cached = None;
+    }
+
     /// Apply updated terminal options (scrollback history, semantic escape
     /// chars, etc.) to the live `Term`. `Term::set_options` replaces the config
     /// and calls `grid.update_history`, so scrollback changes take effect on
@@ -1273,6 +1340,7 @@ impl Pane {
     /// switch). Marks the pane dirty so the change is reflected on next frame.
     pub fn apply_term_config(&self, term_config: Config) {
         let mut term = self.terminal.lock();
+        self.history_limit.set(term_config.scrolling_history);
         term.set_options(term_config);
         drop(term);
         self.dirty.store(true, Ordering::Release);
@@ -1323,6 +1391,24 @@ impl Pane {
     }
 
     pub fn frame(&mut self, focused: bool) -> Arc<Frame> {
+        let slot = Arc::clone(&self.search);
+        let gate = slot.gate();
+        let held = *gate;
+        // Held under the gate through the snapshot, so a search cannot take
+        // the terminal between this check and the snapshot's lock.
+        let _gate = match (held, &self.cached) {
+            // A search holds the terminal: nothing can change it until the
+            // search lets go and wakes us, and re-snapshotting would wait out
+            // the scan. Dirty and a focus change keep for that frame.
+            (Some(_), Some(frame)) => return Arc::clone(frame),
+            // Nothing to show yet: wait for the scan. Not under the gate,
+            // which the search thread needs to let the terminal go.
+            (Some(_), None) => {
+                drop(gate);
+                None
+            }
+            (None, _) => Some(gate),
+        };
         // Re-arm the PTY wake before reading the terminal: output that lands
         // mid-snapshot must send a fresh Repaint event or it would be lost
         // until the next unrelated wake.
@@ -1354,7 +1440,7 @@ impl Pane {
     /// bindings. A key egui has no name for (`key` None: é, ß, Cyrillic) has
     /// only its legacy bytes there.
     pub fn send_key(&self, rk: &RawTermKey) -> bool {
-        let mode = *self.terminal.lock().mode();
+        let mode = self.view().mode;
         let bytes = key_bytes(rk, mode, &self.defaults);
         if std::env::var_os("RUSTINATOR_KEY_DEBUG").is_some() {
             eprintln!(
@@ -1371,7 +1457,14 @@ impl Pane {
     }
 
     pub fn mode(&self) -> TermMode {
-        *self.terminal.lock().mode()
+        self.view().mode
+    }
+
+    /// The terminal's mode and scroll position. Unlike a plain lock, this
+    /// does not wait out a scrollback search holding the terminal; the
+    /// UI thread reads these for every visible pane every frame.
+    fn view(&self) -> TermView {
+        self.search.view(&self.terminal)
     }
 
     /// See `mark_visible`: true when the pane needs a repaint it never got.
@@ -1455,14 +1548,11 @@ impl Pane {
     }
 
     pub fn mouse_reporting(&self) -> bool {
-        self.terminal
-            .lock()
-            .mode()
-            .intersects(TermMode::MOUSE_MODE)
+        self.view().mode.intersects(TermMode::MOUSE_MODE)
     }
 
     pub fn term_mode(&self) -> TermMode {
-        *self.terminal.lock().mode()
+        self.view().mode
     }
 
     /// Encode and send a mouse report. A read-only pane sends nothing: VTE's
@@ -1482,18 +1572,15 @@ impl Pane {
         if self.read_only {
             return;
         }
-        let mode = *self.terminal.lock().mode();
+        let mode = self.view().mode;
         if let Some(bytes) = mouse::encode(kind, button, col, row, mods, mode) {
             self.send_bytes(bytes);
         }
     }
 
     pub fn scroll_info(&self) -> (usize, usize, usize) {
-        let term = self.terminal.lock();
-        let offset = term.grid().display_offset();
-        let history = term.grid().total_lines().saturating_sub(term.grid().screen_lines());
-        let screen = term.grid().screen_lines();
-        (offset, history, screen)
+        let view = self.view();
+        (view.display_offset, view.history, view.screen)
     }
 
     pub fn scroll_to_position(&self, offset: usize) {
@@ -1541,53 +1628,37 @@ impl Pane {
         }
     }
 
-    /// Search scrollback for `needle` (plain text; regex-escaped internally).
-    /// Searches backward from the cursor by default. Sets the selection to the
-    /// match and scrolls it into view. Returns true if a match was found.
-    pub fn search(&self, needle: &str, backward: bool) -> bool {
+    /// Search scrollback for `needle` (plain text; regex-escaped internally),
+    /// backward from the selection or cursor when `backward`, else forward.
+    /// Returns at once: the search thread selects the match and scrolls it
+    /// into view, then wakes the UI through `wake`, unless a newer search or
+    /// `cancel_search` came first. An empty needle searches nothing but still
+    /// abandons the search in flight. See `crate::search`.
+    pub fn search(&self, needle: &str, backward: bool, wake: Option<EventLoopProxy<UserEvent>>) {
+        let ticket = self.search.begin();
         if needle.is_empty() {
-            return false;
+            return;
         }
-        let pattern = escape_regex(needle);
-        let mut regex = match RegexSearch::new(&pattern) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("search regex build failed: {e}");
-                return false;
-            }
-        };
-        let mut term = self.terminal.lock();
-        // Origin: skip past the current selection/cursor so consecutive searches advance.
-        let origin = match (term.selection.as_ref().and_then(|s| s.to_range(&*term)), backward) {
-            (Some(range), true) => range.start.sub(&*term, Boundary::None, 1),
-            (Some(range), false) => range.end.add(&*term, Boundary::None, 1),
-            (None, _) => term.grid().cursor.point,
-        };
-        let direction = if backward { GridDir::Left } else { GridDir::Right };
-        let m = term.search_next(&mut regex, origin, direction, Side::Left, None);
-        if let Some(m) = m {
-            let start = *m.start();
-            let end = *m.end();
-            term.selection = Some(Selection::new(SelectionType::Simple, start, Side::Left));
-            if let Some(sel) = term.selection.as_mut() {
-                sel.update(end, Side::Right);
-            }
-            term.scroll_to_point(start);
-            self.dirty.store(true, Ordering::Release);
-            true
-        } else {
-            false
-        }
+        crate::search::submit(SearchJob {
+            terminal: TermHandle::new(Arc::clone(&self.terminal)),
+            slot: Arc::clone(&self.search),
+            ticket,
+            needle: needle.to_owned(),
+            backward,
+            dirty: Arc::clone(&self.dirty),
+            wake,
+        });
+    }
+
+    /// Abandon the search in flight, if any: it selects nothing.
+    pub fn cancel_search(&self) {
+        self.search.cancel();
     }
 
     /// Send pasted text, wrapping in bracketed-paste sequences when the term
     /// has BRACKETED_PASTE enabled.
     pub fn send_paste(&self, text: &str) {
-        let bracketed = self
-            .terminal
-            .lock()
-            .mode()
-            .contains(TermMode::BRACKETED_PASTE);
+        let bracketed = self.view().mode.contains(TermMode::BRACKETED_PASTE);
         self.send_bytes(crate::input::encode_paste(text, bracketed));
     }
 
@@ -2057,6 +2128,97 @@ mod tests {
             .expect("payload was never dropped");
         assert_ne!(id, std::thread::current().id(), "payload dropped on the dropping thread");
         assert_eq!(name.as_deref(), Some("term reaper"));
+    }
+
+    /// `reset_state_reaping_history` against a plain `reset_state` on two
+    /// terminals built from the same bytes: full history, modes, a pushed
+    /// kitty mode, a scroll region, cleared tab stops, a charset, SGR, a saved
+    /// cursor, a scrolled viewport and a selection, on the primary screen and
+    /// on the alternate. The state after the reset must match, and so must
+    /// the state after the same output on both, which exercises what is not
+    /// public (scroll region, tab stops, history limit, the other grid).
+    #[test]
+    fn reset_reaping_history_matches_reset_state() {
+        use alacritty_terminal::event::VoidListener;
+        use alacritty_terminal::term::test::TermSize;
+        use alacritty_terminal::vte::ansi::{Handler, Processor};
+
+        const HISTORY: usize = 100;
+
+        fn feed(term: &mut Term<VoidListener>, bytes: &[u8]) {
+            let mut parser: Processor = Processor::new();
+            parser.advance(term, bytes);
+        }
+
+        fn build(alt: bool) -> Term<VoidListener> {
+            let config =
+                Config { scrolling_history: HISTORY, kitty_keyboard: true, ..Config::default() };
+            let mut term = Term::new(config, &TermSize::new(20, 6), VoidListener);
+            let mut bytes = Vec::new();
+            for i in 0..300 {
+                bytes.extend_from_slice(format!("history {i}\r\n").as_bytes());
+            }
+            bytes.extend_from_slice(
+                b"\x1b[?1h\x1b[?2004h\x1b[?1000h\x1b[?1006h\x1b[>1u\x1b[3g\x1b(0\x1b[1;31m\
+                  \x1b[3;5H\x1b7\x1b]0;title\x07\x1b[22t\x1b[2;4r\x1b[4;2Hregion",
+            );
+            if alt {
+                bytes.extend_from_slice(b"\x1b[?1049h\x1b[>5ualt screen\r\nmore");
+            }
+            feed(&mut term, &bytes);
+            assert_eq!(term.grid().history_size(), if alt { 0 } else { HISTORY });
+            term.scroll_display(Scroll::Delta(40));
+            let start = Point::new(Line(1), Column(2));
+            term.selection = Some(Selection::new(SelectionType::Simple, start, Side::Left));
+            term
+        }
+
+        fn assert_same(a: &Term<VoidListener>, b: &Term<VoidListener>, when: &str) {
+            assert_eq!(a.mode(), b.mode(), "mode {when}");
+            assert_eq!(a.selection, b.selection, "selection {when}");
+            assert_eq!(a.vi_mode_cursor.point, b.vi_mode_cursor.point, "vi cursor {when}");
+            let (ga, gb) = (a.grid(), b.grid());
+            assert_eq!(ga.total_lines(), gb.total_lines(), "total lines {when}");
+            assert_eq!(ga.history_size(), gb.history_size(), "history {when}");
+            assert_eq!(ga.display_offset(), gb.display_offset(), "display offset {when}");
+            assert_eq!(ga.cursor, gb.cursor, "cursor {when}");
+            assert_eq!(ga.saved_cursor, gb.saved_cursor, "saved cursor {when}");
+            for line in ga.topmost_line().0..=ga.bottommost_line().0 {
+                for col in 0..ga.columns() {
+                    let (line, col) = (Line(line), Column(col));
+                    assert_eq!(ga[line][col], gb[line][col], "cell {line:?},{col:?} {when}");
+                }
+            }
+        }
+
+        for alt in [false, true] {
+            let (mut plain, mut reaped) = (build(alt), build(alt));
+            assert_same(&plain, &reaped, "before the reset");
+
+            Handler::reset_state(&mut plain);
+            reset_state_reaping_history(&mut reaped, HISTORY);
+            let when = format!("after the reset (alt {alt})");
+            assert_same(&plain, &reaped, &when);
+            assert_eq!(reaped.grid().history_size(), 0, "{when}");
+            assert!(!reaped.mode().contains(TermMode::ALT_SCREEN), "{when}");
+
+            let mut after = b"a\tb\tc\r\n\x1b8x\x1b[<1u".to_vec();
+            for i in 0..250 {
+                after.extend_from_slice(format!("after {i}\r\n").as_bytes());
+            }
+            feed(&mut plain, &after);
+            feed(&mut reaped, &after);
+            assert_same(&plain, &reaped, &format!("after more output (alt {alt})"));
+            assert_eq!(reaped.grid().history_size(), HISTORY, "history limit kept");
+
+            let alt_bytes = b"\x1b[?1049hon the alternate\r\nscreen";
+            feed(&mut plain, alt_bytes);
+            feed(&mut reaped, alt_bytes);
+            assert_same(&plain, &reaped, &format!("on the alternate screen (alt {alt})"));
+            feed(&mut plain, b"\x1b[?1049l");
+            feed(&mut reaped, b"\x1b[?1049l");
+            assert_same(&plain, &reaped, &format!("back on the primary (alt {alt})"));
+        }
     }
 
     #[test]
