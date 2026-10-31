@@ -19,8 +19,13 @@
 //! ends without reaping its child kills it and still reports `Term::exit`
 //! (see `finish`). The loop's channel is a separate
 //! `LoopChannel` passed to `EventLoop::new`, so a pane holds its sender before
-//! the `Pty` exists (see `LoopChannel`). Re-sync this file when bumping
-//! alacritty_terminal.
+//! the `Pty` exists (see `LoopChannel`). The loop can also be paused
+//! (`PaneHooks::paused`, woken through `EventLoopSender::notify`) while a
+//! background thread holds the terminal for a long scrollback search or
+//! reflow: it then drops read interest and leaves the terminal alone (no
+//! `pty_read`, no sync-timeout flush), so instead of blocking on the lock it
+//! keeps writing input, resizing and shutting down. Re-sync this file when
+//! bumping alacritty_terminal.
 
 use std::borrow::Cow;
 use std::collections::VecDeque;
@@ -61,6 +66,13 @@ pub struct PaneHooks {
     /// Pid of the PTY's direct child, signalled on `Msg::Shutdown`. The loop is
     /// generic over `EventedPty`, which does not expose the child.
     pub child_pid: u32,
+    /// Set while a background thread holds the terminal for a long time (a
+    /// scrollback search or reflow, `TermGate::hold`), which wakes the loop
+    /// through `EventLoopSender::notify` on each change. While set the loop
+    /// leaves the terminal alone: it stops reading the PTY (output waits in
+    /// the kernel's buffer) and does not flush a synchronized update, but
+    /// keeps writing input, resizing and shutting down.
+    pub paused: Arc<AtomicBool>,
 }
 
 // Replicated from alacritty_terminal's tty module, where they are pub(crate).
@@ -118,6 +130,12 @@ impl LoopChannel {
 
     pub fn sender(&self) -> EventLoopSender {
         EventLoopSender { sender: self.tx.clone(), poller: Arc::clone(&self.poll) }
+    }
+
+    /// Everything sent so far, for tests of a pane whose loop never starts.
+    #[cfg(test)]
+    pub fn drain(&self) -> Vec<Msg> {
+        self.rx.try_iter().collect()
     }
 }
 
@@ -408,9 +426,23 @@ where
             let mut child_reaped = false;
 
             'event_loop: loop {
+                // Deviation: while paused (see `PaneHooks::paused`) drop read
+                // interest, or the level-triggered poll would wake for unread
+                // output forever; take it back once resumed.
+                // Not once PTY I/O has failed: `pty_io_failed` disarmed the fd
+                // for good, and re-arming it would bring back the spin.
+                let paused = self.hooks.paused.load(Ordering::SeqCst);
+                if !state.io_failed && interest.readable == paused {
+                    interest.readable = !paused;
+                    self.pty.reregister(&self.poll, interest, poll_opts).unwrap();
+                }
+
                 // Wakeup the event loop when a synchronized update timeout was reached.
                 let handler = state.parser.sync_timeout();
-                let sync_deadline = handler.sync_timeout();
+                // Deviation: a paused loop cannot flush a synchronized update
+                // (that needs the terminal), so it does not wake for one; the
+                // overdue deadline fires once resumed.
+                let sync_deadline = if paused { None } else { handler.sync_timeout() };
                 // Deviation: while shutting down, also wake for the SIGKILL deadline.
                 let kill_deadline = state.shutdown.as_ref().and_then(|s| s.kill_at);
                 let deadline = match (sync_deadline, kill_deadline) {
@@ -442,10 +474,16 @@ where
                 // Handle synchronized update timeout.
                 // Deviation: upstream's only timeout is the sync one, so it reads any
                 // empty wake as that. While shutting down the wake may be the kill
-                // deadline instead, so then the sync timer must actually be due.
+                // deadline instead, and a wait begun paused (no read interest)
+                // can only end on the kill deadline or the resume notification,
+                // so then the sync timer must actually be due. A wake that
+                // pauses the loop (`paused` read again: it is set before the
+                // notification) must not lock the terminal at all: the holder
+                // that paused it is taking it.
                 if events.is_empty()
                     && self.rx.peek().is_none()
-                    && (state.shutdown.is_none()
+                    && !self.hooks.paused.load(Ordering::SeqCst)
+                    && ((state.shutdown.is_none() && interest.readable)
                         || sync_deadline.is_some_and(|at| at <= Instant::now()))
                 {
                     let mut terminal = self.terminal.lock();
@@ -504,7 +542,9 @@ where
                                 continue;
                             }
 
-                            if event.readable {
+                            // Deviation: no read while paused (a readable event
+                            // can still come from before the interest dropped).
+                            if event.readable && !self.hooks.paused.load(Ordering::SeqCst) {
                                 if let Err(err) = self.pty_read(&mut state, &mut buf, pipe.as_mut())
                                 {
                                     // On Linux, a `read` on the master side of a PTY can fail
@@ -652,6 +692,13 @@ impl EventLoopSender {
     pub fn send(&self, msg: Msg) -> Result<(), EventLoopSendError> {
         self.sender.send(msg).map_err(EventLoopSendError::Send)?;
         self.poller.notify().map_err(EventLoopSendError::Io)
+    }
+
+    /// Deviation: wake the loop without a message, to re-read
+    /// `PaneHooks::paused`. Sticky: a loop not yet polling wakes on its next
+    /// poll.
+    pub fn notify(&self) {
+        let _ = self.poller.notify();
     }
 }
 
@@ -923,6 +970,7 @@ mod tests {
                 history_limit: Arc::new(AtomicUsize::new(Config::default().scrolling_history)),
                 defaults: Arc::new(Mutex::new(PaneDefaults::default())),
                 child_pid,
+                paused: Arc::new(AtomicBool::new(false)),
             };
             let channel = LoopChannel::new().expect("create loop channel");
             let event_loop =
@@ -1099,6 +1147,7 @@ mod tests {
                 history_limit: Arc::new(AtomicUsize::new(Config::default().scrolling_history)),
                 defaults: Arc::new(Mutex::new(PaneDefaults::default())),
                 child_pid: pid,
+                paused: Arc::new(AtomicBool::new(false)),
             };
             let channel = LoopChannel::new().expect("create loop channel");
             let pty = FailingReads { pty, reader: FailRead };

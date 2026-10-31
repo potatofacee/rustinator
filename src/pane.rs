@@ -21,7 +21,9 @@ use crate::keyboard;
 use crate::RawTermKey;
 use crate::mouse::{self, MouseButton, MouseKind, MouseMods};
 use crate::profile::{ProfileName, SpawnCommand};
-use crate::search::{SearchJob, SearchSlot, TermView};
+use crate::reflow::{ReflowJob, ReflowSlot, Request};
+use crate::search::{SearchJob, SearchSlot};
+use crate::term_gate::{HoldKind, PtyPause, TermGate, TermView};
 use crate::window::UserEvent;
 use winit::event_loop::EventLoopProxy;
 
@@ -528,9 +530,9 @@ impl EventListener for EventProxy {
     }
 }
 
-struct TermDims {
-    cols: usize,
-    lines: usize,
+pub(crate) struct TermDims {
+    pub(crate) cols: usize,
+    pub(crate) lines: usize,
 }
 
 impl Dimensions for TermDims {
@@ -1036,6 +1038,14 @@ fn scrub_foreign_term_vars(env: &mut std::collections::HashMap<String, String>) 
     }
 }
 
+/// A terminal's gate, pausing the PTY loop behind `pty_tx` for each hold,
+/// and the flag for that loop's `PaneHooks::paused`.
+fn paused_gate(pty_tx: &EventLoopSender) -> (Arc<AtomicBool>, Arc<TermGate<EventProxy>>) {
+    let paused = Arc::new(AtomicBool::new(false));
+    let pause = PtyPause { paused: Arc::clone(&paused), waker: pty_tx.clone() };
+    (paused, Arc::new(TermGate::new(Some(pause))))
+}
+
 /// Spawn the pane's child and start its PTY event loop on a worker thread,
 /// never the caller's. `tty::new` forks and std's `Command::spawn` then waits
 /// for the child to exec, and the child first chdirs into
@@ -1058,6 +1068,7 @@ fn spawn_pty<U: EventListener + Send + 'static>(
     defaults: Arc<Mutex<PaneDefaults>>,
     child_pid: Arc<OnceLock<u32>>,
     spawn_failed: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
     alacritty_terminal::thread::spawn_named("PTY spawn", move || {
         // `tty::new` is `openpty` + `tty::from_fd`; on macOS the PTY is opened
@@ -1082,7 +1093,8 @@ fn spawn_pty<U: EventListener + Send + 'static>(
         };
         let pid = pty.child().id();
         let _ = child_pid.set(pid);
-        let hooks = PaneHooks { clear_wipes_scrollback, history_limit, defaults, child_pid: pid };
+        let hooks =
+            PaneHooks { clear_wipes_scrollback, history_limit, defaults, child_pid: pid, paused };
         let event_loop = EventLoop::new(channel, terminal, event_proxy, pty, false, false, hooks);
         // Detached, as in alacritty: the thread tears down its own Pty.
         let _ = event_loop.spawn();
@@ -1206,6 +1218,15 @@ pub struct Pane {
     /// Scrollback search state shared with the search thread; replaced with
     /// `terminal` on respawn. See `crate::search`.
     search: Arc<SearchSlot>,
+    /// The gate between background holders of `terminal` (the search and
+    /// reflow threads) and the UI thread; replaced with `terminal` on
+    /// respawn. See `crate::term_gate`.
+    gate: Arc<TermGate<EventProxy>>,
+    /// The newest size asked for, for the reflow thread; replaced with
+    /// `terminal` on respawn. See `crate::reflow`.
+    reflow: Arc<ReflowSlot>,
+    /// Wakes the UI thread when a reflow lets the terminal go.
+    winit_proxy: Option<EventLoopProxy<UserEvent>>,
     /// The `scrolling_history` `terminal` was built or last `set_options`
     /// with: its primary grid's `max_scroll_limit`, which the grid does not
     /// expose. The grids that replace one holding scrollback are built with it
@@ -1238,7 +1259,7 @@ impl Pane {
             cell_height: cell_h.round() as u16,
         };
 
-        let proxy = EventProxy::new(winit_proxy, window_size);
+        let proxy = EventProxy::new(winit_proxy.clone(), window_size);
         let dirty = Arc::clone(&proxy.dirty);
         let wake_pending = Arc::clone(&proxy.wake_pending);
         let has_new_output = Arc::clone(&proxy.has_new_output);
@@ -1274,6 +1295,7 @@ impl Pane {
         *pty_writer.lock().unwrap() = Some(pty_tx.clone());
         let child_pid = Arc::new(OnceLock::new());
         let spawn_failed = Arc::new(AtomicBool::new(false));
+        let (paused, gate) = paused_gate(&pty_tx);
         let _ = spawn_pty(
             pty_opts,
             window_size,
@@ -1286,6 +1308,7 @@ impl Pane {
             Arc::clone(&shared_defaults),
             Arc::clone(&child_pid),
             Arc::clone(&spawn_failed),
+            paused,
         );
 
         Ok(Self {
@@ -1316,8 +1339,62 @@ impl Pane {
             spawn_command,
             dead: Cell::new(false),
             search: Arc::default(),
+            gate,
+            reflow: Arc::new(ReflowSlot::new(window_size)),
+            winit_proxy,
             history_limit,
         })
+    }
+
+    /// A pane whose PTY loop never starts: what it sends queues in the
+    /// returned channel (`LoopChannel::drain`). Cells are 8x16.
+    #[cfg(test)]
+    pub(crate) fn detached(term_config: Config, cols: usize, lines: usize) -> (Self, LoopChannel) {
+        let window_size =
+            WindowSize { num_lines: lines as u16, num_cols: cols as u16, cell_width: 8, cell_height: 16 };
+        let proxy = EventProxy::new(None, window_size);
+        let history_limit = Arc::new(AtomicUsize::new(term_config.scrolling_history));
+        let term = Term::new(term_config, &TermDims { cols, lines }, proxy.clone());
+        let channel = LoopChannel::new().expect("create loop channel");
+        let pty_tx = channel.sender();
+        *proxy.pty_writer.lock().unwrap() = Some(pty_tx.clone());
+        let defaults = PaneDefaults::default();
+        // Pauses a loop that never runs; only the notifications are real.
+        let (_paused, gate) = paused_gate(&pty_tx);
+        let pane = Self {
+            id: 0,
+            terminal: TermHandle::new(Arc::new(FairMutex::new(term))),
+            pty_tx,
+            child_pid: Arc::new(OnceLock::new()),
+            spawn_failed: Arc::new(AtomicBool::new(false)),
+            cols,
+            lines,
+            dirty: Arc::clone(&proxy.dirty),
+            wake_pending: Arc::clone(&proxy.wake_pending),
+            has_new_output: Arc::clone(&proxy.has_new_output),
+            exited: Arc::clone(&proxy.exited),
+            title: Arc::clone(&proxy.title),
+            visible: Arc::clone(&proxy.visible),
+            cached: None,
+            last_focused: false,
+            clear_wipes_scrollback: Arc::new(AtomicBool::new(false)),
+            defaults,
+            shared_defaults: Arc::new(Mutex::new(defaults)),
+            window_size: Arc::clone(&proxy.window_size),
+            pending_clipboard_store: Arc::clone(&proxy.pending_clipboard_store),
+            read_only: false,
+            scrollbar_visible: true,
+            group: None,
+            profile: ProfileName::default(),
+            spawn_command: SpawnCommand { program: None, args: Vec::new() },
+            dead: Cell::new(false),
+            search: Arc::default(),
+            gate,
+            reflow: Arc::new(ReflowSlot::new(window_size)),
+            winit_proxy: None,
+            history_limit,
+        };
+        (pane, channel)
     }
 
     pub fn respawn(
@@ -1331,6 +1408,9 @@ impl Pane {
         // up (and after its grace period kills) the old child and reaps it on
         // its own thread; the old Term goes to the reaper when `self.terminal`
         // is replaced below. No join: either could stall the UI thread.
+        // A reflow queued for the old terminal stops (one running finishes
+        // on the old terminal, which nothing here touches again).
+        self.reflow.close();
         let _ = self.pty_tx.send(Msg::Shutdown);
 
         let window_size = WindowSize {
@@ -1340,7 +1420,7 @@ impl Pane {
             cell_height: cell_h.round() as u16,
         };
 
-        let proxy = EventProxy::new(winit_proxy, window_size);
+        let proxy = EventProxy::new(winit_proxy.clone(), window_size);
         let dirty = Arc::clone(&proxy.dirty);
         let wake_pending = Arc::clone(&proxy.wake_pending);
         let has_new_output = Arc::clone(&proxy.has_new_output);
@@ -1380,6 +1460,7 @@ impl Pane {
         *pty_writer.lock().unwrap() = Some(pty_tx.clone());
         let child_pid = Arc::new(OnceLock::new());
         let spawn_failed = Arc::new(AtomicBool::new(false));
+        let (paused, gate) = paused_gate(&pty_tx);
         let _ = spawn_pty(
             pty_opts,
             window_size,
@@ -1392,6 +1473,7 @@ impl Pane {
             Arc::clone(&self.shared_defaults),
             Arc::clone(&child_pid),
             Arc::clone(&spawn_failed),
+            paused,
         );
 
         self.terminal = TermHandle::new(terminal);
@@ -1409,6 +1491,9 @@ impl Pane {
         self.cached = None;
         self.dead.set(false);
         self.search = Arc::default();
+        self.gate = gate;
+        self.reflow = Arc::new(ReflowSlot::new(window_size));
+        self.winit_proxy = winit_proxy;
         self.history_limit = history_limit;
 
         Ok(())
@@ -1434,21 +1519,35 @@ impl Pane {
     /// Terminator's Reset (`clear` false) and Reset and Clear: a full
     /// terminal reset, whose scrollback frees on the reaper thread
     /// (`reset_state_reaping_history`).
+    ///
+    /// While a background holder has the terminal (a search or a reflow)
+    /// the reset waits for it to let go, off this thread (`TermGate`). It
+    /// reads `history_limit` when it runs, under the terminal lock, so a
+    /// deferred `apply_term_config` queued before it is accounted for.
     pub fn reset_terminal(&mut self, clear: bool) {
         use alacritty_terminal::vte::ansi::{ClearMode, Handler};
-        {
-            let mut term = self.terminal.lock();
-            // reset_state already blanks both grids and wipes scrollback
-            // (Grid::reset calls clear_history), so the clear variant's
-            // extra calls are belt-and-braces against semantics changes.
-            reset_state_reaping_history(&mut term, self.history_limit.load(Ordering::Relaxed));
-            if clear {
-                Handler::clear_screen(&mut *term, ClearMode::All);
-                Handler::clear_screen(&mut *term, ClearMode::Saved);
-            }
-        }
+        let history_limit = Arc::clone(&self.history_limit);
+        let dirty = Arc::clone(&self.dirty);
+        let ran_now = self.gate.mutate_or_defer(
+            &self.terminal,
+            Box::new(move |term| {
+                // reset_state already blanks both grids and wipes scrollback
+                // (Grid::reset calls clear_history), so the clear variant's
+                // extra calls are belt-and-braces against semantics changes.
+                reset_state_reaping_history(term, history_limit.load(Ordering::Relaxed));
+                if clear {
+                    Handler::clear_screen(term, ClearMode::All);
+                    Handler::clear_screen(term, ClearMode::Saved);
+                }
+                dirty.store(true, Ordering::Release);
+            }),
+        );
         self.dirty.store(true, Ordering::Release);
-        self.cached = None;
+        // A deferred reset keeps the frame: it is what the pane shows until
+        // the holder lets go.
+        if ran_now {
+            self.cached = None;
+        }
     }
 
     /// Apply updated terminal options (scrollback history, semantic escape
@@ -1456,11 +1555,19 @@ impl Pane {
     /// and calls `grid.update_history`, so scrollback changes take effect on
     /// the existing grid (the inactive/alt grid updates on its next screen
     /// switch). Marks the pane dirty so the change is reflected on next frame.
+    /// Deferred while a background holder has the terminal (`TermGate`);
+    /// `history_limit` changes with the options, under the terminal lock.
     pub fn apply_term_config(&self, term_config: Config) {
-        let mut term = self.terminal.lock();
-        self.history_limit.store(term_config.scrolling_history, Ordering::Relaxed);
-        term.set_options(term_config);
-        drop(term);
+        let history_limit = Arc::clone(&self.history_limit);
+        let dirty = Arc::clone(&self.dirty);
+        self.gate.mutate_or_defer(
+            &self.terminal,
+            Box::new(move |term| {
+                history_limit.store(term_config.scrolling_history, Ordering::Relaxed);
+                term.set_options(term_config);
+                dirty.store(true, Ordering::Release);
+            }),
+        );
         self.dirty.store(true, Ordering::Release);
     }
 
@@ -1474,29 +1581,69 @@ impl Pane {
         self.child_pid.get().and_then(|&pid| pane_cwd(pid))
     }
 
+    /// Size the grid to `cols` x `lines`. Returns at once: a column change
+    /// reflows the scrollback on the reflow thread (see `crate::reflow`),
+    /// and the PTY is told the size once the grid has it. `cols`/`lines`
+    /// are the size asked for from here on, which the title bar shows.
     pub fn resize(&mut self, cols: usize, lines: usize, cell_w: f32, cell_h: f32) {
-        if cols == self.cols && lines == self.lines {
-            return;
+        if let Some(job) = self.request_resize(cols, lines, cell_w, cell_h) {
+            crate::reflow::submit(job);
         }
-        let dims = TermDims { cols, lines };
-        {
-            let mut term = self.terminal.lock();
-            term.resize(dims);
+    }
+
+    /// `resize` without the submit: the job to run, if one must be queued.
+    pub(crate) fn request_resize(
+        &mut self,
+        cols: usize,
+        lines: usize,
+        cell_w: f32,
+        cell_h: f32,
+    ) -> Option<ReflowJob<EventProxy>> {
+        if cols == self.cols && lines == self.lines {
+            return None;
         }
         self.cols = cols;
         self.lines = lines;
-        self.dirty.store(true, Ordering::Release);
-        self.cached = None;
         let ws = WindowSize {
             num_lines: lines as u16,
             num_cols: cols as u16,
             cell_width: cell_w.round() as u16,
             cell_height: cell_h.round() as u16,
         };
-        *self.window_size.lock().unwrap() = ws;
-        let _ = self.pty_tx.send(Msg::Resize(ws));
+        let mut request = self.reflow.request(ws);
+        if request == Request::Sync {
+            // Lines only: no history to rewrap, so resize here, unless a
+            // search holds the terminal; then the reflow thread waits for it.
+            let dims = TermDims { cols, lines };
+            if self.gate.try_mut(&self.terminal, |term| term.resize(dims)).is_some() {
+                self.dirty.store(true, Ordering::Release);
+                self.reflow.applied_now(ws, |ws| {
+                    *self.window_size.lock().unwrap() = ws;
+                    let _ = self.pty_tx.send(Msg::Resize(ws));
+                });
+                return None;
+            }
+            request = self.reflow.queue(ws);
+        }
+        if request != Request::Submit {
+            return None;
+        }
+        // The frame shown while the reflow runs: bring it up to date first
+        // (output since the last paint, or a tab that was hidden).
+        self.frame(self.last_focused);
+        Some(ReflowJob {
+            terminal: TermHandle::new(Arc::clone(&self.terminal)),
+            gate: Arc::clone(&self.gate),
+            slot: Arc::clone(&self.reflow),
+            pty_tx: self.pty_tx.clone(),
+            window_size: Arc::clone(&self.window_size),
+            dirty: Arc::clone(&self.dirty),
+            wake: self.winit_proxy.clone(),
+        })
     }
 
+    /// Tell the PTY a new cell size with the grid size kept (font zoom).
+    /// While a reflow is pending it goes out with the reflow's final size.
     pub fn force_pty_resize(&mut self, cell_w: f32, cell_h: f32) {
         let ws = WindowSize {
             num_lines: self.lines as u16,
@@ -1504,29 +1651,29 @@ impl Pane {
             cell_width: cell_w.round() as u16,
             cell_height: cell_h.round() as u16,
         };
-        *self.window_size.lock().unwrap() = ws;
-        let _ = self.pty_tx.send(Msg::Resize(ws));
+        self.reflow.update_cells(ws, |ws| {
+            *self.window_size.lock().unwrap() = ws;
+            let _ = self.pty_tx.send(Msg::Resize(ws));
+        });
     }
 
+    /// The frame to paint. Never waits on a background holder of the
+    /// terminal (a search or a reflow): while one has it, this is the last
+    /// frame, or a blank one if there is none yet.
     pub fn frame(&mut self, focused: bool) -> Arc<Frame> {
-        let slot = Arc::clone(&self.search);
-        let gate = slot.gate();
-        let held = *gate;
-        // Held under the gate through the snapshot, so a search cannot take
-        // the terminal between this check and the snapshot's lock.
-        let _gate = match (held, &self.cached) {
-            // A search holds the terminal: nothing can change it until the
-            // search lets go and wakes us, and re-snapshotting would wait out
-            // the scan. Dirty and a focus change keep for that frame.
-            (Some(_), Some(frame)) => return Arc::clone(frame),
-            // Nothing to show yet: wait for the scan. Not under the gate,
-            // which the search thread needs to let the terminal go.
-            (Some(_), None) => {
-                drop(gate);
-                None
-            }
-            (None, _) => Some(gate),
-        };
+        let gate = Arc::clone(&self.gate);
+        // Held through the snapshot, so a holder cannot take the terminal
+        // between this check and the snapshot's lock.
+        let gate = gate.gate();
+        if gate.is_held() {
+            // Nothing can change the terminal until the holder lets go and
+            // wakes us, and re-snapshotting would wait it out. Dirty and a
+            // focus change keep for that frame.
+            return match &self.cached {
+                Some(frame) => Arc::clone(frame),
+                None => Arc::new(self.blank_frame(focused)),
+            };
+        }
         // Re-arm the PTY wake before reading the terminal: output that lands
         // mid-snapshot must send a fresh Repaint event or it would be lost
         // until the next unrelated wake.
@@ -1537,7 +1684,19 @@ impl Pane {
         if was_dirty || focus_changed || self.cached.is_none() {
             self.cached = Some(Arc::new(self.snapshot(focused)));
         }
+        drop(gate);
         Arc::clone(self.cached.as_ref().unwrap())
+    }
+
+    /// A frame with no cells and no cursor, in the default background: what
+    /// `frame` shows for a terminal a holder has before any snapshot exists.
+    /// Not cached, so the first frame after the holder lets go snapshots.
+    fn blank_frame(&self, focused: bool) -> Frame {
+        let [r, g, b] = self.defaults.bg;
+        let bg_factor = if focused { 1.0 } else { self.defaults.inactive_bg_color_offset };
+        let mut default_bg = scale_rgb(rgb_to_f32(r, g, b), bg_factor);
+        default_bg[3] = self.defaults.bg_opacity.clamp(0.0, 1.0);
+        Frame { cells: Vec::new(), default_bg, cursor: None, cursor_blink_requested: false }
     }
 
     pub fn send_bytes(&self, bytes: Vec<u8>) {
@@ -1582,7 +1741,7 @@ impl Pane {
     /// does not wait out a scrollback search holding the terminal; the
     /// UI thread reads these for every visible pane every frame.
     fn view(&self) -> TermView {
-        self.search.view(&self.terminal)
+        self.gate.view(&self.terminal)
     }
 
     /// See `mark_visible`: true when the pane needs a repaint it never got.
@@ -1596,73 +1755,87 @@ impl Pane {
         }
     }
 
+    // Selection and scroll gestures go through `TermGate::try_mut`: while a
+    // background holder (a search or a reflow) has the terminal they are
+    // dropped, not waited for on the UI thread.
+
     pub fn begin_selection(&self, col: i32, row: i32, side: Side, ty: SelectionType) {
-        let mut term = self.terminal.lock();
-        let display_offset = term.grid().display_offset() as i32;
-        let point = point_from_grid(col, row, display_offset);
-        // `side` is which half of the cell the cursor sits in, matching
-        // alacritty/vte: it decides whether the anchor cell is included.
-        term.selection = Some(Selection::new(ty, point, side));
-        self.dirty.store(true, Ordering::Release);
+        self.gate.try_mut(&self.terminal, |term| {
+            let display_offset = term.grid().display_offset() as i32;
+            let point = point_from_grid(col, row, display_offset);
+            // `side` is which half of the cell the cursor sits in, matching
+            // alacritty/vte: it decides whether the anchor cell is included.
+            term.selection = Some(Selection::new(ty, point, side));
+            self.dirty.store(true, Ordering::Release);
+        });
     }
 
     pub fn update_selection(&self, col: i32, row: i32, side: Side) {
-        let mut term = self.terminal.lock();
-        let display_offset = term.grid().display_offset() as i32;
-        let point = point_from_grid(col, row, display_offset);
-        // Extend the live selection in place. The PTY thread rotates/invalidates
-        // `term.selection` as output scrolls, so editing it directly (rather than
-        // a stored mirror) keeps the highlight pinned to its content.
-        if let Some(sel) = term.selection.as_mut() {
-            sel.update(point, side);
-            self.dirty.store(true, Ordering::Release);
-        }
+        self.gate.try_mut(&self.terminal, |term| {
+            let display_offset = term.grid().display_offset() as i32;
+            let point = point_from_grid(col, row, display_offset);
+            // Extend the live selection in place. The PTY thread rotates/invalidates
+            // `term.selection` as output scrolls, so editing it directly (rather than
+            // a stored mirror) keeps the highlight pinned to its content.
+            if let Some(sel) = term.selection.as_mut() {
+                sel.update(point, side);
+                self.dirty.store(true, Ordering::Release);
+            }
+        });
     }
 
     /// Scroll the display one step while extending the active selection to the
     /// newly exposed edge. Returns `false` (without touching the selection) when
     /// the display is already at the scroll limit, so the caller can fall back to
-    /// a normal in-bounds selection update.
+    /// a normal in-bounds selection update. Returns `true`, doing nothing,
+    /// while a holder has the terminal, so the caller drops the gesture
+    /// instead of falling through to `update_selection`.
     pub fn selection_auto_scroll(&self, delta: i32, cols: i32) -> bool {
-        let mut term = self.terminal.lock();
-        let before = term.grid().display_offset();
-        term.scroll_display(Scroll::Delta(delta));
-        let new_offset = term.grid().display_offset();
-        if new_offset == before {
-            return false;
-        }
-        let display_offset = new_offset as i32;
-        let row = if delta > 0 { 0 } else { term.screen_lines() as i32 - 1 };
-        let col = if delta > 0 { 0 } else { cols.saturating_sub(1) };
-        // Extend to the leading edge of the newly exposed line: left edge when
-        // scrolling up to the top, right edge when scrolling down to the bottom.
-        let side = if delta > 0 { Side::Left } else { Side::Right };
-        let point = point_from_grid(col, row, display_offset);
-        if let Some(sel) = term.selection.as_mut() {
-            sel.update(point, side);
-        }
-        self.dirty.store(true, Ordering::Release);
-        true
+        self.gate
+            .try_mut(&self.terminal, |term| {
+                let before = term.grid().display_offset();
+                term.scroll_display(Scroll::Delta(delta));
+                let new_offset = term.grid().display_offset();
+                if new_offset == before {
+                    return false;
+                }
+                let display_offset = new_offset as i32;
+                let row = if delta > 0 { 0 } else { term.screen_lines() as i32 - 1 };
+                let col = if delta > 0 { 0 } else { cols.saturating_sub(1) };
+                // Extend to the leading edge of the newly exposed line: left edge when
+                // scrolling up to the top, right edge when scrolling down to the bottom.
+                let side = if delta > 0 { Side::Left } else { Side::Right };
+                let point = point_from_grid(col, row, display_offset);
+                if let Some(sel) = term.selection.as_mut() {
+                    sel.update(point, side);
+                }
+                self.dirty.store(true, Ordering::Release);
+                true
+            })
+            .unwrap_or(true)
     }
 
     pub fn clear_selection(&self) {
-        let mut term = self.terminal.lock();
-        if term.selection.is_some() {
-            term.selection = None;
-            self.dirty.store(true, Ordering::Release);
-        }
+        self.gate.try_mut(&self.terminal, |term| {
+            if term.selection.is_some() {
+                term.selection = None;
+                self.dirty.store(true, Ordering::Release);
+            }
+        });
     }
 
+    /// The selected text; `None` while a holder has the terminal.
     pub fn selection_text(&self) -> Option<String> {
-        let term = self.terminal.lock();
-        term.selection_to_string()
+        self.gate.read(&self.terminal, |term| term.selection_to_string()).unwrap_or(None)
     }
 
     /// True while the terminal holds a non-empty selection (VTE's
-    /// `get_has_selection`).
+    /// `get_has_selection`). While a holder has the terminal, as of when it
+    /// took it.
     pub fn has_selection(&self) -> bool {
-        let term = self.terminal.lock();
-        term.selection.as_ref().is_some_and(|s| !s.is_empty())
+        self.gate
+            .read(&self.terminal, |term| term.selection.as_ref().is_some_and(|s| !s.is_empty()))
+            .unwrap_or_else(|view| view.has_selection)
     }
 
     pub fn mouse_reporting(&self) -> bool {
@@ -1690,6 +1863,11 @@ impl Pane {
         if self.read_only {
             return;
         }
+        // While a reflow has the terminal its cells are moving: the report
+        // would name a cell of a grid the app has not been told about yet.
+        if self.gate.held_kind() == Some(HoldKind::Reflow) {
+            return;
+        }
         let mode = self.view().mode;
         if let Some(bytes) = mouse::encode(kind, button, col, row, mods, mode) {
             self.send_bytes(bytes);
@@ -1702,13 +1880,14 @@ impl Pane {
     }
 
     pub fn scroll_to_position(&self, offset: usize) {
-        let mut term = self.terminal.lock();
-        let current = term.grid().display_offset();
-        let delta = offset as i32 - current as i32;
-        if delta != 0 {
-            term.scroll_display(Scroll::Delta(delta));
-            self.dirty.store(true, Ordering::Release);
-        }
+        self.gate.try_mut(&self.terminal, |term| {
+            let current = term.grid().display_offset();
+            let delta = offset as i32 - current as i32;
+            if delta != 0 {
+                term.scroll_display(Scroll::Delta(delta));
+                self.dirty.store(true, Ordering::Release);
+            }
+        });
     }
 
     /// Scroll the display by `lines`; positive is up into history.
@@ -1716,34 +1895,44 @@ impl Pane {
         if lines == 0 {
             return;
         }
-        let mut term = self.terminal.lock();
-        term.scroll_display(Scroll::Delta(lines));
-        self.dirty.store(true, Ordering::Release);
+        self.gate.try_mut(&self.terminal, |term| {
+            term.scroll_display(Scroll::Delta(lines));
+            self.dirty.store(true, Ordering::Release);
+        });
     }
 
     /// Scroll the display by `pages` screens — Terminator's `scroll_by_page`
     /// (terminal.py:1987-1990), `int(pages * page_increment)` lines, so a
     /// half page truncates. Positive is up into history, as `scroll_by`.
     pub fn scroll_by_page(&self, pages: f32) {
-        let lines = (pages * self.terminal.lock().screen_lines() as f32) as i32;
+        let lines = (pages * self.view().screen as f32) as i32;
         self.scroll_by(lines);
     }
 
     /// VTE's `maybe_scroll_to_top`.
     pub fn scroll_to_top(&self) {
-        let mut term = self.terminal.lock();
-        if term.grid().display_offset() != term.grid().history_size() {
-            term.scroll_display(Scroll::Top);
-            self.dirty.store(true, Ordering::Release);
-        }
+        self.gate.try_mut(&self.terminal, |term| {
+            if term.grid().display_offset() != term.grid().history_size() {
+                term.scroll_display(Scroll::Top);
+                self.dirty.store(true, Ordering::Release);
+            }
+        });
     }
 
+    /// Scroll to the bottom (on input, and on output with scroll_on_output).
+    /// Deferred, not dropped, while a holder has the terminal: typing must
+    /// still bring the view back to the prompt.
     pub fn scroll_to_bottom(&self) {
-        let mut term = self.terminal.lock();
-        if term.grid().display_offset() != 0 {
-            term.scroll_display(Scroll::Bottom);
-            self.dirty.store(true, Ordering::Release);
-        }
+        let dirty = Arc::clone(&self.dirty);
+        self.gate.mutate_or_defer(
+            &self.terminal,
+            Box::new(move |term| {
+                if term.grid().display_offset() != 0 {
+                    term.scroll_display(Scroll::Bottom);
+                    dirty.store(true, Ordering::Release);
+                }
+            }),
+        );
     }
 
     /// Search scrollback for `needle` (plain text; regex-escaped internally),
@@ -1760,6 +1949,7 @@ impl Pane {
         crate::search::submit(SearchJob {
             terminal: TermHandle::new(Arc::clone(&self.terminal)),
             slot: Arc::clone(&self.search),
+            gate: Arc::clone(&self.gate),
             ticket,
             needle: needle.to_owned(),
             backward,
@@ -1962,7 +2152,9 @@ impl Drop for Pane {
         // Only signal, as alacritty's WindowContext does: the PTY thread hangs
         // up, reaps and closes its child itself, and `terminal` frees on the
         // reaper. Nothing here may block the UI thread. A dead pane's loop has
-        // already ended, so the send just fails.
+        // already ended, so the send just fails. A queued reflow stops; one
+        // running finishes and drops its terminal handle on the reaper.
+        self.reflow.close();
         let _ = self.pty_tx.send(Msg::Shutdown);
     }
 }
@@ -3573,6 +3765,461 @@ mod tests {
         assert_eq!(proc_cwd(std::process::id()), std::env::current_dir().ok());
     }
 
+    // The UI thread against a reflow holding the terminal (`crate::reflow`).
+    // "Blocked" is always a channel the test controls; timeouts only turn a
+    // hang into a failure.
+    mod reflow_ui {
+        use super::*;
+        use std::time::Duration;
+
+        use alacritty_terminal::vte::ansi::Processor;
+
+        use crate::reflow::{self, Next};
+
+        const HANG: Duration = Duration::from_secs(10);
+
+        fn feed(pane: &Pane, bytes: &[u8]) {
+            let mut parser: Processor = Processor::new();
+            parser.advance(&mut *pane.terminal.lock(), bytes);
+        }
+
+        /// A detached `cols` x `lines` pane with `history` rows of scrollback.
+        fn pane_with_history(cols: usize, lines: usize, history: usize) -> (Pane, LoopChannel) {
+            let config = Config { scrolling_history: history, ..Config::default() };
+            let (pane, channel) = Pane::detached(config, cols, lines);
+            let mut bytes = Vec::new();
+            for i in 0..history + lines {
+                bytes.extend_from_slice(format!("line {i}\r\n").as_bytes());
+            }
+            feed(&pane, &bytes);
+            assert_eq!(pane.terminal.lock().grid().history_size(), history);
+            (pane, channel)
+        }
+
+        /// Run `job` on its own thread; returns once it holds the terminal.
+        /// Each size it applies goes to `applied`; it then blocks until
+        /// `release` is sent.
+        struct Blocked {
+            release: mpsc::Sender<()>,
+            done: mpsc::Receiver<Next<EventProxy>>,
+        }
+
+        impl Blocked {
+            fn start(job: ReflowJob<EventProxy>, applied: mpsc::Sender<(usize, usize)>) -> Self {
+                let (entered_tx, entered_rx) = mpsc::channel();
+                let (release, release_rx) = mpsc::channel::<()>();
+                let (done_tx, done) = mpsc::channel();
+                std::thread::spawn(move || {
+                    let next = reflow::run_with(job, |term, dims| {
+                        applied.send((dims.cols, dims.lines)).unwrap();
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                        term.resize(dims);
+                    });
+                    let _ = done_tx.send(next);
+                });
+                entered_rx.recv_timeout(HANG).expect("the reflow never took the terminal");
+                Self { release, done }
+            }
+
+            fn finish(self) -> Next<EventProxy> {
+                self.release.send(()).unwrap();
+                self.done.recv_timeout(HANG).expect("the reflow never finished")
+            }
+        }
+
+        /// Run `f` on a stand-in UI thread with the pane, failing if it
+        /// blocks; hands the pane back.
+        fn on_ui<R: Send + 'static>(
+            pane: Pane,
+            f: impl FnOnce(&mut Pane) -> R + Send + 'static,
+        ) -> (Pane, R) {
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let mut pane = pane;
+                let result = f(&mut pane);
+                let _ = tx.send((pane, result));
+            });
+            rx.recv_timeout(HANG).expect("the UI thread blocked on a reflow")
+        }
+
+        fn split(msgs: Vec<Msg>) -> (Vec<u8>, Vec<(u16, u16, u16, u16)>) {
+            let (mut input, mut resizes) = (Vec::new(), Vec::new());
+            for msg in msgs {
+                match msg {
+                    Msg::Input(bytes) => input.extend_from_slice(&bytes),
+                    Msg::Resize(w) => {
+                        resizes.push((w.num_cols, w.num_lines, w.cell_width, w.cell_height))
+                    }
+                    Msg::Shutdown => panic!("unexpected shutdown"),
+                }
+            }
+            (input, resizes)
+        }
+
+        fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+            haystack.windows(needle.len()).any(|w| w == needle)
+        }
+
+        /// Every UI entry point returns at once while a reflow holds the
+        /// terminal; input still goes out; mutations that must not be lost
+        /// run when it lets go; the PTY hears the final size once, after.
+        #[test]
+        fn the_ui_never_waits_on_a_reflow() {
+            let (mut pane, channel) = pane_with_history(20, 5, 300);
+            // Focus reports and mouse reporting on; scrolled up; a selection.
+            feed(&pane, b"\x1b[?1004h\x1b[?1000h");
+            pane.scroll_by(10);
+            pane.begin_selection(0, 0, Side::Left, SelectionType::Simple);
+            pane.update_selection(5, 0, Side::Right);
+            assert!(pane.has_selection());
+            pane.frame(true);
+
+            let job = pane.request_resize(30, 6, 8.0, 16.0).expect("a column change queues a reflow");
+            assert!(channel.drain().is_empty(), "nothing sent before the reflow");
+            let cached = Arc::clone(pane.cached.as_ref().expect("a frame to show meanwhile"));
+            let (applied_tx, applied_rx) = mpsc::channel();
+            let blocked = Blocked::start(job, applied_tx.clone());
+
+            let shown = Arc::clone(&cached);
+            let (mut pane, ()) = on_ui(pane, move |pane| {
+                assert!(Arc::ptr_eq(&pane.frame(true), &shown), "the last frame is shown");
+                assert!(Arc::ptr_eq(&pane.frame(false), &shown), "a focus change keeps");
+                assert!(pane.mode().contains(TermMode::FOCUS_IN_OUT));
+                assert_eq!(pane.scroll_info(), (10, 300, 5), "the published view");
+                assert!(!pane.has_selection(), "the reflow drops the selection");
+                assert_eq!(pane.selection_text(), None);
+                pane.begin_selection(1, 1, Side::Left, SelectionType::Simple);
+                pane.update_selection(3, 1, Side::Right);
+                pane.clear_selection();
+                assert!(pane.selection_auto_scroll(1, 20), "a held terminal ends the gesture");
+                pane.scroll_by(3);
+                pane.scroll_by_page(1.0);
+                pane.scroll_to_position(0);
+                pane.scroll_to_top();
+                pane.scroll_to_bottom();
+                pane.apply_term_config(Config { scrolling_history: 500, ..Config::default() });
+                pane.reset_terminal(true);
+                let key = RawTermKey { legacy_bytes: b"k".to_vec(), ..Default::default() };
+                pane.send_key(&key);
+                pane.send_bytes(b"typed".to_vec());
+                pane.send_paste("pasted");
+                let mods = MouseMods { shift: false, alt: false, ctrl: false };
+                pane.send_mouse(MouseKind::Press, MouseButton::Left, 0, 0, mods);
+                pane.send_focus_event(true);
+                assert!(pane.request_resize(40, 6, 8.0, 16.0).is_none(), "coalesced");
+                assert!(pane.request_resize(50, 7, 8.0, 16.0).is_none(), "coalesced");
+                pane.force_pty_resize(8.0, 16.0);
+                pane.search("", true, None);
+                pane.set_visible(true);
+                assert_eq!((pane.cols, pane.lines), (50, 7), "the size asked for");
+            });
+
+            let (input, resizes) = split(channel.drain());
+            assert!(resizes.is_empty(), "no SIGWINCH while the reflow runs: {resizes:?}");
+            assert!(contains(&input, b"typed"), "keystrokes go out during the reflow");
+            assert!(contains(&input, b"pasted"));
+            assert!(contains(&input, b"\x1b[I"), "focus report");
+            assert!(!contains(&input, b"\x1b[M"), "no mouse report against a moving grid");
+
+            let Next::Again(job) = blocked.finish() else { panic!("a newer size must run again") };
+            let next = reflow::run_with(job, |term, dims| {
+                applied_tx.send((dims.cols, dims.lines)).unwrap();
+                term.resize(dims);
+            });
+            assert!(matches!(next, Next::Done));
+            assert_eq!(
+                applied_rx.try_iter().collect::<Vec<_>>(),
+                vec![(30, 6), (50, 7)],
+                "the size in between is never applied"
+            );
+            {
+                let term = pane.terminal.lock();
+                assert_eq!((term.columns(), term.screen_lines()), (50, 7));
+                assert_eq!(term.grid().history_size(), 0, "the deferred reset ran");
+                assert_eq!(term.grid().display_offset(), 0, "at the bottom");
+            }
+            assert_eq!(pane.history_limit.load(Ordering::Relaxed), 500, "the deferred config ran");
+            let (input, resizes) = split(channel.drain());
+            assert!(input.is_empty());
+            assert_eq!(resizes, vec![(50, 7, 8, 16)], "one SIGWINCH, at the final size");
+            let mirror = *pane.window_size.lock().unwrap();
+            assert_eq!((mirror.num_cols, mirror.num_lines), (50, 7), "XTWINOPS mirror");
+            assert!(pane.dirty.load(Ordering::Acquire));
+            assert!(!pane.reflow.is_pending());
+            let frame = pane.frame(true);
+            assert!(!Arc::ptr_eq(&frame, &cached), "re-snapshotted");
+            assert_eq!(frame.cells.len(), 50 * 7, "at the new size");
+        }
+
+        /// A pane with no frame yet shows a blank one while held, and
+        /// snapshots once the holder lets go.
+        #[test]
+        fn a_pane_with_no_frame_shows_a_blank_one_while_held() {
+            let (pane, _channel) = pane_with_history(20, 5, 10);
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel::<()>();
+            let holder = {
+                let (term, gate) = (Arc::clone(&pane.terminal), Arc::clone(&pane.gate));
+                std::thread::spawn(move || {
+                    gate.hold(&term, HoldKind::Search, |_| {}, |_| {
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                    })
+                    .unwrap();
+                })
+            };
+            entered_rx.recv_timeout(HANG).unwrap();
+            let (mut pane, cells) = on_ui(pane, |pane| {
+                let frame = pane.frame(true);
+                (frame.cells.len(), frame.cursor.is_none(), pane.cached.is_none())
+            });
+            assert_eq!(cells, (0, true, true), "blank, no cursor, not cached");
+            release_tx.send(()).unwrap();
+            holder.join().unwrap();
+            assert_eq!(pane.frame(true).cells.len(), 20 * 5);
+        }
+
+        #[test]
+        fn a_lines_only_resize_stays_on_the_ui_thread() {
+            let (mut pane, channel) = pane_with_history(20, 5, 50);
+            assert!(pane.request_resize(20, 8, 8.0, 16.0).is_none());
+            assert_eq!(pane.terminal.lock().screen_lines(), 8);
+            let (_, resizes) = split(channel.drain());
+            assert_eq!(resizes, vec![(20, 8, 8, 16)]);
+            assert!(!pane.reflow.is_pending());
+        }
+
+        /// A lines-only change asked for while a reflow is pending joins it.
+        #[test]
+        fn a_lines_only_resize_while_queued_folds_into_the_reflow() {
+            let (mut pane, channel) = pane_with_history(20, 5, 50);
+            let job = pane.request_resize(30, 5, 8.0, 16.0).expect("queued");
+            assert!(pane.request_resize(30, 8, 8.0, 16.0).is_none());
+            assert!(channel.drain().is_empty());
+            assert!(matches!(reflow::run(job), Next::Done));
+            let term = pane.terminal.lock();
+            assert_eq!((term.columns(), term.screen_lines()), (30, 8));
+            let (_, resizes) = split(channel.drain());
+            assert_eq!(resizes, vec![(30, 8, 8, 16)]);
+        }
+
+        /// A lines-only change while a search holds the terminal goes to the
+        /// reflow thread, which waits its turn.
+        #[test]
+        fn a_lines_only_resize_during_a_search_is_queued() {
+            let (pane, channel) = pane_with_history(20, 5, 50);
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel::<()>();
+            let holder = {
+                let (term, gate) = (Arc::clone(&pane.terminal), Arc::clone(&pane.gate));
+                std::thread::spawn(move || {
+                    gate.hold(&term, HoldKind::Search, |_| {}, |_| {
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                    })
+                    .unwrap();
+                })
+            };
+            entered_rx.recv_timeout(HANG).unwrap();
+            let (pane, job) = on_ui(pane, |pane| pane.request_resize(20, 8, 8.0, 16.0));
+            let job = job.expect("queued behind the search");
+            assert!(channel.drain().is_empty());
+            release_tx.send(()).unwrap();
+            holder.join().unwrap();
+            assert!(matches!(reflow::run(job), Next::Done));
+            assert_eq!(pane.terminal.lock().screen_lines(), 8);
+            assert_eq!(split(channel.drain()).1, vec![(20, 8, 8, 16)]);
+        }
+
+        /// Closing the pane mid-reflow: the running resize finishes, the
+        /// newer size is not run, nothing more is sent.
+        #[test]
+        fn dropping_the_pane_mid_reflow_skips_the_rerun() {
+            let (mut pane, channel) = pane_with_history(20, 5, 50);
+            let job = pane.request_resize(30, 5, 8.0, 16.0).expect("queued");
+            let (applied_tx, applied_rx) = mpsc::channel();
+            let blocked = Blocked::start(job, applied_tx);
+            assert!(pane.request_resize(40, 5, 8.0, 16.0).is_none());
+            let (pane, ()) = on_ui(pane, |_| ());
+            drop(pane);
+            assert!(matches!(blocked.finish(), Next::Done));
+            assert_eq!(applied_rx.try_iter().collect::<Vec<_>>(), vec![(30, 5)]);
+            let msgs = channel.drain();
+            assert!(matches!(msgs.as_slice(), [Msg::Shutdown]), "only the shutdown: {msgs:?}");
+        }
+
+        /// Respawning mid-reflow: the old job finishes on the old terminal,
+        /// which nothing uses any more, and the new terminal is built at the
+        /// size asked for, untouched by it.
+        #[cfg(unix)]
+        #[test]
+        fn respawning_mid_reflow_leaves_the_new_terminal_alone() {
+            let (mut pane, _channel) = pane_with_history(20, 5, 50);
+            pane.spawn_command =
+                SpawnCommand { program: Some("/bin/sh".into()), args: vec!["-c".into(), "exec cat".into()] };
+            let job = pane.request_resize(30, 5, 8.0, 16.0).expect("queued");
+            let old_term = Arc::clone(&pane.terminal);
+            let (applied_tx, applied_rx) = mpsc::channel();
+            let blocked = Blocked::start(job, applied_tx);
+            assert!(pane.request_resize(40, 5, 8.0, 16.0).is_none());
+            let (mut pane, respawned) = on_ui(pane, |pane| {
+                pane.respawn(8.0, 16.0, Config::default(), None)
+            });
+            respawned.expect("respawn");
+            {
+                let term = pane.terminal.lock();
+                assert_eq!((term.columns(), term.screen_lines()), (40, 5));
+            }
+            assert!(matches!(blocked.finish(), Next::Done), "the old pane's job stops");
+            assert_eq!(applied_rx.try_iter().collect::<Vec<_>>(), vec![(30, 5)]);
+            assert_eq!(old_term.lock().columns(), 30, "the old job ran on the old terminal");
+            let term = pane.terminal.lock();
+            assert_eq!((term.columns(), term.screen_lines()), (40, 5));
+            drop(term);
+            assert!(!pane.gate.gate().is_held());
+            assert!(!pane.reflow.is_pending());
+            assert_eq!(pane.frame(true).cells.len(), 40 * 5);
+        }
+
+        /// Poll for something an external child does, failing after a
+        /// deadline instead of hanging.
+        #[cfg(unix)]
+        fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
+            let deadline = std::time::Instant::now() + HANG;
+            while !done() {
+                assert!(std::time::Instant::now() < deadline, "timed out waiting for {what}");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        #[cfg(unix)]
+        fn screen_text(pane: &Pane) -> String {
+            let term = pane.terminal.lock();
+            let grid = term.grid();
+            let mut text = String::new();
+            for line in 0..grid.screen_lines() {
+                for col in 0..grid.columns() {
+                    text.push(grid[Line(line as i32)][Column(col)].c);
+                }
+                text.push('\n');
+            }
+            text
+        }
+
+        /// On a real PTY: keystrokes reach the child while the reflow holds
+        /// the terminal (the PTY loop is paused, not parked), output resumes
+        /// after it, and the child sees one SIGWINCH, at the final size.
+        #[cfg(unix)]
+        #[test]
+        fn a_real_pty_keeps_its_input_and_hears_only_the_final_size() {
+            let out = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("target")
+                .join(format!("reflow-pty-test-{}", std::process::id()));
+            let (out_a, out_b) = (out.with_extension("a"), out.with_extension("b"));
+            let read_file = |path: &std::path::Path| std::fs::read_to_string(path).unwrap_or_default();
+            let script = r#"trap 'stty size' WINCH
+echo ready
+read a; printf %s "$a" > "$1.a"
+read b; printf %s "$b" > "$1.b"
+while :; do sleep 1; done"#;
+            let command = SpawnCommand {
+                program: Some("/bin/sh".into()),
+                args: vec!["-c".into(), script.into(), "sh".into(), out.display().to_string()],
+            };
+            let mut pane = Pane::spawn(
+                0,
+                80,
+                24,
+                8.0,
+                16.0,
+                Config::default(),
+                PaneDefaults::default(),
+                None,
+                None,
+                "test".into(),
+                command,
+            )
+            .expect("spawn");
+            wait_for("the ready marker", || screen_text(&pane).contains("ready"));
+
+            let job = pane.request_resize(100, 24, 8.0, 16.0).expect("a column change queues");
+            let (applied_tx, applied_rx) = mpsc::channel();
+            let blocked = Blocked::start(job, applied_tx);
+            assert!(pane.request_resize(120, 30, 8.0, 16.0).is_none(), "coalesced");
+
+            // Two lines, each echoed by the tty: an unpaused loop would wake
+            // for the first echo and park in the terminal's lease, and the
+            // second line would never be written.
+            pane.send_bytes(b"first\n".to_vec());
+            wait_for("the first line to reach the child", || read_file(&out_a) == "first");
+            pane.send_bytes(b"second\n".to_vec());
+            wait_for("the second line to reach the child", || read_file(&out_b) == "second");
+
+            let Next::Again(job) = blocked.finish() else { panic!("a newer size must run again") };
+            assert!(matches!(reflow::run(job), Next::Done));
+            assert_eq!(applied_rx.try_iter().collect::<Vec<_>>(), vec![(100, 24)]);
+            wait_for("the child's size report", || screen_text(&pane).contains("30 120"));
+            let screen = screen_text(&pane);
+            assert!(screen.contains("first") && screen.contains("second"), "output resumed:\n{screen}");
+            assert_eq!(screen.matches("30 120").count(), 1, "one SIGWINCH:\n{screen}");
+            assert!(!screen.contains(" 100"), "no SIGWINCH for the size in between:\n{screen}");
+
+            drop(pane);
+            let _ = std::fs::remove_file(&out_a);
+            let _ = std::fs::remove_file(&out_b);
+        }
+
+        /// A full-size reflow (200k rows of 200 columns, ~1 GB of cells) on
+        /// its own thread while this thread plays the UI: every call it
+        /// makes returns well inside a frame for as long as the reflow runs.
+        #[test]
+        #[ignore = "perf, ~1 GB of memory: run with \
+                    `cargo test -- --ignored a_full_size_reflow_never_stalls_the_ui --nocapture`"]
+        fn a_full_size_reflow_never_stalls_the_ui() {
+            const HISTORY: usize = 200_000;
+            let (mut pane, _channel) = pane_with_history(200, 50, HISTORY);
+            pane.frame(true);
+            let job = pane.request_resize(150, 50, 8.0, 16.0).expect("a column change queues");
+            let (done_tx, done_rx) = mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let start = std::time::Instant::now();
+                assert!(matches!(reflow::run(job), Next::Done));
+                done_tx.send(start.elapsed()).unwrap();
+            });
+
+            let (mut held_calls, mut max, mut i) = (0u64, Duration::ZERO, 0u64);
+            let took = loop {
+                if let Ok(took) = done_rx.try_recv() {
+                    break took;
+                }
+                let held = pane.gate.held_kind() == Some(HoldKind::Reflow);
+                let start = std::time::Instant::now();
+                pane.frame(true);
+                let _ = pane.mode();
+                let _ = pane.scroll_info();
+                let _ = pane.has_selection();
+                // A handful, not one per spin: each is deferred to the end.
+                if i % 4096 == 0 {
+                    pane.scroll_to_bottom();
+                }
+                let elapsed = start.elapsed();
+                if held {
+                    held_calls += 1;
+                    max = max.max(elapsed);
+                }
+                i += 1;
+                std::thread::yield_now();
+            };
+            worker.join().unwrap();
+            eprintln!("reflow took {took:?}; {held_calls} UI rounds during it, slowest {max:?}");
+            assert!(held_calls > 0, "never saw the reflow hold the terminal");
+            // Half a 60 Hz frame; measured in the microseconds.
+            assert!(max < Duration::from_millis(8), "a UI call took {max:?} during the reflow");
+            assert_eq!(pane.terminal.lock().columns(), 150);
+        }
+    }
+
     // `spawn_pty` on a real PTY (openpty, so no controlling tty is needed):
     // what a pane sends before its child exists must reach the child in order,
     // and a failed spawn must end the pane like a child exit.
@@ -3640,6 +4287,7 @@ mod tests {
                 Arc::new(Mutex::new(PaneDefaults::default())),
                 Arc::clone(&child_pid),
                 Arc::clone(&spawn_failed),
+                Arc::new(AtomicBool::new(false)),
             );
             Spawned { tx, term, exited, child_pid, spawn_failed, worker }
         }

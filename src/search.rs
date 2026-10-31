@@ -13,52 +13,30 @@
 //!
 //! The scan holds the lock throughout: alacritty's `search_next` cannot be
 //! resumed, and a scan split into pieces would read a grid that moves under it
-//! between pieces. The PTY thread waits for it, as it waited for the UI
-//! thread's search. The UI thread must not: it locks every visible pane's
-//! terminal each frame (mode, scroll position, a snapshot when dirty). Those
-//! reads go through `SearchSlot::read`, which hands back the mode and scroll
-//! position the search thread published when it took the lock. Only the
-//! search's own selection and scroll change the terminal until it lets go,
-//! so they are exact, as if read just before it. Anything else that needs
-//! the terminal (a click, a scroll, a resize) still waits for the scan.
+//! between pieces. The PTY loop stops reading output for it (paused, still
+//! writing input), as it waited for the UI thread's search. The UI thread
+//! must not wait: it locks every visible pane's
+//! terminal each frame (mode, scroll position, a snapshot when dirty). It
+//! goes through the pane's `TermGate` instead (see `crate::term_gate`):
+//! reads get the mode and scroll position the search thread published when
+//! it took the lock, which are exact, since only the search's own selection
+//! and scroll change the terminal until it lets go; mutations that must not
+//! be lost wait for it, and gestures (a click, a wheel scroll) are dropped.
 
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, mpsc};
+use std::sync::{Arc, OnceLock, mpsc};
 
 use alacritty_terminal::event::EventListener;
-use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Boundary, Direction as GridDir, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::sync::FairMutex;
+use alacritty_terminal::term::Term;
 use alacritty_terminal::term::search::RegexSearch;
-use alacritty_terminal::term::{Term, TermMode};
 use winit::event_loop::EventLoopProxy;
 
 use crate::pane::{DropOffThread, EventProxy};
+use crate::term_gate::{HoldKind, TermGate};
 use crate::window::UserEvent;
-
-/// What the UI thread reads from a terminal every frame: its mode and
-/// `Pane::scroll_info`'s scroll position.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct TermView {
-    pub(crate) mode: TermMode,
-    pub(crate) display_offset: usize,
-    pub(crate) history: usize,
-    pub(crate) screen: usize,
-}
-
-impl TermView {
-    pub(crate) fn of<T>(term: &Term<T>) -> Self {
-        let grid = term.grid();
-        Self {
-            mode: *term.mode(),
-            display_offset: grid.display_offset(),
-            history: grid.total_lines().saturating_sub(grid.screen_lines()),
-            screen: grid.screen_lines(),
-        }
-    }
-}
 
 /// One pane's search state, shared with the jobs it submits. Replaced with
 /// the terminal on respawn, so a job still running on the old terminal
@@ -70,13 +48,6 @@ pub(crate) struct SearchSlot {
     /// under the terminal lock: a newer search, or the bar closing, makes it
     /// stale.
     generation: AtomicU64,
-    /// The gate between the search thread and the UI thread's reads. `Some`
-    /// while a search holds the terminal, with the view published when it
-    /// took the lock. The search thread takes the gate before the terminal
-    /// and clears it before letting the terminal go, so a reader that finds
-    /// it `None` can lock the terminal under the gate without the search
-    /// thread slipping in between.
-    held: Mutex<Option<TermView>>,
 }
 
 impl SearchSlot {
@@ -93,53 +64,6 @@ impl SearchSlot {
     pub(crate) fn is_current(&self, ticket: u64) -> bool {
         self.generation.load(Ordering::Acquire) == ticket
     }
-
-    /// The gate, for a reader that must keep a search out while it locks
-    /// the terminal itself (`Pane::frame`). It may lock the terminal only
-    /// while this reads `None`, and never while it reads `Some`: the search
-    /// thread needs the gate to let go.
-    pub(crate) fn gate(&self) -> MutexGuard<'_, Option<TermView>> {
-        self.held.lock().unwrap()
-    }
-
-    /// `read` the terminal, or, while a search holds it, the view it
-    /// published.
-    pub(crate) fn read<T, R>(
-        &self,
-        terminal: &FairMutex<Term<T>>,
-        read: impl FnOnce(&Term<T>) -> R,
-    ) -> Result<R, TermView> {
-        let held = self.gate();
-        match *held {
-            Some(view) => Err(view),
-            None => Ok(read(&terminal.lock())),
-        }
-    }
-
-    /// The terminal's `TermView`, without waiting on a search.
-    pub(crate) fn view<T>(&self, terminal: &FairMutex<Term<T>>) -> TermView {
-        self.read(terminal, TermView::of).unwrap_or_else(|view| view)
-    }
-
-    /// Run `f` with the terminal locked, publishing its view to `read` for
-    /// as long as it runs. The gate is cleared even if `f` panics, or every
-    /// later read would see the view of a search that is gone.
-    fn hold<T, R>(
-        &self,
-        terminal: &FairMutex<Term<T>>,
-        f: impl FnOnce(&mut Term<T>) -> R,
-    ) -> std::thread::Result<R> {
-        let mut held = self.gate();
-        let mut term = terminal.lock();
-        *held = Some(TermView::of(&term));
-        drop(held);
-        let result = catch_unwind(AssertUnwindSafe(|| f(&mut term)));
-        let mut held = self.gate();
-        *held = None;
-        drop(term);
-        drop(held);
-        result
-    }
 }
 
 /// A search for the search thread.
@@ -149,6 +73,8 @@ pub(crate) struct SearchJob<T: Send + 'static> {
     /// would have.
     pub(crate) terminal: DropOffThread<Arc<FairMutex<Term<T>>>>,
     pub(crate) slot: Arc<SearchSlot>,
+    /// The pane's terminal gate, published to while the scan holds the lock.
+    pub(crate) gate: Arc<TermGate<T>>,
     pub(crate) ticket: u64,
     pub(crate) needle: String,
     pub(crate) backward: bool,
@@ -196,7 +122,7 @@ pub(crate) fn run<T: EventListener + Send + 'static>(job: SearchJob<T>) {
             return;
         }
     };
-    let found = job.slot.hold(&job.terminal, |term| {
+    let found = job.gate.hold(&job.terminal, HoldKind::Search, |_| {}, |term| {
         select_next_match(term, &mut regex, job.backward, || job.slot.is_current(job.ticket))
     });
     if matches!(found, Ok(true)) {
@@ -243,9 +169,8 @@ pub(crate) fn select_next_match<T: EventListener>(
 mod tests {
     use super::*;
 
-    use std::time::Duration;
-
     use alacritty_terminal::event::VoidListener;
+    use alacritty_terminal::grid::Dimensions;
     use alacritty_terminal::index::{Column, Line, Point};
     use alacritty_terminal::term::Config;
     use alacritty_terminal::term::test::TermSize;
@@ -272,6 +197,7 @@ mod tests {
         SearchJob {
             terminal: DropOffThread::new(Arc::clone(term)),
             slot: Arc::clone(slot),
+            gate: Arc::default(),
             ticket,
             needle: "needle".into(),
             backward: true,
@@ -301,6 +227,7 @@ mod tests {
         let slot = Arc::new(SearchSlot::default());
         let job = job(&term, &slot, slot.begin());
         let dirty = Arc::clone(&job.dirty);
+        let gate = Arc::clone(&job.gate);
         run(job);
         let term = term.lock();
         let top = Line(-2000);
@@ -308,7 +235,7 @@ mod tests {
         assert_eq!((range.start, range.end), (Point::new(top, Column(0)), Point::new(top, Column(5))));
         assert_eq!(term.grid().display_offset(), 2000, "scrolled to the match");
         assert!(dirty.load(Ordering::Acquire));
-        assert_eq!(*slot.gate(), None, "the gate is clear once the job is done");
+        assert!(!gate.gate().is_held(), "the gate is clear once the job is done");
     }
 
     #[test]
@@ -334,58 +261,5 @@ mod tests {
         assert_eq!(term.grid().display_offset(), 0);
         assert!(select_next_match(&mut term, &mut regex, true, || true));
         assert!(term.selection.is_some());
-    }
-
-    #[test]
-    fn reads_get_the_published_view_while_a_search_holds_the_terminal() {
-        let term = term_with_needle_at_top(50);
-        let slot = Arc::new(SearchSlot::default());
-        let before = slot.view(&term);
-        assert_eq!(before, TermView::of(&term.lock()));
-        assert_eq!((before.display_offset, before.history, before.screen), (0, 50, 5));
-
-        let (holding_tx, holding_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel::<()>();
-        let searcher = {
-            let (term, slot) = (Arc::clone(&term), Arc::clone(&slot));
-            std::thread::spawn(move || {
-                slot.hold(&term, |_| {
-                    holding_tx.send(()).unwrap();
-                    release_rx.recv().unwrap();
-                })
-                .unwrap();
-            })
-        };
-        holding_rx.recv().unwrap();
-
-        // Read on another thread so a read that blocked on the held lock
-        // fails the test instead of hanging it.
-        let (read_tx, read_rx) = mpsc::channel();
-        let reader = {
-            let (term, slot) = (Arc::clone(&term), Arc::clone(&slot));
-            std::thread::spawn(move || {
-                read_tx.send((slot.view(&term), slot.read(&term, |_| ()))).unwrap();
-            })
-        };
-        let (view, read) = read_rx
-            .recv_timeout(Duration::from_secs(10))
-            .expect("a read blocked on the terminal a search holds");
-        assert_eq!(view, before);
-        assert_eq!(read, Err(before));
-        reader.join().unwrap();
-
-        release_tx.send(()).unwrap();
-        searcher.join().unwrap();
-        assert_eq!(slot.read(&term, |_| ()), Ok(()), "reads lock the terminal again");
-    }
-
-    #[test]
-    fn a_panicking_search_still_clears_the_gate() {
-        let term = term_with_needle_at_top(5);
-        let slot = SearchSlot::default();
-        let result = slot.hold(&term, |_| panic!("scan panicked"));
-        assert!(result.is_err());
-        assert_eq!(*slot.gate(), None);
-        assert_eq!(slot.read(&term, |_| ()), Ok(()));
     }
 }
