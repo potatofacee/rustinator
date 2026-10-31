@@ -56,9 +56,18 @@ impl SharedGl {
 
         let (gl_context, gl_surface) = create_context_and_surface(&display, &gl_config, &window);
 
+        // On macOS a vsynced `swap_buffers` (CGL `flushBuffer`) can block for a
+        // long time while the window is occluded or minimized, stalling the UI
+        // thread, so vsync is off there as in alacritty; the frame governor in
+        // `window.rs` paces frames. CGL keeps the interval on the context, which
+        // every window shares, so this covers them all.
+        #[cfg(target_os = "macos")]
+        let interval = glutin::surface::SwapInterval::DontWait;
+        #[cfg(not(target_os = "macos"))]
+        let interval = glutin::surface::SwapInterval::Wait(NonZeroU32::new(1).unwrap());
         gl_surface
-            .set_swap_interval(&gl_context, glutin::surface::SwapInterval::Wait(NonZeroU32::new(1).unwrap()))
-            .unwrap_or_else(|e| log::warn!("failed to set vsync: {e}"));
+            .set_swap_interval(&gl_context, interval)
+            .unwrap_or_else(|e| log::warn!("failed to set swap interval: {e}"));
 
         let gl = unsafe {
             Arc::new(glow::Context::from_loader_function(|name| {
