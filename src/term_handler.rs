@@ -9,7 +9,9 @@
 use alacritty_terminal::event::EventListener;
 use alacritty_terminal::term::{Term, TermMode};
 
-use crate::pane::{indexed_default, PaneDefaults};
+use crate::pane::{
+    clear_saved_reaping_history, indexed_default, reset_state_reaping_history, PaneDefaults,
+};
 use crate::pty_event_loop::{EventLoopSender, Msg};
 use alacritty_terminal::vte::ansi::cursor_icon::CursorIcon;
 use alacritty_terminal::vte::ansi::{
@@ -21,6 +23,11 @@ use alacritty_terminal::vte::ansi::{
 pub(crate) struct TermHandlerProxy<'a, T: EventListener> {
     pub term: &'a mut Term<T>,
     pub clear_wipes_scrollback: bool,
+    /// The terminal's primary-grid history limit (`Pane::history_limit`).
+    /// RIS and ED 3 replace a grid holding scrollback with a fresh one built
+    /// with it and drop the old one on the reaper thread instead of freeing
+    /// the history in place, under the terminal lock the UI thread waits on.
+    pub history_limit: usize,
     /// Sender into the owning PTY event loop, used to queue query replies
     /// (color queries) for write-back to the PTY.
     pub writer: &'a EventLoopSender,
@@ -217,7 +224,10 @@ impl<T: EventListener> Handler for TermHandlerProxy<'_, T> {
     // preference is set, ClearMode::All on the primary screen also wipes
     // scrollback (All scrolls the viewport into history, Saved then clears
     // it). On the alt screen history belongs to the primary screen, so the
-    // sequence is forwarded untouched.
+    // sequence is forwarded untouched. Every Saved (ED 3, which plain
+    // `clear` emits) goes through `clear_saved_reaping_history`: the same
+    // result as upstream, but the history is dropped on the reaper thread
+    // rather than here, under the terminal lock.
     fn clear_screen(&mut self, mode: ClearMode) {
         // matches! instead of ==: vte's ClearMode does not derive PartialEq.
         if wipes_scrollback(
@@ -226,7 +236,9 @@ impl<T: EventListener> Handler for TermHandlerProxy<'_, T> {
             self.term.mode().contains(TermMode::ALT_SCREEN),
         ) {
             Handler::clear_screen(self.term, ClearMode::All);
-            Handler::clear_screen(self.term, ClearMode::Saved);
+            clear_saved_reaping_history(self.term, self.history_limit);
+        } else if matches!(mode, ClearMode::Saved) {
+            clear_saved_reaping_history(self.term, self.history_limit);
         } else {
             Handler::clear_screen(self.term, mode);
         }
@@ -240,8 +252,10 @@ impl<T: EventListener> Handler for TermHandlerProxy<'_, T> {
         Handler::set_tabs(self.term, interval);
     }
 
+    // RIS (`reset`, `tput reset`): upstream's reset, with the scrollback
+    // dropped on the reaper thread rather than under the terminal lock.
     fn reset_state(&mut self) {
-        Handler::reset_state(self.term);
+        reset_state_reaping_history(self.term, self.history_limit);
     }
 
     fn reverse_index(&mut self) {
@@ -408,6 +422,243 @@ mod tests {
         assert!(!wipes_scrollback(false, true, true));
         assert!(!wipes_scrollback(false, false, true));
         assert!(!wipes_scrollback(true, false, true));
+    }
+
+    // ---- RIS / ED 3 with the scrollback reaped off the PTY thread ----
+
+    mod reaping {
+        use alacritty_terminal::event::VoidListener;
+        use alacritty_terminal::grid::{Dimensions, Scroll};
+        use alacritty_terminal::index::{Column, Line, Point, Side};
+        use alacritty_terminal::selection::{Selection, SelectionType};
+        use alacritty_terminal::term::test::TermSize;
+        use alacritty_terminal::term::{Config, Term, TermDamage, TermMode};
+        use alacritty_terminal::vte::ansi::Processor;
+
+        use super::super::TermHandlerProxy;
+        use crate::pane::PaneDefaults;
+        use crate::pty_event_loop::LoopChannel;
+
+        type T = Term<VoidListener>;
+
+        const COLS: usize = 20;
+        const LINES: usize = 6;
+        /// Above the Storage row cache (1000), so upstream's ED 3 truncates
+        /// rather than keeping the cleared rows cached; `HISTORY_SHORT`
+        /// covers the other case.
+        const HISTORY: usize = 1500;
+        const HISTORY_SHORT: usize = 40;
+
+        /// Upstream: the parser straight into `Term`.
+        fn feed_upstream(term: &mut T, bytes: &[u8]) {
+            let mut parser: Processor = Processor::new();
+            parser.advance(term, bytes);
+        }
+
+        /// Ours: the parser into the PTY loop's proxy.
+        fn feed_proxy(term: &mut T, bytes: &[u8], wipe: bool, history_limit: usize) {
+            let channel = LoopChannel::new().expect("create loop channel");
+            let writer = channel.sender();
+            let mut parser: Processor = Processor::new();
+            let mut proxy = TermHandlerProxy {
+                term,
+                clear_wipes_scrollback: wipe,
+                history_limit,
+                writer: &writer,
+                defaults: PaneDefaults::default(),
+            };
+            parser.advance(&mut proxy, bytes);
+        }
+
+        #[derive(Clone, Copy, Debug)]
+        struct Setup {
+            history_limit: usize,
+            /// Lines of output before the screen setup.
+            output: usize,
+            /// Narrow then widen once the history exists, so rows carry
+            /// reflowed and differently sized storage.
+            resize: bool,
+            alt: bool,
+            /// Scroll the viewport this far into history.
+            scrolled: i32,
+            /// Selection anchored in history (ED 3 drops it) or on screen
+            /// (ED 3 keeps it).
+            selection_in_history: bool,
+        }
+
+        fn build(s: Setup) -> T {
+            let config = Config { scrolling_history: s.history_limit, ..Config::default() };
+            let mut term = Term::new(config, &TermSize::new(COLS, LINES), VoidListener);
+            let mut bytes = Vec::new();
+            for i in 0..s.output {
+                bytes.extend_from_slice(format!("\x1b[3{}mhistory line {i}\r\n", i % 8).as_bytes());
+            }
+            feed_upstream(&mut term, &bytes);
+            if s.resize {
+                term.resize(TermSize::new(COLS - 7, LINES + 1));
+                term.resize(TermSize::new(COLS, LINES));
+            }
+            // SGR, a saved cursor, a scroll region, a charset, then screen
+            // content and the cursor left mid-screen.
+            feed_upstream(
+                &mut term,
+                b"\x1b[1;4;35;42m\x1b[2;3H\x1b7\x1b[2;5r\x1b(0\x1b[3;2Hregion text\
+                  \x1b[44mbg\x1b[5;7H",
+            );
+            if s.alt {
+                feed_upstream(&mut term, b"\x1b[?1049h\x1b[32malt screen\r\nmore");
+            }
+            term.scroll_display(Scroll::Delta(s.scrolled));
+            let anchor =
+                if s.selection_in_history { Line(-3) } else { Line(1) };
+            let mut selection =
+                Selection::new(SelectionType::Simple, Point::new(anchor, Column(2)), Side::Left);
+            selection.update(Point::new(Line(2), Column(5)), Side::Right);
+            term.selection = Some(selection);
+            term.vi_mode_cursor.point = Point::new(Line(-4), Column(3));
+            term.reset_damage();
+            term
+        }
+
+        fn assert_same(a: &T, b: &T, when: &str) {
+            assert_eq!(a.mode(), b.mode(), "mode {when}");
+            assert_eq!(a.selection, b.selection, "selection {when}");
+            assert_eq!(a.vi_mode_cursor.point, b.vi_mode_cursor.point, "vi cursor {when}");
+            let (ga, gb) = (a.grid(), b.grid());
+            assert_eq!(ga.screen_lines(), gb.screen_lines(), "screen lines {when}");
+            assert_eq!(ga.columns(), gb.columns(), "columns {when}");
+            assert_eq!(ga.total_lines(), gb.total_lines(), "total lines {when}");
+            assert_eq!(ga.history_size(), gb.history_size(), "history {when}");
+            assert_eq!(ga.display_offset(), gb.display_offset(), "display offset {when}");
+            assert_eq!(ga.cursor, gb.cursor, "cursor {when}");
+            assert_eq!(ga.saved_cursor, gb.saved_cursor, "saved cursor {when}");
+            for line in ga.topmost_line().0..=ga.bottommost_line().0 {
+                let line = Line(line);
+                assert_eq!(ga[line].len(), gb[line].len(), "row {line:?} length {when}");
+                for col in 0..ga.columns() {
+                    let col = Column(col);
+                    assert_eq!(ga[line][col], gb[line][col], "cell {line:?},{col:?} {when}");
+                }
+            }
+        }
+
+        fn fully_damaged(term: &mut T) -> bool {
+            matches!(term.damage(), TermDamage::Full)
+        }
+
+        /// Run `ours` through the proxy and `upstream` straight into `Term`
+        /// on two terminals built alike, and require the same state after it,
+        /// after more output, and across an alternate-screen round trip
+        /// (which exercises state that is not public: scroll region, history
+        /// limit, the inactive grid).
+        fn check(s: Setup, ours: &[u8], wipe: bool, upstream: &[u8]) {
+            let (mut plain, mut reaped) = (build(s), build(s));
+            assert_same(&plain, &reaped, &format!("before {ours:?} ({s:?})"));
+            feed_upstream(&mut plain, upstream);
+            feed_proxy(&mut reaped, ours, wipe, s.history_limit);
+            let when = format!("after {ours:?} ({s:?})");
+            assert_same(&plain, &reaped, &when);
+            assert_eq!(fully_damaged(&mut plain), fully_damaged(&mut reaped), "damage {when}");
+
+            let mut after = b"a\tb\tc\r\n\x1b8x".to_vec();
+            for i in 0..s.history_limit + 30 {
+                after.extend_from_slice(format!("after {i}\r\n").as_bytes());
+            }
+            feed_upstream(&mut plain, &after);
+            feed_upstream(&mut reaped, &after);
+            assert_same(&plain, &reaped, &format!("then more output, {when}"));
+
+            for toggle in [&b"\x1b[?1049hon the alternate\r\nscreen"[..], b"\x1b[?1049l"] {
+                feed_upstream(&mut plain, toggle);
+                feed_upstream(&mut reaped, toggle);
+                assert_same(&plain, &reaped, &format!("then {toggle:?}, {when}"));
+            }
+        }
+
+        fn setups() -> Vec<Setup> {
+            let base = Setup {
+                history_limit: HISTORY,
+                output: HISTORY + 200,
+                resize: false,
+                alt: false,
+                scrolled: 0,
+                selection_in_history: false,
+            };
+            let mut all = Vec::new();
+            for (history_limit, output) in
+                [(HISTORY, HISTORY + 200), (HISTORY, 30), (HISTORY_SHORT, 200), (HISTORY, 0)]
+            {
+                for resize in [false, true] {
+                    for alt in [false, true] {
+                        for scrolled in [0, 7] {
+                            for selection_in_history in [false, true] {
+                                all.push(Setup {
+                                    history_limit,
+                                    output,
+                                    resize,
+                                    alt,
+                                    scrolled,
+                                    selection_in_history,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            all.push(base);
+            all
+        }
+
+        /// ED 3 (`\e[3J`), and the sequence `clear` emits, match upstream.
+        #[test]
+        fn clear_saved_matches_upstream() {
+            for s in setups() {
+                for seq in [&b"\x1b[3J"[..], b"\x1b[H\x1b[2J\x1b[3J", b"\x1b[3J\x1b[3J"] {
+                    check(s, seq, false, seq);
+                }
+            }
+        }
+
+        /// With the wipe preference, ED 2 matches upstream's ED 2 then ED 3.
+        #[test]
+        fn wiping_clear_all_matches_upstream_clear_then_saved() {
+            for s in setups() {
+                check(s, b"\x1b[2J", true, b"\x1b[2J\x1b[3J");
+                check(s, b"\x1b[H\x1b[2J", true, b"\x1b[H\x1b[2J\x1b[3J");
+            }
+        }
+
+        /// RIS (`\ec`) matches upstream's reset.
+        #[test]
+        fn reset_matches_upstream() {
+            for s in setups() {
+                check(s, b"\x1bc", false, b"\x1bc");
+                check(s, b"\x1bcafter reset\r\n\x1b[3J", false, b"\x1bcafter reset\r\n\x1b[3J");
+            }
+        }
+
+        /// The cases above do reach the reaping paths: history existed and
+        /// is gone, and on the alternate screen ED 3 leaves the primary's.
+        #[test]
+        fn reaping_paths_clear_history() {
+            let s = setups().pop().unwrap();
+            let mut term = build(s);
+            assert_eq!(term.grid().history_size(), HISTORY);
+            feed_proxy(&mut term, b"\x1b[3J", false, HISTORY);
+            assert_eq!(term.grid().history_size(), 0);
+            assert_eq!(term.grid().display_offset(), 0);
+
+            let mut term = build(Setup { alt: true, ..s });
+            feed_proxy(&mut term, b"\x1b[3J", false, HISTORY);
+            assert!(term.mode().contains(TermMode::ALT_SCREEN));
+            feed_upstream(&mut term, b"\x1b[?1049l");
+            assert_eq!(term.grid().history_size(), HISTORY, "ED 3 on alt keeps primary history");
+
+            let mut term = build(Setup { alt: true, ..s });
+            feed_proxy(&mut term, b"\x1bc", false, HISTORY);
+            assert!(!term.mode().contains(TermMode::ALT_SCREEN));
+            assert_eq!(term.grid().history_size(), 0);
+        }
     }
 
     // ---- OSC color-query override resolution ----

@@ -4,8 +4,9 @@
 //! offers no way to interpose a `vte::ansi::Handler` between the parser and
 //! `Term`, so we carry our own copy that advances the parser into
 //! `TermHandlerProxy` instead of `Term` directly. Differences from upstream:
-//! `EventLoop::new` takes a `PaneHooks` (clear_wipes_scrollback flag + shared
-//! pane defaults for answering color queries), the loop keeps a clone of its
+//! `EventLoop::new` takes a `PaneHooks` (clear_wipes_scrollback flag, the
+//! terminal's history limit for RIS/ED 3 handing scrollback to the reaper, and
+//! shared pane defaults for answering color queries), the loop keeps a clone of its
 //! own `EventLoopSender` so the proxy can write query replies back to the PTY,
 //! and both parser dispatch sites (`advance`, `stop_sync`) go through the
 //! proxy; the PTY poll token constants are replicated locally because upstream
@@ -24,7 +25,7 @@ use std::fmt::{self, Display, Formatter};
 use std::fs::File;
 use std::io::{self, ErrorKind, Read, Write};
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -47,6 +48,10 @@ use crate::term_handler::TermHandlerProxy;
 pub struct PaneHooks {
     /// When true, ED 2 on the primary screen also wipes scrollback.
     pub clear_wipes_scrollback: Arc<AtomicBool>,
+    /// The terminal's primary-grid history limit (`Pane::history_limit`), for
+    /// the grids the parser builds when RIS and ED 3 hand the scrollback to
+    /// the reaper. Only written under the terminal lock; read under it.
+    pub history_limit: Arc<AtomicUsize>,
     /// Pane default colors, used to answer OSC 10/11/12 and OSC 4 queries when
     /// the program has not overridden the color. Written by the main thread.
     pub defaults: Arc<Mutex<PaneDefaults>>,
@@ -264,6 +269,7 @@ where
             let mut handler = TermHandlerProxy {
                 term: &mut **terminal,
                 clear_wipes_scrollback: self.hooks.clear_wipes_scrollback.load(Ordering::Relaxed),
+                history_limit: self.hooks.history_limit.load(Ordering::Relaxed),
                 writer: &self.sender,
                 defaults: *self.hooks.defaults.lock().unwrap(),
             };
@@ -395,6 +401,7 @@ where
                             .hooks
                             .clear_wipes_scrollback
                             .load(Ordering::Relaxed),
+                        history_limit: self.hooks.history_limit.load(Ordering::Relaxed),
                         writer: &self.sender,
                         defaults: *self.hooks.defaults.lock().unwrap(),
                     };
@@ -850,6 +857,7 @@ mod tests {
             )));
             let hooks = PaneHooks {
                 clear_wipes_scrollback: Arc::new(AtomicBool::new(false)),
+                history_limit: Arc::new(AtomicUsize::new(Config::default().scrolling_history)),
                 defaults: Arc::new(Mutex::new(PaneDefaults::default())),
                 child_pid,
             };

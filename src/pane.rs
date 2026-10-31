@@ -1,5 +1,5 @@
 use std::cell::Cell;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
@@ -112,6 +112,49 @@ pub(crate) fn reset_state_reaping_history<T: EventListener>(term: &mut Term<T>, 
     let history = std::mem::replace(term.grid_mut(), empty);
     Handler::reset_state(term);
     reap_off_thread(Box::new(history));
+}
+
+/// `Handler::clear_screen(ClearMode::Saved)` (ED 3), with the scrollback
+/// freed on the reaper thread.
+///
+/// Upstream clears history in place (`Grid::clear_history`), dropping every
+/// row of it under the terminal lock. Instead, the grid is replaced by a
+/// fresh `Grid::new` of the same size and history limit holding the old
+/// grid's visible rows and both cursors (moved, not copied), and the old grid
+/// with the history goes to the reaper. `Grid` holds nothing else that
+/// `clear_history` keeps: the display offset it resets to 0, which is what a
+/// new grid has.
+///
+/// The fresh grid gets one blank row of history first (the one `scroll_up`
+/// creates), so that upstream's own ED 3 then runs on it and takes its
+/// history branch: it drops that one row and does everything else ED 3 does
+/// (vi cursor clamp, selection filter, damage) exactly as upstream. Without
+/// history ED 3 only marks damage, so then it is forwarded as is; that is
+/// always the case on the alternate screen, whose grid never has history.
+///
+/// `history_limit` must be the `scrolling_history` the terminal was built
+/// or last `set_options` with (`Pane::history_limit`).
+pub(crate) fn clear_saved_reaping_history<T: EventListener>(term: &mut Term<T>, history_limit: usize) {
+    use alacritty_terminal::grid::Grid;
+    use alacritty_terminal::vte::ansi::{ClearMode, Handler};
+    let history = term.grid().history_size();
+    debug_assert!(history <= history_limit, "stale history limit {history_limit} < {history}");
+    if history == 0 || history_limit == 0 {
+        Handler::clear_screen(term, ClearMode::Saved);
+        return;
+    }
+    let lines = term.screen_lines();
+    let mut fresh = Grid::new(lines, term.columns(), history_limit);
+    fresh.scroll_up::<Color>(&(Line(0)..Line(lines as i32)), 1);
+    let old = term.grid_mut();
+    for line in (0..lines as i32).map(Line) {
+        std::mem::swap(&mut fresh[line], &mut old[line]);
+    }
+    std::mem::swap(&mut fresh.cursor, &mut old.cursor);
+    std::mem::swap(&mut fresh.saved_cursor, &mut old.saved_cursor);
+    let old = std::mem::replace(old, fresh);
+    Handler::clear_screen(term, ClearMode::Saved);
+    reap_off_thread(Box::new(old));
 }
 
 // Xterm-ish ANSI palette (NamedColor::Black..BrightWhite = 0..15).
@@ -1011,6 +1054,7 @@ fn spawn_pty<U: EventListener + Send + 'static>(
     event_proxy: U,
     channel: LoopChannel,
     clear_wipes_scrollback: Arc<AtomicBool>,
+    history_limit: Arc<AtomicUsize>,
     defaults: Arc<Mutex<PaneDefaults>>,
     child_pid: Arc<OnceLock<u32>>,
     spawn_failed: Arc<AtomicBool>,
@@ -1027,7 +1071,7 @@ fn spawn_pty<U: EventListener + Send + 'static>(
         };
         let pid = pty.child().id();
         let _ = child_pid.set(pid);
-        let hooks = PaneHooks { clear_wipes_scrollback, defaults, child_pid: pid };
+        let hooks = PaneHooks { clear_wipes_scrollback, history_limit, defaults, child_pid: pid };
         let event_loop = EventLoop::new(channel, terminal, event_proxy, pty, false, false, hooks);
         // Detached, as in alacritty: the thread tears down its own Pty.
         let _ = event_loop.spawn();
@@ -1094,11 +1138,15 @@ pub struct Pane {
     /// Scrollback search state shared with the search thread; replaced with
     /// `terminal` on respawn. See `crate::search`.
     search: Arc<SearchSlot>,
-    /// The `scrolling_history` the terminal was built or last `set_options`
+    /// The `scrolling_history` `terminal` was built or last `set_options`
     /// with: its primary grid's `max_scroll_limit`, which the grid does not
-    /// expose. `reset_terminal` builds the grid that replaces the old one
-    /// with it.
-    history_limit: Cell<usize>,
+    /// expose. The grids that replace one holding scrollback are built with it
+    /// (`reset_state_reaping_history`, `clear_saved_reaping_history`), here in
+    /// `reset_terminal` and by the PTY loop's parser on RIS and ED 3. Belongs
+    /// to this `terminal`, so respawn makes a new one rather than repointing
+    /// the old loop's. Written only under the terminal lock and read under it,
+    /// which orders it, so `Relaxed` suffices.
+    history_limit: Arc<AtomicUsize>,
 }
 
 impl Pane {
@@ -1134,7 +1182,7 @@ impl Pane {
         let pending_clipboard_store = Arc::clone(&proxy.pending_clipboard_store);
 
         let dims = TermDims { cols, lines };
-        let history_limit = term_config.scrolling_history;
+        let history_limit = Arc::new(AtomicUsize::new(term_config.scrolling_history));
         let term = Term::new(term_config, &dims, proxy.clone());
         let terminal = Arc::new(FairMutex::new(term));
 
@@ -1166,6 +1214,7 @@ impl Pane {
             proxy,
             channel,
             Arc::clone(&clear_wipes_scrollback),
+            Arc::clone(&history_limit),
             Arc::clone(&shared_defaults),
             Arc::clone(&child_pid),
             Arc::clone(&spawn_failed),
@@ -1199,7 +1248,7 @@ impl Pane {
             spawn_command,
             dead: Cell::new(false),
             search: Arc::default(),
-            history_limit: Cell::new(history_limit),
+            history_limit,
         })
     }
 
@@ -1235,7 +1284,7 @@ impl Pane {
         let pending_clipboard_store = Arc::clone(&proxy.pending_clipboard_store);
 
         let dims = TermDims { cols: self.cols, lines: self.lines };
-        let history_limit = term_config.scrolling_history;
+        let history_limit = Arc::new(AtomicUsize::new(term_config.scrolling_history));
         let term = Term::new(term_config, &dims, proxy.clone());
         let terminal = Arc::new(FairMutex::new(term));
 
@@ -1271,6 +1320,7 @@ impl Pane {
             proxy,
             channel,
             Arc::clone(&self.clear_wipes_scrollback),
+            Arc::clone(&history_limit),
             Arc::clone(&self.shared_defaults),
             Arc::clone(&child_pid),
             Arc::clone(&spawn_failed),
@@ -1291,7 +1341,7 @@ impl Pane {
         self.cached = None;
         self.dead.set(false);
         self.search = Arc::default();
-        self.history_limit.set(history_limit);
+        self.history_limit = history_limit;
 
         Ok(())
     }
@@ -1323,7 +1373,7 @@ impl Pane {
             // reset_state already blanks both grids and wipes scrollback
             // (Grid::reset calls clear_history), so the clear variant's
             // extra calls are belt-and-braces against semantics changes.
-            reset_state_reaping_history(&mut term, self.history_limit.get());
+            reset_state_reaping_history(&mut term, self.history_limit.load(Ordering::Relaxed));
             if clear {
                 Handler::clear_screen(&mut *term, ClearMode::All);
                 Handler::clear_screen(&mut *term, ClearMode::Saved);
@@ -1340,7 +1390,7 @@ impl Pane {
     /// switch). Marks the pane dirty so the change is reflected on next frame.
     pub fn apply_term_config(&self, term_config: Config) {
         let mut term = self.terminal.lock();
-        self.history_limit.set(term_config.scrolling_history);
+        self.history_limit.store(term_config.scrolling_history, Ordering::Relaxed);
         term.set_options(term_config);
         drop(term);
         self.dirty.store(true, Ordering::Release);
@@ -3518,6 +3568,7 @@ mod tests {
                 exited.clone(),
                 channel,
                 Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicUsize::new(Config::default().scrolling_history)),
                 Arc::new(Mutex::new(PaneDefaults::default())),
                 Arc::clone(&child_pid),
                 Arc::clone(&spawn_failed),
