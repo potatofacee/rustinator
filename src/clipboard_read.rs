@@ -3,11 +3,15 @@
 //! UI thread.
 //!
 //! An X11 selection read is a round trip to the selection owner, and arboard
-//! waits up to 4 s for each target format it tries (`LONG_TIMEOUT_DUR`,
-//! `read_single`). `get_text` tries six targets in turn (UTF8_STRING,
+//! waits up to 4 s for each request it makes (`LONG_TIMEOUT_DUR`). Upstream
+//! `get_text` asks for six targets in turn (UTF8_STRING,
 //! text/plain;charset=utf-8, text/plain;charset=UTF-8, STRING, TEXT,
 //! text/plain), moving on when one times out, so an owner that never answers
-//! costs about 24 s; arboard offers no way to ask for fewer targets or a
+//! costs about 24 s. The vendored arboard (`vendor/arboard`, see its
+//! RUSTINATOR-PATCHES.md) asks for TARGETS first, gives up at once if that
+//! times out, and otherwise asks once for the best text format the owner
+//! lists: an owner that never answers costs 4 s, a slow one up to 8 s (two
+//! requests), and with no owner the read returns at once. arboard offers no
 //! shorter wait. Under Xvnc the owner is often the VNC server's clipboard
 //! bridge, which answers late or never while the viewer is idle, so a read
 //! on the UI thread froze painting and PTY output for that long. Reads run

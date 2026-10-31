@@ -125,7 +125,7 @@ pub(crate) fn strip_egui_key_events(ctx: &egui::Context) {
 
 /// Whether a key event is the chord egui-winit takes as its paste command,
 /// which it answers by reading the OS clipboard on the UI thread (on X11 a
-/// selection round trip of up to 4 s per target when the owner is slow, as an
+/// selection round trip of up to 4 s per request when the owner is slow, as an
 /// idle Xvnc clipboard bridge is). Such events are withheld from egui-winit
 /// (`GlWindow::on_window_event`): with an egui text field focused the paste
 /// is read off the UI thread and injected as egui-winit's `Event::Paste`

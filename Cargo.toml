@@ -46,3 +46,8 @@ identifier = "com.rustinator.app"
 icon = ["assets/icon.icns"]
 osx_minimum_system_version = "10.15"
 
+# arboard 3.6.1 with rustinator's X11 text-read patches (see
+# vendor/arboard/RUSTINATOR-PATCHES.md). egui-winit's arboard resolves here too.
+[patch.crates-io]
+arboard = { path = "vendor/arboard" }
+
