@@ -141,7 +141,7 @@ pub(crate) fn strip_egui_key_events(ctx: &egui::Context) {
 /// `is_paste_command`): the key is the logical key's egui name, else the
 /// physical key's, and `mods` is egui-winit's own modifier state, whose
 /// `command` is Ctrl, or Cmd on macOS. So: the Paste key; Ctrl+V and
-/// Ctrl+Shift+V (Cmd+V, Cmd+Shift+V on macOS); Shift+Insert on Windows only.
+/// Ctrl+Shift+V (Cmd+V, Cmd+Shift+V on macOS); Shift+Insert on Windows, and on Linux/BSD as in GTK entries.
 /// A named logical key other than Paste/Insert counts as some other egui
 /// key; egui-winit names nearly all of them, and one it does not merely
 /// keeps egui-winit's own read.
@@ -165,6 +165,13 @@ pub(crate) fn is_egui_paste_chord(mods: egui::Modifiers, logical: &Key, physical
     key == egui::Key::Paste
         || (mods.command && key == egui::Key::V)
         || (cfg!(target_os = "windows") && mods.shift && key == egui::Key::Insert)
+        // Not egui-winit's: GTK entries (Terminator's search bar, dialogs)
+        // paste the clipboard on Shift+Insert, so egui fields do too here.
+        || (cfg!(all(unix, not(target_os = "macos")))
+            && mods.shift
+            && !mods.command
+            && !mods.alt
+            && key == egui::Key::Insert)
 }
 
 /// The bindings Terminator's toplevel handles itself, ahead of whichever
@@ -1855,10 +1862,15 @@ mod tests {
         // there (Dvorak): the logical key decides.
         assert!(!withheld(command_mods(false), ch("c"), KeyCode::KeyC));
         assert!(!withheld(command_mods(false), ch("k"), KeyCode::KeyV));
-        // Shift+Insert is egui-winit's paste only on Windows.
+        // Shift+Insert pastes into a field as in GTK entries (egui-winit
+        // itself only does it on Windows); never on macOS. Ctrl+Shift+Insert
+        // is not a field paste.
         assert_eq!(
             withheld(shift, Key::Named(NamedKey::Insert), KeyCode::Insert),
-            cfg!(target_os = "windows")
+            !cfg!(target_os = "macos")
         );
+        if cfg!(all(unix, not(target_os = "macos"))) {
+            assert!(!withheld(command_mods(true), Key::Named(NamedKey::Insert), KeyCode::Insert));
+        }
     }
 }
