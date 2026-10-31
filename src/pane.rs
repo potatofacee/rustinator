@@ -1060,9 +1060,20 @@ fn spawn_pty<U: EventListener + Send + 'static>(
     spawn_failed: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
     alacritty_terminal::thread::spawn_named("PTY spawn", move || {
-        let pty = match tty::new(&opts, window_size, window_id) {
+        // `tty::new` is `openpty` + `tty::from_fd`; on macOS the PTY is opened
+        // here instead (see `open_pty_cloexec`).
+        #[cfg(target_os = "macos")]
+        let pty = open_pty_cloexec(window_size)
+            .and_then(|(master, slave)| tty::from_fd(&opts, window_id, master, slave));
+        #[cfg(not(target_os = "macos"))]
+        let pty = tty::new(&opts, window_size, window_id);
+        let pty = match pty {
             Ok(pty) => pty,
             Err(e) => {
+                // The PTY fds are closed by now, but when the spawn itself
+                // failed, `tty::from_fd` (0.26) leaves its SIGCHLD signal-hook
+                // registration, and with it one socket fd, registered for good:
+                // it returns without the `unregister` that `Pty::drop` does.
                 eprintln!("failed to spawn pane: failed to open pty: {e}");
                 spawn_failed.store(true, Ordering::Release);
                 terminal.lock().exit();
@@ -1076,6 +1087,63 @@ fn spawn_pty<U: EventListener + Send + 'static>(
         // Detached, as in alacritty: the thread tears down its own Pty.
         let _ = event_loop.spawn();
     })
+}
+
+/// Open a PTY pair for `spawn_pty` on macOS with CLOEXEC set atomically.
+///
+/// `tty::new` gets its fds from `rustix_openpty::openpty`, which on macOS
+/// calls libc `openpty` and sets CLOEXEC on them only afterwards. Panes spawn
+/// on their own worker threads, and URL and new-window launches fork on the UI
+/// thread (`platform::spawn_detached`), so a fork on another thread inside that
+/// gap hands this pane's master and slave to an unrelated child, which keeps
+/// them across exec: the pty then stays open after this pane's child is gone,
+/// and its other processes never get the hangup. Opening both ends with
+/// `O_CLOEXEC`, as rustix does on Linux, closes the gap for every fork in the
+/// process, without a lock that would have to be held across a spawn that can
+/// block (see `spawn_pty`). The steps are Apple's `openpty` (posix_openpt,
+/// grantpt, unlockpt, ptsname, open, TIOCSWINSZ); the name comes from the
+/// TIOCPTYGNAME ioctl that `ptsname` wraps, as `ptsname` itself is not
+/// thread-safe. The window size is the one `tty::new` passes `openpty`.
+#[cfg(target_os = "macos")]
+fn open_pty_cloexec(
+    window_size: WindowSize,
+) -> std::io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
+    use std::io::Error;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    let flags = libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC;
+    let open = |path: *const libc::c_char| -> std::io::Result<OwnedFd> {
+        let fd = unsafe { libc::open(path, flags) };
+        if fd < 0 {
+            return Err(Error::last_os_error());
+        }
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    };
+
+    let master = open(c"/dev/ptmx".as_ptr())?;
+    let fd = master.as_raw_fd();
+    if unsafe { libc::grantpt(fd) } != 0 || unsafe { libc::unlockpt(fd) } != 0 {
+        return Err(Error::last_os_error());
+    }
+    let mut name = [0 as libc::c_char; 128];
+    if unsafe { libc::ioctl(fd, libc::TIOCPTYGNAME as libc::c_ulong, name.as_mut_ptr()) } != 0 {
+        return Err(Error::last_os_error());
+    }
+    let slave = open(name.as_ptr())?;
+
+    // alacritty_terminal's `ToWinsize` for `WindowSize`.
+    let ws_row = window_size.num_lines as libc::c_ushort;
+    let ws_col = window_size.num_cols as libc::c_ushort;
+    let winsize = libc::winsize {
+        ws_row,
+        ws_col,
+        ws_xpixel: ws_col * window_size.cell_width as libc::c_ushort,
+        ws_ypixel: ws_row * window_size.cell_height as libc::c_ushort,
+    };
+    if unsafe { libc::ioctl(slave.as_raw_fd(), libc::TIOCSWINSZ, &winsize) } != 0 {
+        return Err(Error::last_os_error());
+    }
+    Ok((master, slave))
 }
 
 pub struct Pane {
