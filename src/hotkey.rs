@@ -8,7 +8,8 @@ use winit::event_loop::EventLoopProxy;
 use crate::window::UserEvent;
 
 pub struct HotkeyHandle {
-    _manager: GlobalHotKeyManager,
+    manager: GlobalHotKeyManager,
+    hotkey: HotKey,
 }
 
 /// The current event-loop proxy that the single reader thread forwards toggle
@@ -39,27 +40,71 @@ fn ensure_reader_thread() {
 }
 
 pub fn spawn(combo: &str, proxy: EventLoopProxy<UserEvent>) -> Option<HotkeyHandle> {
-    let hotkey = parse_combo(combo).or_else(|| {
-        log::warn!("hotkey: can't parse combo '{combo}'");
-        None
-    })?;
+    let hotkey = parse(combo)?;
 
     let manager = GlobalHotKeyManager::new()
         .map_err(|e| log::warn!("hotkey: failed to create manager: {e}"))
         .ok()?;
 
+    register(&manager, hotkey, combo)?;
+    Some(finish(manager, hotkey, combo, proxy))
+}
+
+/// Re-point an existing registration at `combo` on the same manager, rather
+/// than dropping it and spawning a fresh one. On X11 a dropped manager's grab
+/// outlives the drop: its thread only sees `DropThread` after its 50 ms poll
+/// sleep, and the crate gives no signal when the grab is gone. A new manager
+/// grabbing the same key in that window gets BadAccess (`AlreadyRegistered`),
+/// which is what a height/focus/on-top change with an unchanged combo hit. On
+/// one manager the ungrab and the grab share an X connection, so the server
+/// handles them in order, and `register`'s checked grab is a round trip that
+/// returns only once both are done.
+pub fn rebind(
+    old: HotkeyHandle,
+    combo: &str,
+    proxy: EventLoopProxy<UserEvent>,
+) -> Option<HotkeyHandle> {
+    // A combo that doesn't parse drops `old`, as the respawn this replaces did.
+    let hotkey = parse(combo)?;
+    let HotkeyHandle { manager, hotkey: old_hotkey } = old;
+
+    // Same combo: the grab is still live on this manager, nothing to redo.
+    if hotkey != old_hotkey {
+        if let Err(e) = manager.unregister(old_hotkey) {
+            log::warn!("hotkey: failed to unregister old hotkey: {e}");
+        }
+        register(&manager, hotkey, combo)?;
+    }
+    Some(finish(manager, hotkey, combo, proxy))
+}
+
+fn parse(combo: &str) -> Option<HotKey> {
+    parse_combo(combo).or_else(|| {
+        log::warn!("hotkey: can't parse combo '{combo}'");
+        None
+    })
+}
+
+fn register(manager: &GlobalHotKeyManager, hotkey: HotKey, combo: &str) -> Option<()> {
     manager
         .register(hotkey)
         .map_err(|e| log::warn!("hotkey: failed to register '{combo}': {e}"))
-        .ok()?;
+        .ok()
+}
 
+fn finish(
+    manager: GlobalHotKeyManager,
+    hotkey: HotKey,
+    combo: &str,
+    proxy: EventLoopProxy<UserEvent>,
+) -> HotkeyHandle {
     // Point the single reader thread at this registration's proxy, then ensure
     // that thread exists (started at most once for the process lifetime).
     *CURRENT_PROXY.lock().unwrap() = Some(proxy);
     ensure_reader_thread();
 
     log::info!("hotkey: registered global hotkey '{combo}'");
-    Some(HotkeyHandle { _manager: manager })
+    HotkeyHandle { manager, hotkey }
 }
 
 fn parse_combo(s: &str) -> Option<HotKey> {

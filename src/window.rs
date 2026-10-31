@@ -39,6 +39,12 @@ pub enum UserEvent {
 
 struct PrefsWindowState {
     gl_window: GlWindow,
+    // Deadline this window's egui asked for via repaint_delay (text cursor
+    // blink, tooltips, animations). Folded into the control flow in
+    // about_to_wait, as for the hotkey window.
+    repaint_at: Option<Instant>,
+    // When this window last painted; caps its repaint cadence in about_to_wait.
+    last_paint: Option<Instant>,
 }
 
 impl PrefsWindowState {
@@ -65,6 +71,8 @@ impl PrefsWindowState {
                 egui::ViewportId::from_hash_of("prefs"),
                 false,
             ),
+            repaint_at: None,
+            last_paint: None,
         }
     }
 
@@ -106,7 +114,8 @@ impl PrefsWindowState {
             bg.a() as f32 / 255.0,
         ];
 
-        let _ = self.gl_window.end_frame(main_context, full_output, clear_color);
+        self.repaint_at = self.gl_window.end_frame(main_context, full_output, clear_color);
+        self.last_paint = Some(Instant::now());
     }
 }
 
@@ -314,6 +323,31 @@ fn governor_next_wake(
         repaint_pending,
         egui_repaint_at,
     }
+}
+
+/// What a secondary window (hotkey dropdown, prefs) does about its egui
+/// repaint deadline in `about_to_wait`.
+#[derive(Debug, PartialEq, Eq)]
+enum DeadlineAction {
+    RedrawNow,
+    WakeAt(Instant),
+}
+
+/// Schedule a secondary window's egui deadline `at`: no sooner than `interval`
+/// after its last paint, so a continuous animation (deadline "now") can't
+/// repaint at swap rate. Pure; the caller clears the deadline and redraws on
+/// `RedrawNow`, or merges `WakeAt` into the loop's next wake.
+fn secondary_deadline(
+    now: Instant,
+    at: Instant,
+    last_paint: Option<Instant>,
+    interval: Duration,
+) -> DeadlineAction {
+    let due = match last_paint {
+        Some(last) => at.max(last + interval),
+        None => at,
+    };
+    if due <= now { DeadlineAction::RedrawNow } else { DeadlineAction::WakeAt(due) }
 }
 
 /// Governed interval is stretched to this multiple of the last frame's render
@@ -655,14 +689,32 @@ impl ApplicationHandler<UserEvent> for WinitApp {
         if let Some(hk) = &mut self.hotkey_window {
             if hk.shown_at.is_some() {
                 if let Some(at) = hk.repaint_at {
-                    let due = match hk.last_paint {
-                        Some(last) => at.max(last + hotkey_interval),
-                        None => at,
-                    };
-                    if due <= now {
-                        hk.repaint_at = None;
-                        hk.gl_window.window.request_redraw();
-                    } else {
+                    match secondary_deadline(now, at, hk.last_paint, hotkey_interval) {
+                        DeadlineAction::RedrawNow => {
+                            hk.repaint_at = None;
+                            hk.gl_window.window.request_redraw();
+                        }
+                        DeadlineAction::WakeAt(due) => {
+                            next_wake = Some(next_wake.map_or(due, |w| w.min(due)));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Prefs window: same deadline folding. Base cadence, not the unfocused
+        // slowdown: with prefs focused the main window is unfocused, yet prefs
+        // is the window being watched (egui only blinks a focused viewport's
+        // cursor). No input-stretch bypass: prefs drains nothing to a PTY.
+        if let Some(prefs) = &mut self.prefs {
+            if let Some(at) = prefs.repaint_at {
+                let interval = effective_interval(self.frame_interval, self.last_render_cost, false);
+                match secondary_deadline(now, at, prefs.last_paint, interval) {
+                    DeadlineAction::RedrawNow => {
+                        prefs.repaint_at = None;
+                        prefs.gl_window.window.request_redraw();
+                    }
+                    DeadlineAction::WakeAt(due) => {
                         next_wake = Some(next_wake.map_or(due, |w| w.min(due)));
                     }
                 }
@@ -1245,15 +1297,19 @@ impl WinitApp {
         if hk_cfg.enabled {
             self.hotkey_height_pct = hk_cfg.height_percent.clamp(1, 100);
             self.hotkey_hide_on_focus_loss = hk_cfg.hide_on_focus_loss;
-            // Tear down old hotkey state.
-            self.hotkey_handle = None;
+            // Tear down old hotkey state. A live registration is rebound on
+            // its own manager, not dropped and respawned (see `hotkey::rebind`).
+            let old_handle = self.hotkey_handle.take();
             if let Some(old_hk) = self.hotkey_window.take() {
                 old_hk.destroy(gl.context());
                 win.gl_window.make_current(gl.context());
             }
-            if let Some(handle) =
-                crate::hotkey::spawn(&hk_cfg.hotkey, self.event_loop_proxy.clone())
-            {
+            let proxy = self.event_loop_proxy.clone();
+            let handle = match old_handle {
+                Some(old) => crate::hotkey::rebind(old, &hk_cfg.hotkey, proxy),
+                None => crate::hotkey::spawn(&hk_cfg.hotkey, proxy),
+            };
+            if let Some(handle) = handle {
                 self.hotkey_handle = Some(handle);
                 self.hotkey_window = Some(HotkeyWindowState::new(
                     event_loop,
@@ -1442,6 +1498,37 @@ mod tests {
         assert_eq!(d.next_wake, Some(egui_at));
         // The egui deadline is still in the future, so it is preserved.
         assert_eq!(d.egui_repaint_at, Some(egui_at));
+    }
+
+    #[test]
+    fn secondary_deadline_redraws_when_due() {
+        let now = Instant::now();
+        let interval = Duration::from_millis(16);
+        // Never painted: a due deadline redraws at once.
+        assert_eq!(secondary_deadline(now, now, None, interval), DeadlineAction::RedrawNow);
+        // Painted longer than an interval ago: same.
+        let last = now - Duration::from_millis(20);
+        assert_eq!(secondary_deadline(now, now, Some(last), interval), DeadlineAction::RedrawNow);
+    }
+
+    #[test]
+    fn secondary_deadline_waits_for_future_deadline() {
+        // Cursor blink: a deadline later than the cadence cap is kept as is.
+        let now = Instant::now();
+        let at = now + Duration::from_millis(500);
+        let d = secondary_deadline(now, at, Some(now), Duration::from_millis(16));
+        assert_eq!(d, DeadlineAction::WakeAt(at));
+    }
+
+    #[test]
+    fn secondary_deadline_caps_continuous_animation() {
+        // A "now" deadline right after a paint waits out the interval instead
+        // of repainting at swap rate.
+        let now = Instant::now();
+        let interval = Duration::from_millis(16);
+        let last = now - Duration::from_millis(4);
+        let d = secondary_deadline(now, now, Some(last), interval);
+        assert_eq!(d, DeadlineAction::WakeAt(last + interval));
     }
 
     const BASE: Duration = Duration::from_micros(16_667);
