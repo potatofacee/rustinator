@@ -1984,10 +1984,15 @@ fn pane_cwd(pid: u32) -> Option<std::path::PathBuf> {
 #[cfg(target_os = "macos")]
 fn pane_cwd(pid: u32) -> Option<std::path::PathBuf> {
     // The tracked pid is `/usr/bin/login`, which *forks* (not execs) the
-    // interactive shell. login's own cwd is unreadable via lsof (setuid) and
+    // interactive shell. login's own cwd is unreadable (setuid: EPERM) and
     // would not follow the shell's `cd` anyway -- the shell that tracks the
     // user's directory is login's child. Walk descendants breadth-first and
     // return the first readable cwd, which is that shell.
+    //
+    // This runs on the UI thread (new tab/split, layout save), so it uses
+    // libproc syscalls, not an lsof/pgrep subprocess per process. Cheaper,
+    // not proven non-blocking: iTerm2 still runs proc_pidinfo in an XPC
+    // helper behind a wedge timeout (pidinfo.m `performRiskyBlock`).
     use std::collections::{HashSet, VecDeque};
     let mut queue: VecDeque<u32> = VecDeque::new();
     let mut seen: HashSet<u32> = HashSet::new();
@@ -1996,42 +2001,84 @@ fn pane_cwd(pid: u32) -> Option<std::path::PathBuf> {
         if !seen.insert(p) {
             continue;
         }
-        if let Some(dir) = lsof_cwd(p) {
+        if let Some(dir) = proc_cwd(p) {
             return Some(dir);
         }
-        for child in child_pids(p) {
+        for child in proc_child_pids(p) {
             queue.push_back(child);
         }
     }
     None
 }
 
+/// A process's cwd via `proc_pidinfo(PROC_PIDVNODEPATHINFO)`, as alacritty's
+/// `macos::proc::cwd` reads it. `None` on any failure (EPERM for setuid
+/// `login`, an exited pid, a short read) so the caller falls through to the
+/// process's children.
 #[cfg(target_os = "macos")]
-fn lsof_cwd(pid: u32) -> Option<std::path::PathBuf> {
-    use std::process::Command;
-    let output = Command::new("lsof")
-        .args(["-a", "-p", &pid.to_string(), "-Fn", "-d", "cwd"])
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&output.stdout);
-    for line in text.lines() {
-        if let Some(path) = line.strip_prefix('n') {
-            return Some(std::path::PathBuf::from(path));
-        }
+fn proc_cwd(pid: u32) -> Option<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+    let pid = libc::pid_t::try_from(pid).ok()?;
+    let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as libc::c_int;
+    // SAFETY: proc_vnodepathinfo is plain integers and char arrays, so the
+    // all-zero bit pattern is a valid value.
+    let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
+    // SAFETY: `info` is a live, writable proc_vnodepathinfo and `size` is its
+    // exact byte size, so the kernel writes at most within it.
+    let ret = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDVNODEPATHINFO,
+            0,
+            (&mut info as *mut libc::proc_vnodepathinfo).cast(),
+            size,
+        )
+    };
+    // <= 0 is an error; anything but the full struct is a short read.
+    if ret != size {
+        return None;
     }
-    None
+    // libc spells `vip_path: [c_char; MAXPATHLEN]` as `[[c_char; 32]; 32]`
+    // (same 1024 bytes); flatten it and take the bytes before the NUL. No
+    // NUL in the buffer, or an empty path, counts as unreadable.
+    let raw = info.pvi_cdir.vip_path.as_flattened();
+    let len = raw.iter().position(|&c| c == 0)?;
+    if len == 0 {
+        return None;
+    }
+    let bytes: Vec<u8> = raw[..len].iter().map(|&c| c as u8).collect();
+    Some(std::ffi::OsString::from_vec(bytes).into())
 }
 
+/// Direct children of `parent` via `proc_listchildpids`. Empty on failure,
+/// like a failed `pgrep -P`.
 #[cfg(target_os = "macos")]
-fn child_pids(parent: u32) -> Vec<u32> {
-    use std::process::Command;
-    let Ok(output) = Command::new("pgrep").args(["-P", &parent.to_string()]).output() else {
+fn proc_child_pids(parent: u32) -> Vec<u32> {
+    let Ok(ppid) = libc::pid_t::try_from(parent) else {
         return Vec::new();
     };
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|l| l.trim().parse::<u32>().ok())
-        .collect()
+    // Unlike `proc_listpids` (which returns bytes), libproc's
+    // `proc_listchildpids` divides the kernel's byte count by sizeof(int) and
+    // returns a *count* of pids. The kernel silently truncates to the buffer,
+    // so a full buffer may mean more children: grow and retry. The cap bounds
+    // a fork storm; past it a truncated list is still a usable walk.
+    let mut cap: usize = 64;
+    loop {
+        let mut buf: Vec<libc::pid_t> = vec![0; cap];
+        let bytes = (cap * std::mem::size_of::<libc::pid_t>()) as libc::c_int;
+        // SAFETY: `buf` owns `cap` pid_t slots, exactly `bytes` bytes, so the
+        // kernel writes within it.
+        let n = unsafe { libc::proc_listchildpids(ppid, buf.as_mut_ptr().cast(), bytes) };
+        let Ok(n) = usize::try_from(n) else {
+            return Vec::new();
+        };
+        if n >= cap && cap < 8192 {
+            cap *= 2;
+            continue;
+        }
+        buf.truncate(n.min(cap));
+        return buf.into_iter().filter(|&p| p > 0).map(|p| p as u32).collect();
+    }
 }
 
 #[cfg(not(any(
@@ -3398,6 +3445,14 @@ mod tests {
             opts.shell,
             Some(tty::Shell::new(shell, vec!["-c".into(), "ls".into()])),
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn proc_cwd_reads_own_cwd() {
+        // proc_pidinfo on ourselves needs no privilege, so this checks the
+        // struct layout, size check and path decoding against the real kernel.
+        assert_eq!(proc_cwd(std::process::id()), std::env::current_dir().ok());
     }
 
     // `spawn_pty` on a real PTY (openpty, so no controlling tty is needed):
