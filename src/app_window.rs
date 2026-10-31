@@ -417,7 +417,7 @@ impl AppWindow {
                 Action::ResetClear => self.tab_mgr.reset_focused_terminal(true),
                 Action::NewWindow => {
                     if let Ok(exe) = std::env::current_exe() {
-                        let _ = std::process::Command::new(exe).spawn();
+                        crate::platform::spawn_detached(&mut std::process::Command::new(exe));
                     }
                 }
                 Action::OpenTerminalHere => self.split_here_inheriting(shared),
@@ -503,7 +503,7 @@ impl AppWindow {
                 // NewWindow does until windows share one process.
                 Action::NewTerminator => {
                     if let Ok(exe) = std::env::current_exe() {
-                        let _ = std::process::Command::new(exe).spawn();
+                        crate::platform::spawn_detached(&mut std::process::Command::new(exe));
                     }
                 }
             }

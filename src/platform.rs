@@ -1,4 +1,52 @@
+use std::io;
+use std::process::{Child, Command};
+
 use winit::window::Window;
+
+/// Launch a program we never wait on (URL opener, a new instance) without
+/// leaving a zombie when it exits. alacritty's `spawn_daemon` double fork: the
+/// direct child forks the real program and exits at once, so it is reaped
+/// right here by a wait on its own pid. A wait on any child (`waitpid(-1)`)
+/// would steal exit statuses each PTY reaps via its own `try_wait` on SIGCHLD.
+/// The program is orphaned to init, which reaps it. A thread parked in
+/// `wait()` would also work, but would live as long as the launched window.
+/// stdio and session are inherited, as with a plain `spawn`.
+pub(crate) fn spawn_detached(cmd: &mut Command) {
+    if let Err(e) = detach(cmd) {
+        log::warn!("failed to launch {:?}: {e}", cmd.get_program());
+    }
+}
+
+/// `spawn_detached`'s body: returns the already-reaped direct child, so a test
+/// can check its pid is gone and read the program's piped output.
+#[cfg(unix)]
+fn detach(cmd: &mut Command) -> io::Result<Child> {
+    use std::os::unix::process::CommandExt;
+
+    // SAFETY: the closure runs between fork and exec and calls only
+    // async-signal-safe functions: fork (POSIX.1-2017, and no atfork handlers
+    // are registered) and _exit.
+    unsafe {
+        cmd.pre_exec(|| match libc::fork() {
+            -1 => Err(io::Error::last_os_error()),
+            // The grandchild goes on to exec. If that fails it still reports
+            // through std's CLOEXEC error pipe, so `spawn` returns the error.
+            0 => Ok(()),
+            _ => libc::_exit(0),
+        });
+    }
+    let mut child = cmd.spawn()?;
+    // Bounded: the direct child exits right after its fork, and `spawn` has
+    // already blocked until the grandchild's exec.
+    child.wait()?;
+    Ok(child)
+}
+
+/// No zombies off Unix: dropping a `Child` just closes its handle.
+#[cfg(not(unix))]
+fn detach(cmd: &mut Command) -> io::Result<Child> {
+    cmd.spawn()
+}
 
 #[cfg(target_os = "macos")]
 fn macos_screen_insets(window: &Window) -> Option<(f64, f64, f64, f64)> {
@@ -208,5 +256,36 @@ pub(crate) fn apply_hotkey_geometry(window: &Window, height_pct: u32) {
             pos.y + top_inset,
         ));
         let _ = window.request_inner_size(winit::dpi::PhysicalSize::new(usable_w, h));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::io::Read;
+    use std::process::Stdio;
+
+    #[test]
+    fn detach_reaps_direct_child_and_orphans_program() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "echo $PPID"]).stdout(Stdio::piped());
+        let mut child = detach(&mut cmd).expect("spawn sh");
+
+        // Reaped, not a zombie: a zombie still answers kill(pid, 0).
+        let rc = unsafe { libc::kill(child.id() as libc::pid_t, 0) };
+        assert_eq!(rc, -1);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+
+        // The program ran (EOF once it exits) and was never our child.
+        let mut out = String::new();
+        child.stdout.take().unwrap().read_to_string(&mut out).unwrap();
+        let ppid: u32 = out.trim().parse().expect("sh printed its ppid");
+        assert_ne!(ppid, std::process::id());
+    }
+
+    #[test]
+    fn detach_reports_exec_failure() {
+        let mut cmd = Command::new("/nonexistent/rustinator-detach-test");
+        assert!(detach(&mut cmd).is_err());
     }
 }

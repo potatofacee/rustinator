@@ -805,7 +805,7 @@ fn handle_pane_mouse(
 /// handler path). Used by Ctrl+click on a matched URL and by the Help action.
 pub(crate) fn open_url(url: &str) {
     let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
-    let _ = std::process::Command::new(opener).arg(url).spawn();
+    crate::platform::spawn_detached(std::process::Command::new(opener).arg(url));
 }
 
 /// Menu entry that fires an action, showing the bound key combo (if any)
