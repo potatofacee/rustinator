@@ -4,7 +4,7 @@ A GPU-accelerated terminal emulator inspired by Terminator, built with Rust. Sup
 
 ## Prerequisites
 
-Requires Rust 1.85+ (edition 2024). Install via [rustup](https://rustup.rs/):
+Requires Rust 1.92+ (edition 2024). Install via [rustup](https://rustup.rs/):
 
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
@@ -27,6 +27,14 @@ sudo apt install libfontconfig1-dev libfreetype-dev libxkbcommon-dev libegl1-mes
 ```bash
 sudo dnf install fontconfig-devel freetype-devel libxkbcommon-devel mesa-libEGL-devel libxcb-devel
 ```
+
+### Linux (RHEL 8 and compatible)
+
+```bash
+sudo dnf install gcc gcc-c++ make cmake pkgconf-pkg-config fontconfig-devel freetype-devel libxkbcommon-devel mesa-libEGL-devel libxcb-devel
+```
+
+Rust from rustup works here, as do the distro's `rust` and `cargo` packages if they are 1.92 or newer. Check with `rustc --version`.
 
 ### Linux (Arch)
 

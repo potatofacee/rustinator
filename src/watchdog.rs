@@ -529,8 +529,10 @@ impl Drop for ActivityGuard {
 
 #[cfg(target_os = "linux")]
 fn current_tid() -> u64 {
+    // A raw syscall because glibc only gained a gettid wrapper in 2.30, and
+    // RHEL 8 ships 2.28: the wrapper compiles there but fails to link.
     // SAFETY: gettid has no preconditions.
-    unsafe { libc::gettid() as u64 }
+    unsafe { libc::syscall(libc::SYS_gettid) as u64 }
 }
 
 #[cfg(target_os = "macos")]
